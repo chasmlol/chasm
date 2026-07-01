@@ -1,0 +1,158 @@
+{% extends "layout.html" %}
+
+{% block title %}Tracing - chasm{% endblock %}
+
+{% block body %}
+<main class="settings-shell">
+    <aside class="settings-nav" aria-label="Settings categories">
+        <a class="settings-back" href="/">&larr; Back to chat</a>
+        <p class="eyebrow">Settings</p>
+        <nav class="settings-nav-list">
+            {% for group in page.nav_groups %}
+                {% if group.items.len() > 0 %}
+                    <p class="settings-nav-group">{{ group.label }}</p>
+                    {% for item in group.items %}
+                        <a class="settings-nav-link{% if item.active %} is-active{% endif %}" href="/settings/{{ item.key }}">{{ item.label }}</a>
+                    {% endfor %}
+                {% endif %}
+            {% endfor %}
+        </nav>
+        <p class="settings-path" title="{{ page.settings_path }}">Saved to {{ page.settings_path }}</p>
+    </aside>
+
+    <section class="settings-main">
+        {% if page.saved %}
+            <div class="settings-flash" role="status">
+                <span class="settings-flash-icon" aria-hidden="true">&#10003;</span> Settings saved.
+            </div>
+        {% endif %}
+
+        <header class="settings-head">
+            <p class="settings-eyebrow">System</p>
+            <h1 class="settings-title">Tracing</h1>
+            <p class="settings-lede">A per-request waterfall of every stage of a request &mdash; speech recognition, generation, TTS, animation &mdash; on a millisecond timeline, plus LLM tokens/sec and the metrics pulled from each stage. Trace files are read-only; the bridge writes one <code>req_*.jsonl</code> per request.</p>
+        </header>
+
+        <form class="settings-form trace-form" method="post" action="/settings/tracing">
+            <details class="settings-group" open>
+                <summary class="settings-legend">Traces directory <span class="chev" aria-hidden="true"></span></summary>
+                <ul class="status-list">
+                    <li class="status-row">
+                        <span class="status-key">Resolved directory</span>
+                        <span class="status-val">
+                            {% if page.trace_dir_exists %}<span class="install-pill is-installed">Found</span>{% else %}<span class="install-pill is-failed">Not found</span>{% endif %}
+                            <code class="status-path" title="{{ page.trace_dir }}">{{ page.trace_dir }}</code>
+                        </span>
+                    </li>
+                </ul>
+                <label class="field-label" for="trace_dir">Traces directory (blank = auto-discover)</label>
+                <input type="text" id="trace_dir" name="trace_dir" class="text" value="{{ page.trace_dir_override }}" placeholder="{{ page.trace_dir }}">
+                <p class="settings-note">Blank auto-discovers from the bridge config's <code>nativeBridgeRoots[0]</code> + <code>\traces</code>, falling back to the default bridge folder.</p>
+                <div class="settings-actions">
+                    <button type="submit" class="button primary">Save tracing settings</button>
+                </div>
+            </details>
+        </form>
+
+        <div class="trace-layout">
+            <aside class="trace-list" aria-label="Recent traces">
+                <div class="trace-list-head">
+                    <span class="settings-subtitle" style="margin:0">Recent traces</span>
+                    <a class="button small" href="/settings/tracing" title="Reload the newest traces">Refresh</a>
+                </div>
+                {% if page.traces.is_empty() %}
+                    <p class="settings-note">No trace files found in the directory above. Run a request from the connected game, then Refresh.</p>
+                {% else %}
+                    <ul class="trace-list-items">
+                        {% for trace in page.traces %}
+                            <li>
+                                <a class="trace-list-link{% if trace.selected %} is-selected{% endif %}" href="/settings/tracing?trace={{ trace.request_id }}">
+                                    <span class="trace-list-id">{{ trace.request_id }}</span>
+                                    <span class="trace-list-meta">{{ trace.total_label }} &middot; {{ trace.stage_count }} stages</span>
+                                    {% if trace.started_at.len() > 0 %}<span class="trace-list-time">{{ trace.started_at }}</span>{% endif %}
+                                </a>
+                            </li>
+                        {% endfor %}
+                    </ul>
+                {% endif %}
+            </aside>
+
+            <div class="trace-detail">
+                {% match page.detail %}
+                {% when Some with (detail) %}
+                    <div class="trace-detail-head">
+                        <div>
+                            <h2 class="trace-detail-title">{{ detail.request_id }}</h2>
+                            {% if detail.started_at.len() > 0 %}<p class="prompt-meta" style="margin-top:4px">Started {{ detail.started_at }}</p>{% endif %}
+                        </div>
+                    </div>
+
+                    <div class="trace-metrics">
+                        {% for metric in detail.metrics %}
+                            <div class="trace-metric{% if metric.primary %} is-primary{% endif %}">
+                                <span class="trace-metric-value">{{ metric.value }}</span>
+                                <span class="trace-metric-label">{{ metric.label }}</span>
+                            </div>
+                        {% endfor %}
+                    </div>
+
+                    {% if detail.legend.len() > 0 %}
+                        <div class="trace-legend">
+                            {% for item in detail.legend %}
+                                <span class="trace-legend-item"><span class="trace-swatch grp-{{ item.group }}"></span>{{ item.label }}</span>
+                            {% endfor %}
+                            <span class="trace-legend-item"><span class="trace-swatch grp-error"></span>Error / slow</span>
+                        </div>
+                    {% endif %}
+
+                    <div class="waterfall">
+                        <div class="waterfall-axis" aria-hidden="true">
+                            {% for tick in detail.axis_ticks %}
+                                <span class="waterfall-tick" style="left:{{ tick.left_pct }}%">
+                                    <span class="waterfall-tick-line"></span>
+                                    <span class="waterfall-tick-label">{{ tick.label }}</span>
+                                </span>
+                            {% endfor %}
+                        </div>
+
+                        <div class="waterfall-rows">
+                            {% for row in detail.rows %}
+                                <details class="wf-row grp-{{ row.group }}{% if row.is_error %} is-error{% endif %}">
+                                    <summary class="wf-summary">
+                                        <span class="wf-track">
+                                            {% for tick in detail.axis_ticks %}
+                                                <span class="wf-grid" style="left:{{ tick.left_pct }}%"></span>
+                                            {% endfor %}
+                                            <span class="wf-bar" style="left:{{ row.left_pct }}%;width:{{ row.width_pct }}%">
+                                                <span class="wf-bar-label{% if row.label_left %} is-left{% endif %}">{{ row.name }} <span class="wf-dur">{{ row.duration_label }}</span></span>
+                                            </span>
+                                        </span>
+                                        <span class="wf-offset">{{ row.offset_label }}</span>
+                                    </summary>
+                                    <div class="wf-fields">
+                                        <table class="wf-field-table">
+                                            <tbody>
+                                                <tr><th>stage</th><td>{{ row.name }}</td></tr>
+                                                <tr><th>offset</th><td>{{ row.offset_label }}</td></tr>
+                                                <tr><th>duration</th><td>{{ row.duration_label }}</td></tr>
+                                                {% for field in row.fields %}
+                                                    <tr><th>{{ field.0 }}</th><td>{{ field.1 }}</td></tr>
+                                                {% endfor %}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </details>
+                            {% endfor %}
+                        </div>
+                    </div>
+                {% when None %}
+                    <div class="empty-state">
+                        <h2>No trace selected</h2>
+                        <p class="settings-note">Pick a request from the list, or run one from the connected game and Refresh.</p>
+                    </div>
+                {% endmatch %}
+            </div>
+        </div>
+    </section>
+</main>
+{% endblock %}

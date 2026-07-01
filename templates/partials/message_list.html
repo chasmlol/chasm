@@ -1,0 +1,37 @@
+<div class="message-scroll">
+    {% if messages.len() == 0 %}
+        <section class="empty-state">
+            <h2>No visible messages</h2>
+            {% match selected_participant %}
+            {% when Some with (participant) %}
+                <p>Nothing in the Live Chat transcript is visible or audible to {{ participant.name }} yet.</p>
+            {% when None %}
+                <p>No participant is selected.</p>
+            {% endmatch %}
+        </section>
+    {% else %}
+        <ol class="message-list">
+            {% for message in messages %}
+                <li class="message-row" data-prompt-row="{{ loop.index0 }}" tabindex="0" role="button" aria-label="Show injected context for this message">
+                    <span class="message-avatar">{{ message.speaker_initial }}</span>
+                    <article class="message-body">
+                        <div class="message-meta">
+                            <span class="speaker">{{ message.speaker_name }}</span>
+                            <span class="role role-{{ message.role }}">{{ message.role }}</span>
+                            {% if message.created_at_label.len() > 0 %}
+                                {% match message.created_at %}
+                                {% when Some with (iso) %}
+                                    <time class="timestamp" datetime="{{ iso }}" title="{{ iso }}">{{ message.created_at_label }}</time>
+                                {% when None %}
+                                    <time class="timestamp">{{ message.created_at_label }}</time>
+                                {% endmatch %}
+                            {% endif %}
+                            <span class="visibility">{{ message.visible_reason }}</span>
+                        </div>
+                        <div class="message-text">{{ message.content }}</div>
+                    </article>
+                </li>
+            {% endfor %}
+        </ol>
+    {% endif %}
+</div>

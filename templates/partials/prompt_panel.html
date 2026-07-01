@@ -1,0 +1,138 @@
+<aside class="prompt" aria-label="Prompt structure" id="prompt-panel">
+    <header class="prompt-header">
+        <div class="prompt-title-block">
+            <p class="eyebrow">Prompt structure</p>
+            <h2 class="prompt-title">{{ prompt.participant_name }}</h2>
+            <p class="prompt-meta">
+                {{ prompt.components.len() }} parts /
+                system {{ prompt.system_char_count }} chars /
+                {{ prompt.history_count }} history /
+                {{ prompt.total_char_count }} total chars
+            </p>
+        </div>
+        <a class="button" href="/partials/live/{{ live_chat.id }}/prompt/{{ prompt.participant_id }}">Refresh</a>
+    </header>
+
+    <!-- Default view: the NEXT prompt that would be sent for this participant. -->
+    <div class="prompt-scroll" id="prompt-next-view">
+        {% if prompt.notes.len() > 0 %}
+            <ul class="prompt-notes">
+                {% for note in prompt.notes %}
+                    <li>{{ note }}</li>
+                {% endfor %}
+            </ul>
+        {% endif %}
+
+        {% if prompt.components.len() == 0 %}
+            <section class="empty-state">
+                <h2>No prompt to show</h2>
+                <p>No participant is selected.</p>
+            </section>
+        {% else %}
+            <p class="prompt-hint">Showing the <strong>next</strong> prompt. Click any message on the left to see what was injected for that turn.</p>
+            <ol class="prompt-list">
+                {% for component in prompt.components %}
+                    <li class="prompt-item is-{{ component.status }} group-{{ component.group }}">
+                        <div class="prompt-item-head">
+                            <span class="prompt-order">{{ component.order }}</span>
+                            <span class="prompt-label">{{ component.label }}</span>
+                            <span class="role role-{{ component.role }}">{{ component.role }}</span>
+                            <span class="prompt-status status-{{ component.status }}">{{ component.status }}</span>
+                            {% if component.char_count > 0 %}
+                                <span class="prompt-chars">{{ component.char_count }} ch</span>
+                            {% endif %}
+                        </div>
+                        {% if component.note.len() > 0 %}
+                            <p class="prompt-note">{{ component.note }}</p>
+                        {% endif %}
+                        {% if component.content.len() > 0 %}
+                            <pre class="prompt-content">{{ component.content }}</pre>
+                        {% endif %}
+                    </li>
+                {% endfor %}
+            </ol>
+        {% endif %}
+    </div>
+
+    <!-- Per-message view: what was injected / what actions ran for one message.
+         One hidden section per rendered message, keyed by its list position so a
+         clicked row maps unambiguously (message ids can repeat across segments).
+         JS reveals the matching section; "Back to next prompt" restores above. -->
+    <div class="prompt-scroll" id="prompt-message-view" hidden>
+        <button type="button" class="button prompt-back" id="prompt-back">&larr; Back to next prompt</button>
+        {% for message in messages %}
+            <section class="msg-detail" data-msg-detail="{{ loop.index0 }}" hidden>
+                <header class="msg-detail-head">
+                    <span class="speaker">{{ message.speaker_name }}</span>
+                    <span class="role role-{{ message.role }}">{{ message.role }}</span>
+                </header>
+                <p class="msg-detail-excerpt">{{ message.content }}</p>
+
+                {% match message.injected %}
+                {% when Some with (injected) %}
+                    {% if injected.lore.len() > 0 %}
+                        <div class="inj-group">
+                            <h4 class="inj-heading">Lorebook <span class="inj-count">{{ injected.lore.len() }}</span></h4>
+                            <ul class="inj-list">
+                                {% for entry in injected.lore %}
+                                    <li class="inj-item">
+                                        <span class="inj-title">{{ entry.title }}</span>
+                                        {% if entry.id.len() > 0 && entry.id != entry.title %}<span class="inj-id">{{ entry.id }}</span>{% endif %}
+                                        <span class="chip inj-reason inj-reason-{{ entry.reason }}">{{ entry.reason }}</span>
+                                    </li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                    {% endif %}
+                    {% if injected.quests.len() > 0 %}
+                        <div class="inj-group">
+                            <h4 class="inj-heading">Quest Book <span class="inj-count">{{ injected.quests.len() }}</span></h4>
+                            <ul class="inj-list">
+                                {% for entry in injected.quests %}
+                                    <li class="inj-item">
+                                        <span class="inj-title">{{ entry.title }}</span>
+                                        {% if entry.id.len() > 0 && entry.id != entry.title %}<span class="inj-id">{{ entry.id }}</span>{% endif %}
+                                        <span class="chip inj-reason inj-reason-{{ entry.reason }}">{{ entry.reason }}</span>
+                                    </li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                    {% endif %}
+                    {% if injected.actions.len() > 0 %}
+                        <div class="inj-group">
+                            <h4 class="inj-heading">Action Book <span class="inj-count">{{ injected.actions.len() }}</span></h4>
+                            <ul class="inj-list">
+                                {% for entry in injected.actions %}
+                                    <li class="inj-item">
+                                        <span class="inj-title">{{ entry.title }}</span>
+                                        {% if entry.id.len() > 0 && entry.id != entry.title %}<span class="inj-id">{{ entry.id }}</span>{% endif %}
+                                        <span class="chip inj-reason inj-reason-{{ entry.reason }}">{{ entry.reason }}</span>
+                                    </li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                    {% endif %}
+                {% when None %}
+                    <p class="inj-empty">No injection data recorded for this message.</p>
+                {% endmatch %}
+
+                {% if message.turn_actions.len() > 0 %}
+                    <div class="inj-group">
+                        <h4 class="inj-heading">Actions this turn <span class="inj-count">{{ message.turn_actions.len() }}</span></h4>
+                        <ul class="inj-list">
+                            {% for action in message.turn_actions %}
+                                <li class="inj-item action-item">
+                                    <span class="inj-title">{% if action.alias.len() > 0 %}{{ action.alias }}{% else %}{{ action.id }}{% endif %}</span>
+                                    <span class="inj-id">{{ action.id }}</span>
+                                    {% if action.target.len() > 0 %}<span class="chip action-target">target: {{ action.target }}</span>{% endif %}
+                                    {% if action.params.len() > 0 %}<code class="action-params">{{ action.params }}</code>{% endif %}
+                                    {% if action.reason.len() > 0 %}<p class="action-reason">{{ action.reason }}</p>{% endif %}
+                                </li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                {% endif %}
+            </section>
+        {% endfor %}
+    </div>
+</aside>

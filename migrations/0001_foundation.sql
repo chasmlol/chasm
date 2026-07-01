@@ -1,0 +1,15 @@
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS runtime_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    level TEXT NOT NULL,
+    target TEXT NOT NULL,
+    message TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+

@@ -1,0 +1,82 @@
+{% extends "layout.html" %}
+
+{% block title %}{{ book.name }} - Action Book - chasm{% endblock %}
+
+{% block body %}
+<main class="library-shell">
+    <aside class="library-rail" aria-label="Library navigation">
+        <a class="library-back" href="/action-books">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+            All Action Books
+        </a>
+        <p class="library-rail-eyebrow">Library</p>
+        <nav class="library-rail-nav" aria-label="Content books">
+            <a class="library-rail-link" href="/lorebooks">Lorebook</a>
+            <a class="library-rail-link" href="/quests">Quest Book</a>
+            <a class="library-rail-link is-active" href="/action-books">Action Book</a>
+        </nav>
+        {% if book.catalogs.len() > 0 %}
+            <p class="library-rail-eyebrow">Catalogs</p>
+            <ul class="library-rail-meta">
+                {% for catalog in book.catalogs %}
+                    <li>{{ catalog.name }} <span>{{ catalog.item_count }}</span></li>
+                {% endfor %}
+            </ul>
+        {% endif %}
+    </aside>
+
+    <section class="library-main">
+        <header class="library-head">
+            <p class="library-eyebrow">Action Book{% if book.target_game.len() > 0 %} · {{ book.target_game }}{% endif %}</p>
+            <h1 class="library-title">{{ book.name }}</h1>
+            {% if book.description.len() > 0 %}<p class="library-lede">{{ book.description }}</p>{% endif %}
+            <p class="library-sub">{{ book.entries.len() }} actions, sorted by priority (descending). Aliases are the exact short strings the model emits.</p>
+        </header>
+
+        {% if book.entries.len() == 0 %}
+            <section class="empty-state library-empty">
+                <h2>No actions in this book</h2>
+            </section>
+        {% else %}
+            <div class="entry-table-wrap">
+                <table class="entry-table action-table">
+                    <thead>
+                        <tr>
+                            <th>Alias</th>
+                            <th>Action id</th>
+                            <th>Title</th>
+                            <th>Risk</th>
+                            <th>Priority</th>
+                            <th>Activation</th>
+                            <th>Details</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for action in book.entries %}
+                            <tr class="{% if action.disable %}entry-disabled{% endif %}">
+                                <td><code class="entry-alias">{{ action.alias }}</code></td>
+                                <td><code>{{ action.action_id }}</code></td>
+                                <td><span class="entry-name">{{ action.title }}</span></td>
+                                <td><span class="risk risk-{{ action.risk_tier }}">{{ action.risk_tier }}</span></td>
+                                <td class="entry-num">{{ action.priority }}</td>
+                                <td class="entry-flags">
+                                    {% if action.disable %}<span class="chip chip-disabled">disabled</span>{% else if action.constant %}<span class="chip chip-constant">constant</span>{% else %}<span class="chip">keyword</span>{% endif %}
+                                    {% if action.vectorized %}<span class="chip chip-vectorized">vector</span>{% endif %}
+                                </td>
+                                <td class="entry-detail">
+                                    {% if action.description.len() > 0 %}<p class="entry-body">{{ action.description }}</p>{% endif %}
+                                    {% if action.scoped_catalogs_label.len() > 0 %}<p class="entry-meta">Scoped catalogs: {{ action.scoped_catalogs_label }}</p>{% endif %}
+                                    {% if action.scopes_label.len() > 0 %}<p class="entry-meta">Scopes: {{ action.scopes_label }}</p>{% endif %}
+                                    {% if action.keys_label.len() > 0 %}<p class="entry-meta">Keys: {{ action.keys_label }}</p>{% endif %}
+                                    {% if action.tags_label.len() > 0 %}<p class="entry-meta">Tags: {{ action.tags_label }}</p>{% endif %}
+                                </td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        {% endif %}
+        <p class="library-path" title="{{ data_root }}">Reading from the active profile, fallback {{ data_root }}/headless/action-books</p>
+    </section>
+</main>
+{% endblock %}

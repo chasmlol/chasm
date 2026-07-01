@@ -1,0 +1,462 @@
+diff --git a/qwen_tts/core/models/modeling_qwen3_tts.py b/qwen_tts/core/models/modeling_qwen3_tts.py
+index a3eb30a..8afaa3d 100644
+--- a/qwen_tts/core/models/modeling_qwen3_tts.py
++++ b/qwen_tts/core/models/modeling_qwen3_tts.py
+@@ -26,7 +26,7 @@ from librosa.filters import mel as librosa_mel_fn
+ from torch import nn
+ from torch.nn import functional as F
+ from transformers.activations import ACT2FN
+-from transformers.cache_utils import Cache, DynamicCache
++from transformers.cache_utils import Cache, DynamicCache, StaticCache
+ from transformers.generation import GenerationMixin
+ from transformers.integrations import use_kernel_forward_from_hub
+ from transformers.masking_utils import (create_causal_mask,
+@@ -1632,6 +1632,376 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel,
+         sub_talker_loss = sub_talker_outputs.loss
+         return sub_talker_logits, sub_talker_loss
+ 
++    @torch.no_grad()
++    def _predict_residual_codes_fast(
++        self,
++        past_hidden,
++        last_id_hidden,
++        do_sample=True,
++        top_k=50,
++        top_p=1.0,
++        temperature=0.9,
++    ):
++        """Manual autoregressive residual-code prediction.
++
++        Faithful drop-in for the per-frame ``code_predictor.generate(...)`` mini-loop,
++        but without the HuggingFace ``GenerationMixin`` machinery (logits-processor
++        construction, cache allocation, kwarg validation, stopping criteria) that was
++        being re-initialised ~85 times per utterance and dominated wall time.
++
++        Runs exactly ``num_code_groups - 1`` decode steps (no EOS early-stop on the
++        sub-talker, matching the original which set no min/eos for this loop) and
++        returns the sampled residual code ids of shape ``[B, num_code_groups - 1]``.
++        """
++        cp = self.code_predictor
++        num_steps = self.config.num_code_groups - 1
++
++        # Prefill over [past_hidden, last_id_hidden] (length 2). The CP forward's
++        # prefill branch sets generation_steps = seq_len - 2 = 0 and returns logits
++        # from lm_head[0] for the last position.
++        prefill_embeds = torch.cat((past_hidden, last_id_hidden), dim=1)
++        prefill_embeds = cp.small_to_mtp_projection(prefill_embeds)
++        outputs = cp.model(
++            input_ids=None,
++            inputs_embeds=prefill_embeds,
++            use_cache=True,
++            past_key_values=None,
++        )
++        past_key_values = outputs.past_key_values
++        hidden_last = outputs.last_hidden_state[:, -1:, :]  # [B,1,H]
++
++        codes = []
++        for step in range(num_steps):
++            logits = cp.lm_head[step](hidden_last)[:, -1, :]  # [B, vocab]
++            next_id = self._sample_token(logits, do_sample, top_k, top_p, temperature)  # [B,1]
++            codes.append(next_id)
++            if step == num_steps - 1:
++                break
++            # Embed the just-sampled code with codec_embedding[step] (== get_input_embeddings()[step]),
++            # then run a single-token decode step. CP.forward's generate branch does
++            # inputs_embeds = embed[generation_steps-1](input_ids) with generation_steps=step+1,
++            # i.e. embed index = step. We inline the embed to avoid the generation_steps plumbing.
++            step_embed = cp.model.get_input_embeddings()[step](next_id)  # [B,1,Hcp_in]
++            step_embed = cp.small_to_mtp_projection(step_embed)
++            outputs = cp.model(
++                input_ids=None,
++                inputs_embeds=step_embed,
++                use_cache=True,
++                past_key_values=past_key_values,
++            )
++            past_key_values = outputs.past_key_values
++            hidden_last = outputs.last_hidden_state[:, -1:, :]
++
++        return torch.cat(codes, dim=-1)  # [B, num_steps]
++
++    @staticmethod
++    def _sample_token(logits, do_sample, top_k, top_p, temperature):
++        """Match HF _sample for (temperature, top_k, top_p, multinomial/greedy)."""
++        if not do_sample:
++            return torch.argmax(logits, dim=-1, keepdim=True)
++        if temperature is not None and temperature != 1.0:
++            logits = logits / temperature
++        if top_k is not None and top_k > 0:
++            k = min(top_k, logits.shape[-1])
++            kth = torch.topk(logits, k, dim=-1).values[..., -1, None]
++            logits = logits.masked_fill(logits < kth, float("-inf"))
++        if top_p is not None and top_p < 1.0:
++            sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
++            probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
++            remove = probs - torch.softmax(sorted_logits, dim=-1) > top_p
++            remove[..., 0] = False
++            sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
++            logits = torch.empty_like(logits).scatter_(-1, sorted_idx, sorted_logits)
++        probs = torch.softmax(logits, dim=-1)
++        return torch.multinomial(probs, num_samples=1)
++
++    # ------------------------------------------------------------------
++    # CUDA-graph fast path
++    # ------------------------------------------------------------------
++    # The autoregressive codec loop is bottlenecked by per-step kernel-launch
++    # overhead, not compute (a 6 s clip is ~85 talker frames, each running a
++    # nested 15-step residual loop -> ~1300 tiny single-token forwards). Static
++    # KV caches + captured CUDA graphs replay each decode step as one launch.
++    # ``torch.compile`` / inductor is unavailable here (triton-windows is
++    # incompatible with this torch build), so we capture the graphs by hand.
++
++    def _cp_residual_codes_inline(self, past_hidden, last_id_hidden, sampler):
++        """Residual-code loop run *inline* (no inner graph) so the whole thing can be
++        captured by the enclosing frame graph. Uses a freshly-reset StaticCache.
++        ``sampler`` maps logits -> token id [1,1] (greedy or captured-multinomial)."""
++        cp = self.code_predictor
++        ncg = self.config.num_code_groups
++        cache = self._cp_cache
++        cache.reset()
++        prefill = cp.small_to_mtp_projection(torch.cat((past_hidden, last_id_hidden), dim=1))
++        out = cp.model(
++            input_ids=None, inputs_embeds=prefill, use_cache=True,
++            past_key_values=cache, cache_position=self._cp_pos2,
++        )
++        hidden = out.last_hidden_state[:, -1:, :]
++        code_ids = []
++        code_embeds = [last_id_hidden]
++        for step in range(ncg - 1):
++            nid = sampler(cp.lm_head[step](hidden)[:, -1, :])      # [1,1]
++            code_ids.append(nid)
++            emb_full = cp.model.get_input_embeddings()[step](nid)  # [1,1,H]
++            code_embeds.append(emb_full)
++            if step == ncg - 2:
++                break
++            emb = cp.small_to_mtp_projection(emb_full)
++            out = cp.model(
++                input_ids=None, inputs_embeds=emb, use_cache=True,
++                past_key_values=cache, cache_position=self._cp_step_pos[step],
++            )
++            hidden = out.last_hidden_state[:, -1:, :]
++        residual = torch.cat(code_ids, dim=-1)                     # [1, ncg-1]
++        code_embed_sum = torch.cat(code_embeds, dim=1).sum(1, keepdim=True)  # [1,1,H]
++        return residual, code_embed_sum
++
++    def _frame_body(self):
++        """One full decode frame, expressed purely over preallocated buffers so it can
++        be captured as a single CUDA graph. Reads ``_tk_emb``/``_tk_pos``/``_tk_cpos``
++        (set by the caller for this frame) and writes ``_out_first``, ``_out_residual``,
++        ``_out_code_embed_sum`` and advances ``_pen_mask``."""
++        ncg = self.config.num_code_groups
++        rp = self._rp_value
++
++        # talker decode for this frame
++        tk_out = self.model(
++            input_ids=None, inputs_embeds=self._tk_emb, position_ids=self._tk_pos,
++            use_cache=True, past_key_values=self._tk_cache, cache_position=self._tk_cpos,
++        )
++        hidden = tk_out.last_hidden_state[:, -1:, :]               # [1,1,H]
++        logits = self.codec_head(hidden)[:, -1, :].float()        # [1,V]
++
++        # repetition penalty over already-seen first-codebook tokens (boolean mask)
++        if rp != 1.0:
++            pen = torch.where(logits < 0, logits * rp, logits / rp)
++            logits = torch.where(self._pen_mask, pen, logits)
++        logits = logits + self._suppress_bias                     # -inf on suppressed
++        logits = logits + self._minlen_bias                       # -inf on eos pre-min-len (set per call window)
++        first = self._sample_token(logits, self._do_sample, self._top_k, self._top_p, self._temperature)  # [1,1]
++
++        # mark this token as seen for future repetition penalty
++        self._pen_mask.index_fill_(1, first[0], True)
++
++        last_id_hidden = self.get_input_embeddings()(first)       # [1,1,H]
++
++        def sub_sampler(lg):
++            return self._sample_token(lg, self._sub_do_sample, self._sub_top_k,
++                                      self._sub_top_p, self._sub_temperature)
++
++        residual, code_embed_sum = self._cp_residual_codes_inline(hidden, last_id_hidden, sub_sampler)
++
++        self._out_first.copy_(first)
++        self._out_residual.copy_(residual)
++        self._out_code_embed_sum.copy_(code_embed_sum)
++
++    def _ensure_cuda_graphs(self, talker_max_len):
++        """Lazily allocate StaticCaches + buffers and capture a single whole-frame
++        graph (talker decode + codec head + sampling + nested residual loop). The
++        graph collapses ~80 per-frame kernel launches into one replay."""
++        cg = getattr(self, "_cudagraph", None)
++        if cg is not None and cg["talker_max_len"] >= talker_max_len:
++            return cg
++        if cg is not None:
++            self._cudagraph = None
++            torch.cuda.synchronize()
++
++        device = self.device
++        dtype = next(self.parameters()).dtype
++        cp = self.code_predictor
++        th = self.config.hidden_size
++        V = self.config.vocab_size
++        ncg = self.config.num_code_groups
++
++        # caches
++        self._cp_cache = StaticCache(config=cp.config, max_batch_size=1, max_cache_len=ncg,
++                                     device=device, dtype=dtype)
++        self._tk_cache = StaticCache(config=self.config, max_batch_size=1,
++                                     max_cache_len=int(talker_max_len), device=device, dtype=dtype)
++        # constant index buffers for the inline CP loop
++        self._cp_pos2 = torch.arange(2, device=device)
++        self._cp_step_pos = [torch.tensor([2 + i], device=device) for i in range(ncg - 1)]
++
++        # per-frame input buffers
++        self._tk_emb = torch.zeros(1, 1, th, device=device, dtype=dtype)
++        self._tk_pos = torch.zeros(3, 1, 1, device=device, dtype=torch.long)
++        self._tk_cpos = torch.zeros(1, device=device, dtype=torch.long)
++        # output buffers
++        self._out_first = torch.zeros(1, 1, device=device, dtype=torch.long)
++        self._out_residual = torch.zeros(1, ncg - 1, device=device, dtype=torch.long)
++        self._out_code_embed_sum = torch.zeros(1, 1, th, device=device, dtype=dtype)
++        # sampling state
++        self._pen_mask = torch.zeros(1, V, device=device, dtype=torch.bool)
++        self._suppress_bias = torch.zeros(1, V, device=device, dtype=torch.float32)
++        self._minlen_bias = torch.zeros(1, V, device=device, dtype=torch.float32)
++
++        # prime caches with a dummy prefill so a single-token decode is valid
++        self._tk_cache.reset()
++        prime_len = 4
++        with torch.no_grad():
++            self.model(
++                input_ids=None,
++                inputs_embeds=torch.zeros(1, prime_len, th, device=device, dtype=dtype),
++                position_ids=torch.arange(prime_len, device=device).view(1, 1, -1).expand(3, 1, -1),
++                use_cache=True, past_key_values=self._tk_cache,
++                cache_position=torch.arange(prime_len, device=device),
++            )
++        self._tk_cpos.fill_(prime_len)
++        self._tk_pos.fill_(prime_len)
++
++        # warm on a side stream, then capture the whole frame
++        s = torch.cuda.Stream()
++        s.wait_stream(torch.cuda.current_stream())
++        with torch.cuda.stream(s):
++            with torch.no_grad():
++                for _ in range(3):
++                    self._frame_body()
++        torch.cuda.current_stream().wait_stream(s)
++
++        cg = {"talker_max_len": int(talker_max_len)}
++        cg["frame_graph"] = torch.cuda.CUDAGraph()
++        with torch.no_grad():
++            with torch.cuda.graph(cg["frame_graph"]):
++                self._frame_body()
++        self._cudagraph = cg
++        return cg
++
++    @torch.no_grad()
++    def generate_codes_cuda_graph(
++        self,
++        talker_input_embeds,        # [1, P, H] (single sequence, no left padding)
++        trailing_text_hidden,       # [1, T, H]
++        tts_pad_embed,              # [1, 1, H]
++        max_new_tokens=4096,
++        min_new_tokens=2,
++        do_sample=True,
++        top_k=50,
++        top_p=1.0,
++        temperature=0.9,
++        subtalker_dosample=True,
++        subtalker_top_k=50,
++        subtalker_top_p=1.0,
++        subtalker_temperature=0.9,
++        eos_token_id=None,
++        repetition_penalty=1.05,
++        suppress_tokens=None,
++        **kwargs,
++    ):
++        """Manual, CUDA-graph-accelerated replacement for ``self.talker.generate``
++        (batch=1, no padding). Returns ``talker_codes`` [num_frames, num_code_groups].
++
++        Reproduces the HF sampling pipeline used by the original talker loop:
++        repetition-penalty -> suppress-tokens -> min-new-tokens(eos) -> temperature
++        -> top-k -> top-p -> multinomial, with the nested residual-code prediction
++        per frame.
++        """
++        device = talker_input_embeds.device
++        P = talker_input_embeds.shape[1]
++        ncg = self.config.num_code_groups
++        V = self.config.vocab_size
++        if eos_token_id is None:
++            eos_token_id = self.config.codec_eos_token_id
++        max_new_tokens = int(max_new_tokens)
++        # The talker uses a StaticCache, and with a static cache every decode step
++        # attends over the *entire* allocated buffer (masked) regardless of how many
++        # slots are filled. Sizing it to the full 4096 max_new_tokens would make each
++        # frame attend over ~4k positions and roughly doubles per-frame cost. Cap the
++        # cache to a realistic ceiling (TTS lines are a handful of seconds; 12.5 Hz so
++        # 768 frames ~= 60 s of audio) so attention work stays small. Generation still
++        # stops at eos; we also clamp max_new_tokens to the cache budget.
++        TALKER_CACHE_CAP = 768
++        talker_budget = min(max_new_tokens, TALKER_CACHE_CAP)
++        max_new_tokens = talker_budget
++        talker_max_len = P + talker_budget + 2
++
++        # Publish sampling params *before* capture: the frame graph bakes the
++        # rp/sampling branches at capture time, so these attrs must exist first.
++        self._rp_value = float(repetition_penalty) if repetition_penalty else 1.0
++        self._do_sample = bool(do_sample); self._top_k = top_k; self._top_p = top_p; self._temperature = temperature
++        self._sub_do_sample = bool(subtalker_dosample); self._sub_top_k = subtalker_top_k
++        self._sub_top_p = subtalker_top_p; self._sub_temperature = subtalker_temperature
++
++        cg = self._ensure_cuda_graphs(talker_max_len)
++
++        self._pen_mask.zero_()
++        self._suppress_bias.zero_()
++        if suppress_tokens:
++            self._suppress_bias[0, torch.tensor(suppress_tokens, device=device, dtype=torch.long)] = float("-inf")
++        self._minlen_bias.zero_()
++        self._minlen_bias[0, eos_token_id] = float("-inf")  # block eos until >= min_new_tokens
++
++        def sample_codec_eager(logits, step_idx):
++            logits = logits.float()
++            if self._rp_value != 1.0:
++                pen = torch.where(logits < 0, logits * self._rp_value, logits / self._rp_value)
++                logits = torch.where(self._pen_mask, pen, logits)
++            logits = logits + self._suppress_bias
++            if step_idx < min_new_tokens:
++                logits = logits + self._minlen_bias
++            return self._sample_token(logits, self._do_sample, self._top_k, self._top_p, self._temperature)
++
++        def sub_sampler_eager(lg):
++            return self._sample_token(lg, self._sub_do_sample, self._sub_top_k, self._sub_top_p, self._sub_temperature)
++
++        self._tk_cache.reset()
++        rope_delta = 0  # batch=1, no padding
++
++        # ---- eager prefill + frame 0 (the first codec token comes from prefill) ----
++        pos_prefill = torch.arange(P, device=device).view(1, 1, -1).expand(3, 1, -1)
++        out = self.model(
++            input_ids=None, inputs_embeds=talker_input_embeds, position_ids=pos_prefill,
++            use_cache=True, past_key_values=self._tk_cache, cache_position=torch.arange(P, device=device),
++        )
++        hidden = out.last_hidden_state[:, -1:, :]
++        first = sample_codec_eager(self.codec_head(hidden)[:, -1, :], 0)
++        self._pen_mask.index_fill_(1, first[0], True)
++        last_id_hidden = self.get_input_embeddings()(first)
++        residual, code_embed_sum = self._cp_residual_codes_inline(hidden, last_id_hidden, sub_sampler_eager)
++
++        # first-codebook ids tracked on-GPU for an amortised eos scan
++        first_ids = torch.full((max_new_tokens,), -1, device=device, dtype=torch.long)
++        all_codes = [torch.cat((first, residual), dim=-1)]
++        first_ids[0] = first[0, 0]
++        cur_pos = P
++        EOS_CHECK = 24
++        stop_frame = None
++        num_frames = 1
++
++        for frame in range(1, max_new_tokens):
++            # min-new-tokens window: once satisfied, stop biasing eos to -inf.
++            if frame == min_new_tokens:
++                self._minlen_bias.zero_()
++            # next talker input embedding = previous frame's code-embed sum + this frame's text
++            if frame - 1 < trailing_text_hidden.shape[1]:
++                next_emb = code_embed_sum + trailing_text_hidden[:, frame - 1].unsqueeze(1)
++            else:
++                next_emb = code_embed_sum + tts_pad_embed
++            self._tk_emb.copy_(next_emb)
++            self._tk_cpos.fill_(cur_pos)
++            self._tk_pos.fill_(cur_pos + rope_delta)
++
++            cg["frame_graph"].replay()
++
++            first_ids[frame] = self._out_first[0, 0]
++            all_codes.append(torch.cat((self._out_first, self._out_residual), dim=-1).clone())
++            code_embed_sum = self._out_code_embed_sum  # buffer; consumed before next replay overwrites it
++            cur_pos += 1
++            num_frames = frame + 1
++
++            if frame >= min_new_tokens and (frame + 1) % EOS_CHECK == 0:
++                hits = torch.nonzero(first_ids[:frame + 1] == eos_token_id, as_tuple=False)
++                if hits.numel() > 0:
++                    stop_frame = int(hits[0].item())
++                    break
++
++        codes = torch.cat(all_codes, dim=0)  # [num_frames, ncg]
++        if stop_frame is None:
++            hits = torch.nonzero(first_ids[:num_frames] == eos_token_id, as_tuple=False)
++            stop_frame = int(hits[0].item()) if hits.numel() > 0 else num_frames
++        return codes[:stop_frame]
++
+     @can_return_tuple
+     def forward(
+         self,
+@@ -1668,20 +2038,32 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel,
+         # Generate
+         else:
+             last_id_hidden = self.get_input_embeddings()(input_ids)
+-            predictor_result = self.code_predictor.generate(
+-                inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
+-                max_new_tokens=self.config.num_code_groups - 1,
+-                do_sample=subtalker_dosample,
+-                top_p=subtalker_top_p,
+-                top_k=subtalker_top_k,
+-                temperature=subtalker_temperature,
+-                output_hidden_states=True,
+-                return_dict_in_generate=True,
+-            )
+-            codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
++            if os.environ.get("QWEN3_FAST_SUBTALKER", "1") != "0":
++                # Fast path: manual residual-code loop (no nested HF generate).
++                residual_codes = self._predict_residual_codes_fast(
++                    past_hidden=past_hidden,
++                    last_id_hidden=last_id_hidden,
++                    do_sample=subtalker_dosample,
++                    top_k=subtalker_top_k,
++                    top_p=subtalker_top_p,
++                    temperature=subtalker_temperature,
++                )
++            else:
++                predictor_result = self.code_predictor.generate(
++                    inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
++                    max_new_tokens=self.config.num_code_groups - 1,
++                    do_sample=subtalker_dosample,
++                    top_p=subtalker_top_p,
++                    top_k=subtalker_top_k,
++                    temperature=subtalker_temperature,
++                    output_hidden_states=True,
++                    return_dict_in_generate=True,
++                )
++                residual_codes = predictor_result.sequences
++            codec_ids = torch.cat((input_ids, residual_codes), dim=-1)
+             codec_hiddens = torch.cat(
+                 [last_id_hidden]
+-                + [self.code_predictor.get_input_embeddings()[i](predictor_result.sequences[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
++                + [self.code_predictor.get_input_embeddings()[i](residual_codes[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
+                 dim=1,
+             )
+             inputs_embeds = codec_hiddens.sum(1, keepdim=True)
+@@ -2268,6 +2650,26 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
+         padded_hiddens[padding_mask] = pad_embedding_vector
+         trailing_text_hiddens = padded_hiddens
+ 
++        # Fast path: batch=1 with no left padding -> manual CUDA-graph decode loop.
++        # This skips the HF GenerationMixin loop (which re-inits logits processors,
++        # caches and a nested per-frame generate ~85x) in favour of replaying two
++        # captured graphs (talker stack + code predictor). Falls back to the stock
++        # path for batches, padded inputs, or when disabled via env.
++        use_graphs = (
++            os.environ.get("QWEN3_CUDA_GRAPHS", "1") != "0"
++            and batch_size == 1
++            and bool((talker_attention_mask == 1).all())
++            and torch.cuda.is_available()
++        )
++        if use_graphs:
++            talker_codes_single = self.talker.generate_codes_cuda_graph(
++                talker_input_embeds=talker_input_embeds,
++                trailing_text_hidden=trailing_text_hiddens,
++                tts_pad_embed=tts_pad_embed,
++                **talker_kwargs,
++            )  # [num_frames, ncg], already truncated at eos
++            return [talker_codes_single], [None]
++
+         # forward
+         talker_result = self.talker.generate(
+             inputs_embeds=talker_input_embeds,

@@ -1,0 +1,17 @@
+[package]
+name = "chasm"
+version = "0.2.18"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chasm-core = { path = "../../crates/chasm-core" }
+chasm-embed = { path = "../../crates/chasm-embed" }
+chasm-web = { path = "../../crates/chasm-web" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+

@@ -1,0 +1,104 @@
+import type { ComponentType } from "react";
+import {
+  MessagesSquare,
+  Users,
+  BookText,
+  ScrollText,
+  Swords,
+  Variable,
+  SlidersHorizontal,
+  Layers,
+  Cpu,
+  AudioLines,
+  Mic,
+  Database,
+  Cable,
+  Activity,
+  Download,
+} from "lucide-react";
+
+// ===========================================================================
+// Navigation config — the single source of truth for the persistent sidebar.
+// The shell renders these groups; each item routes to its screen in the content
+// pane (via react-router). Adding/moving a screen is a one-line change here.
+//
+// `path` is RELATIVE to the app basename (/app). The router (App.tsx) maps the
+// same paths to screen components.
+// ===========================================================================
+
+export interface NavItem {
+  /** Stable key (also the settings `category` for settings items). */
+  key: string;
+  label: string;
+  /** Route path relative to /app (e.g. "chat", "settings/llm"). */
+  path: string;
+  icon: ComponentType<{ className?: string; strokeWidth?: number }>;
+}
+
+export interface NavGroup {
+  label: string;
+  items: NavItem[];
+}
+
+export const NAV_GROUPS: NavGroup[] = [
+  {
+    label: "Main",
+    items: [
+      { key: "chat", label: "Chat", path: "chat", icon: MessagesSquare },
+      {
+        key: "characters",
+        label: "Characters Book",
+        path: "characters",
+        icon: Users,
+      },
+      { key: "lore", label: "Lore Book", path: "lore", icon: BookText },
+      { key: "quest", label: "Quest Book", path: "quest", icon: ScrollText },
+      { key: "action", label: "Action Book", path: "action", icon: Swords },
+      {
+        key: "gamestate",
+        label: "Gamestate",
+        path: "gamestate",
+        icon: Variable,
+      },
+    ],
+  },
+  {
+    label: "Settings",
+    items: [
+      {
+        key: "interface",
+        label: "Interface",
+        path: "settings/interface",
+        icon: SlidersHorizontal,
+      },
+      {
+        key: "profiles",
+        label: "Profiles",
+        path: "settings/profiles",
+        icon: Layers,
+      },
+      { key: "llm", label: "LLM", path: "settings/llm", icon: Cpu },
+      { key: "tts", label: "TTS", path: "settings/tts", icon: AudioLines },
+      { key: "stt", label: "STT", path: "settings/stt", icon: Mic },
+      {
+        key: "retrieval",
+        label: "Retrieval",
+        path: "settings/retrieval",
+        icon: Database,
+      },
+      { key: "bridge", label: "Bridge", path: "settings/bridge", icon: Cable },
+      {
+        key: "tracing",
+        label: "Tracing",
+        path: "settings/tracing",
+        icon: Activity,
+      },
+      {
+        key: "updates",
+        label: "Updates",
+        path: "settings/updates",
+        icon: Download,
+      },
+    ],
+  },
+];

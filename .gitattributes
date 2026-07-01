@@ -1,0 +1,5 @@
+# Patch files must stay LF regardless of platform: scripts/install-engine.ps1
+# runs `git apply` on them against freshly-cloned upstream sources (which are
+# LF), and on Windows core.autocrlf would otherwise rewrite the patch to CRLF
+# and make the apply fail.
+*.patch text eol=lf

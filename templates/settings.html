@@ -1,0 +1,772 @@
+{% extends "layout.html" %}
+
+{% block title %}Settings - chasm{% endblock %}
+
+{% block body %}
+<main class="settings-shell">
+    <aside class="settings-nav" aria-label="Settings categories">
+        <a class="settings-back" href="/">&larr; Back to chat</a>
+        <p class="eyebrow">Settings</p>
+        <nav class="settings-nav-list">
+            {% for group in page.nav_groups %}
+                {% if group.items.len() > 0 %}
+                    <p class="settings-nav-group">{{ group.label }}</p>
+                    {% for item in group.items %}
+                        <a class="settings-nav-link{% if item.active %} is-active{% endif %}" href="/settings/{{ item.key }}">{{ item.label }}</a>
+                    {% endfor %}
+                {% endif %}
+            {% endfor %}
+        </nav>
+        <p class="settings-path" title="{{ page.settings_path }}">Saved to {{ page.settings_path }}</p>
+    </aside>
+
+    <section class="settings-main">
+        {% if page.saved %}
+            <div class="settings-flash" role="status">
+                <span class="settings-flash-icon" aria-hidden="true">&#10003;</span> Settings saved.
+            </div>
+        {% endif %}
+
+        {% if page.category == "interface" %}
+            <form class="settings-form" method="post" action="/settings/interface">
+                <header class="settings-head">
+                    <p class="settings-eyebrow">Appearance</p>
+                    <h1 class="settings-title">Interface</h1>
+                    <p class="settings-lede">Theme the control panel. Every option here is emitted into a live <code>/theme.css</code> stylesheet read fresh on each page load, so changes apply on the next navigation &mdash; no restart.</p>
+                </header>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Theme <span class="chev" aria-hidden="true"></span></summary>
+                    <p class="field-help">Sets the base dark palette. The accent below applies on top of whichever preset you pick.</p>
+                    <div class="swatch-grid">
+                        {% for theme in page.interface.themes %}
+                            <label class="swatch-card{% if theme.selected %} is-selected{% endif %}">
+                                <input type="radio" name="theme" value="{{ theme.id }}"{% if theme.selected %} checked{% endif %}>
+                                <span class="swatch-preview" style="background:{{ theme.bg }}"><span class="swatch-chip" style="background:{{ theme.panel }}"></span></span>
+                                <span class="swatch-name">{{ theme.label }}</span>
+                            </label>
+                        {% endfor %}
+                    </div>
+                </details>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Accent colour <span class="chev" aria-hidden="true"></span></summary>
+                    <p class="field-help">Drives the primary button, links, focus rings and highlight badges (the <code>--accent</code> token).</p>
+                    <div class="field-row">
+                        <input type="color" name="accent" id="accent" class="color-input" value="{{ page.interface.accent }}">
+                        <output class="range-output" id="accent-readout">{{ page.interface.accent }}</output>
+                        <span class="accent-presets">
+                            {% for accent in page.interface.accents %}
+                                <button type="button" class="accent-dot{% if accent.selected %} is-selected{% endif %}" style="background:{{ accent.value }}" data-accent="{{ accent.value }}" title="{{ accent.label }}" aria-label="{{ accent.label }}"></button>
+                            {% endfor %}
+                        </span>
+                    </div>
+                </details>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Layout <span class="chev" aria-hidden="true"></span></summary>
+                    <label class="field-label" for="density">Density</label>
+                    <p class="field-help">Compact tightens padding across the shells, cards and message rows.</p>
+                    <div class="seg-toggle">
+                        {% for option in page.interface.densities %}
+                            <label class="seg-option"><input type="radio" name="density" value="{{ option.value }}"{% if option.selected %} checked{% endif %}> {{ option.label }}</label>
+                        {% endfor %}
+                    </div>
+
+                    <div class="field-row range-row">
+                        <label for="font_scale">Font scale</label>
+                        <input type="range" id="font_scale" name="font_scale"
+                            min="{{ page.interface.font_scale_min }}" max="{{ page.interface.font_scale_max }}" step="{{ page.interface.font_scale_step }}"
+                            value="{{ page.interface.font_scale }}" oninput="this.nextElementSibling.value = this.value + '%'">
+                        <output class="range-output">{{ page.interface.font_scale }}%</output>
+                    </div>
+                    <p class="field-help">Scales the whole UI via the root font size (90&ndash;120%).</p>
+
+                    <label class="checkbox"><input type="checkbox" name="show_prompt_panel"{% if page.interface.show_prompt_panel %} checked{% endif %}> Show the prompt-inspector column on chat pages</label>
+                    <p class="field-help">When off, the right-hand prompt panel is collapsed and chat gets the extra width.</p>
+                </details>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Motion &amp; chrome <span class="chev" aria-hidden="true"></span></summary>
+                    <label class="checkbox"><input type="checkbox" name="reduce_motion"{% if page.interface.reduce_motion %} checked{% endif %}> Reduce motion (disable transitions &amp; animations)</label>
+                    <label class="checkbox"><input type="checkbox" name="show_timestamps"{% if page.interface.show_timestamps %} checked{% endif %}> Show message timestamps</label>
+                </details>
+
+                <div class="settings-actions">
+                    <button type="submit" class="button primary">Save appearance</button>
+                </div>
+            </form>
+
+        {% else if page.category == "profiles" %}
+            <header class="settings-head">
+                <p class="settings-eyebrow">Content</p>
+                <h1 class="settings-title">Game profiles</h1>
+                <p class="settings-lede">Profiles are drop-in folders that supply a game's characters, lore, quests, actions and voices. Activating one points the whole bridge &mdash; chat, prompts, voices and the headless API &mdash; at that game's content.</p>
+            </header>
+
+            <div class="profile-cards">
+                {% for profile in page.profiles.profiles %}
+                    <article class="profile-card{% if profile.active %} is-active{% endif %}">
+                        <div class="profile-card-badge" aria-hidden="true">{{ profile.initials }}</div>
+                        <div class="profile-card-body">
+                            <div class="profile-card-headline">
+                                <h2 class="profile-card-name">{{ profile.name }}</h2>
+                                {% if profile.active %}<span class="tag-badge yes">Active</span>{% endif %}
+                            </div>
+                            {% if profile.description.len() > 0 %}
+                                <p class="profile-card-desc">{{ profile.description }}</p>
+                            {% endif %}
+                            <ul class="profile-stats">
+                                <li><strong>{{ profile.character_count }}</strong> <small>characters</small></li>
+                                <li><strong>{{ profile.lorebook_count }}</strong> <small>lorebooks</small></li>
+                                <li><strong>{{ profile.quest_count }}</strong> <small>quests</small></li>
+                                <li><strong>{{ profile.action_count }}</strong> <small>actions</small></li>
+                                <li><strong>{{ profile.cloned_voice_count }}</strong> <small>voices cloned</small></li>
+                            </ul>
+                        </div>
+                        <div class="profile-card-action">
+                            {% if profile.active %}
+                                <button type="button" class="button small" disabled>Active</button>
+                            {% else %}
+                                <button type="button" class="button small primary profile-activate" data-profile-id="{{ profile.id }}">Activate</button>
+                            {% endif %}
+                        </div>
+                    </article>
+                {% endfor %}
+            </div>
+
+            <details class="settings-group" open>
+                <summary class="settings-legend">How to add a profile <span class="chev" aria-hidden="true"></span></summary>
+                <p class="settings-note">Drop a folder into the profiles directory containing a <code>profile.json</code> (id, name, description, characters) plus the content dirs:</p>
+                <ul class="howto-list">
+                    <li><code>characters/</code> &mdash; SillyTavern character cards (<code>.png</code> / folder cards)</li>
+                    <li><code>worlds/</code> &mdash; World Info / lorebook JSON files</li>
+                    <li><code>headless/quest-books/</code> &mdash; quest book JSON</li>
+                    <li><code>headless/action-books/</code> &mdash; action book JSON</li>
+                    <li><code>voices/</code> &mdash; per-character reference clips (cloned per engine)</li>
+                </ul>
+                <p class="settings-note">Profiles directory: <code>{{ page.profiles.profiles_dir }}</code>. Reload this page after dropping a folder in, then Activate it.</p>
+            </details>
+
+        {% else if page.category == "tts" %}
+            <form class="settings-form" method="post" action="/settings/tts">
+                <header class="settings-head">
+                    <p class="settings-eyebrow">AI</p>
+                    <h1 class="settings-title">Text-to-Speech</h1>
+                    <p class="settings-lede">The voice the game speaks with. Tuning below is applied live by the warm worker on every line.</p>
+                </header>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Output <span class="chev" aria-hidden="true"></span></summary>
+                    <div class="seg-toggle">
+                        <label class="seg-option"><input type="radio" name="mode" value="local" data-tts-mode{% if page.tts.is_local %} checked{% endif %}> Local TTS</label>
+                        <label class="seg-option"><input type="radio" name="mode" value="api" data-tts-mode{% if page.tts.is_api %} checked{% endif %}> API TTS</label>
+                    </div>
+                </details>
+
+                <details class="settings-group" data-tts-section="local" open>
+                    <summary class="settings-legend">Local engine <span class="chev" aria-hidden="true"></span></summary>
+                    <ul class="engine-list pick-list">
+                        {% for engine in page.tts.local_engines %}
+                            <li class="pick-row{% if engine.selected %} is-selected{% endif %}">
+                                <label class="pick-label">
+                                    <input type="radio" name="local_engine" value="{{ engine.value }}"{% if engine.selected %} checked{% endif %}>
+                                    <span class="engine-name">{{ engine.label }}</span>
+                                </label>
+                                <span class="engine-actions">
+                                    {% if engine.running %}<span class="install-pill is-installed">● Running</span>{% endif %}
+                                    <span class="install-pill is-{{ engine.status }}">{{ engine.status_label }}</span>
+                                    {% if engine.can_download %}
+                                        <button type="submit" class="button small" formaction="/engines/{{ engine.value }}/install" formmethod="post">Download</button>
+                                    {% else if engine.installing %}
+                                        <a class="button small" href="/settings/tts">Refresh</a>
+                                    {% endif %}
+                                </span>
+                            </li>
+                        {% endfor %}
+                    </ul>
+                    <p class="settings-note">For TTS the engine <em>is</em> its own runtime &mdash; the status pill above each engine is its runtime status (Installed / Not installed / Installing). Pick the engine to use with its radio &mdash; saving spawns it on the TTS port (<code>:5002</code>) and the <span class="install-pill is-installed">● Running</span> badge marks the live one. Both engines stream the same way. <strong>PocketTTS</strong> installs into an isolated <code>uv</code> virtualenv via Download (background &mdash; click Refresh to update status); <strong>faster-qwen3-tts</strong> runs from its own venv configured in the helper config.</p>
+                    <div class="model-path">
+                        <p class="model-path-label">TTS engines installed in (reference &mdash; engines install via Download above, not by dropping files):</p>
+                        <div class="model-path-row">
+                            <span class="model-path-value">{{ page.model_paths.tts_engines }}</span>
+                            <button type="submit" class="button small" formaction="/open-folder/tts-engines" formmethod="post">Open folder</button>
+                        </div>
+                    </div>
+                </details>
+
+                <details class="settings-group" data-tts-section="api" open>
+                    <summary class="settings-legend">API provider <span class="chev" aria-hidden="true"></span></summary>
+                    <div class="field-row">
+                        <select name="api_provider" class="select">
+                            {% for provider in page.tts.api_providers %}
+                                <option value="{{ provider.value }}"{% if provider.selected %} selected{% endif %}>{{ provider.label }}{% if provider.has_audio_tags %} (audio tags){% endif %}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <p class="settings-subtitle">Providers &amp; the audio tags that come with them</p>
+                    <div class="provider-tags">
+                        {% for provider in page.tts.api_providers %}
+                            <details class="provider-tag-item{% if provider.selected %} is-selected{% endif %}">
+                                <summary>
+                                    <span class="engine-name">{{ provider.label }}</span>
+                                    {% if provider.has_audio_tags %}
+                                        <span class="tag-badge yes">audio tags</span>
+                                    {% else %}
+                                        <span class="tag-badge no">no tags</span>
+                                    {% endif %}
+                                </summary>
+                                {% if provider.has_audio_tags %}
+                                    <p class="settings-note">{{ provider.audio_tags_note }}</p>
+                                    <pre class="tags-prompt">{{ provider.audio_tags_prompt }}</pre>
+                                {% else %}
+                                    <p class="settings-note">This provider does not define audio tags.</p>
+                                {% endif %}
+                            </details>
+                        {% endfor %}
+                    </div>
+                </details>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Streaming <span class="chev" aria-hidden="true"></span></summary>
+                    <label class="checkbox"><input type="checkbox" name="streaming_enabled"{% if page.tts.streaming_enabled %} checked{% endif %}> Streaming / lowest latency</label>
+                    <div class="field-row range-row">
+                        <label for="streaming_chunk_ms">Streaming chunk size (ms)</label>
+                        <input type="range" id="streaming_chunk_ms" name="streaming_chunk_ms"
+                            min="{{ page.tts.streaming_chunk_min }}" max="{{ page.tts.streaming_chunk_max }}" step="{{ page.tts.streaming_chunk_step }}"
+                            value="{{ page.tts.streaming_chunk_ms }}"
+                            oninput="this.nextElementSibling.value = this.value">
+                        <output class="range-output">{{ page.tts.streaming_chunk_ms }}</output>
+                    </div>
+                </details>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Volume <span class="chev" aria-hidden="true"></span></summary>
+                    <p class="field-help">Live playback volume for the synthesized voice &mdash; move a slider and the <strong>next line</strong> uses it, no restart needed. Applied to the audio itself, so values above 100% genuinely boost (very high values may clip).</p>
+                    <div class="field-row range-row">
+                        <label for="npc_volume">NPC voice volume</label>
+                        <input type="range" id="npc_volume" name="npc_volume"
+                            min="{{ page.tts.voice_volume_min_pct }}" max="{{ page.tts.voice_volume_max_pct }}" step="{{ page.tts.voice_volume_step_pct }}"
+                            value="{{ page.tts.npc_volume_pct }}"
+                            oninput="this.nextElementSibling.value = this.value + '%'">
+                        <output class="range-output">{{ page.tts.npc_volume_pct }}%</output>
+                    </div>
+                    <div class="field-row range-row">
+                        <label for="admin_volume">Admin voice volume</label>
+                        <input type="range" id="admin_volume" name="admin_volume"
+                            min="{{ page.tts.voice_volume_min_pct }}" max="{{ page.tts.voice_volume_max_pct }}" step="{{ page.tts.voice_volume_step_pct }}"
+                            value="{{ page.tts.admin_volume_pct }}"
+                            oninput="this.nextElementSibling.value = this.value + '%'">
+                        <output class="range-output">{{ page.tts.admin_volume_pct }}%</output>
+                    </div>
+                    <p class="field-help"><strong>NPC</strong> = the directional, in-world voices (positioned in 3D space). <strong>Admin</strong> = the non-positional voice spoken straight into your ear, with no 3D direction (e.g. Todd).</p>
+                </details>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Captions <span class="chev" aria-hidden="true"></span></summary>
+                    <div class="field-row range-row">
+                        <label for="caption_max_chars">Caption segment size (chars)</label>
+                        <input type="range" id="caption_max_chars" name="caption_max_chars"
+                            min="{{ page.tts.caption_max_min }}" max="{{ page.tts.caption_max_max }}" step="{{ page.tts.caption_max_step }}"
+                            value="{{ page.tts.caption_max_chars }}"
+                            oninput="this.nextElementSibling.value = this.value">
+                        <output class="range-output">{{ page.tts.caption_max_chars }}</output>
+                    </div>
+                    <p class="field-help">On-screen captions only &mdash; splits the NPC's line into segments of at most this many characters, revealed in sync with speech. <strong>0 = show the whole line in one caption.</strong> Pure display: never affects audio latency or flow.</p>
+                </details>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Audio Tags Prompt <span class="chev" aria-hidden="true"></span></summary>
+                    <label class="checkbox"><input type="checkbox" name="audio_tags_enabled"{% if page.tts.audio_tags_enabled %} checked{% endif %}> Enabled (inject the audio-tags prompt)</label>
+                    <div class="field-row">
+                        <label for="audio_tags_profile">Profile</label>
+                        <select id="audio_tags_profile" name="audio_tags_profile" class="select">
+                            {% for option in page.tts.audio_tags_profiles %}
+                                <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+                            {% endfor %}
+                        </select>
+                        <label for="audio_tags_max_tags">Max tags</label>
+                        <input type="number" id="audio_tags_max_tags" name="audio_tags_max_tags" class="number"
+                            min="{{ page.tts.audio_tags_max_min }}" max="{{ page.tts.audio_tags_max_max }}" step="1" value="{{ page.tts.audio_tags_max_tags }}">
+                    </div>
+                    <label class="checkbox"><input type="checkbox" name="audio_tags_strip_subtitles"{% if page.tts.audio_tags_strip_subtitles %} checked{% endif %}> Strip audio tags from game subtitles</label>
+                    <label class="field-label" for="audio_tags_custom_prompt">Custom prompt (used when Profile = Custom)</label>
+                    <textarea id="audio_tags_custom_prompt" name="audio_tags_custom_prompt" class="textarea" rows="4" placeholder="Custom audio-tag prompt">{{ page.tts.audio_tags_custom_prompt }}</textarea>
+                    <label class="field-label">Resolved prompt preview</label>
+                    <pre class="tags-prompt preview">{% if page.tts.audio_tags_preview.len() > 0 %}{{ page.tts.audio_tags_preview }}{% else %}(audio tags disabled, or the selected provider has none){% endif %}</pre>
+                </details>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Default voice <span class="chev" aria-hidden="true"></span></summary>
+                    <input type="text" name="default_voice" class="text" value="{{ page.tts.default_voice }}" placeholder="Voice name/id for the selected provider">
+                </details>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Voice Cloning <span class="chev" aria-hidden="true"></span></summary>
+                    <div id="voice-clone-panel">
+                        {% let voice_clone = page.voice_clone.clone() %}
+                        {% include "partials/voice_clone.html" %}
+                    </div>
+                    <div class="model-path">
+                        <p class="model-path-label">Voice samples folder &mdash; drop a character's reference audio here to add a clone voice (it then appears for cloning):</p>
+                        <div class="model-path-row">
+                            <span class="model-path-value">{{ page.model_paths.tts_voices }}</span>
+                            <button type="submit" class="button small" formaction="/open-folder/tts-voices" formmethod="post">Open folder</button>
+                        </div>
+                    </div>
+                </details>
+
+                <details class="settings-group" id="tts-tuning" open>
+                    <summary class="settings-legend">TTS tuning <span class="chev" aria-hidden="true"></span></summary>
+                    <p class="settings-note">Synthesis controls for the <strong>PocketTTS</strong> engine, applied live and sent with every line &mdash; no restart. The silence pads (lead-in / sentence gap / trailing) smooth the delivery; the sampling knobs below shape the voice. A change is heard on the next NPC line; <strong>Test</strong> uses the values shown here so you can tweak and hear before saving. (faster-qwen3-tts ignores these and uses its own pipeline.)</p>
+
+                    <p class="settings-subtitle">Silence &amp; level</p>
+                    <div class="field-row range-row">
+                        <label for="tuning_lead_in_ms">Lead-in silence (ms)</label>
+                        <input type="range" id="tuning_lead_in_ms" name="tuning_lead_in_ms" data-tuning
+                            min="{{ page.tts.tuning.pad_ms_min }}" max="{{ page.tts.tuning.pad_ms_max }}" step="{{ page.tts.tuning.pad_ms_step }}"
+                            value="{{ page.tts.tuning.lead_in_ms }}" oninput="this.nextElementSibling.value = this.value">
+                        <output class="range-output">{{ page.tts.tuning.lead_in_ms }}</output>
+                    </div>
+                    <div class="field-row range-row">
+                        <label for="tuning_trailing_ms">Trailing silence (ms)</label>
+                        <input type="range" id="tuning_trailing_ms" name="tuning_trailing_ms" data-tuning
+                            min="{{ page.tts.tuning.pad_ms_min }}" max="{{ page.tts.tuning.pad_ms_max }}" step="{{ page.tts.tuning.pad_ms_step }}"
+                            value="{{ page.tts.tuning.trailing_ms }}" oninput="this.nextElementSibling.value = this.value">
+                        <output class="range-output">{{ page.tts.tuning.trailing_ms }}</output>
+                    </div>
+                    <div class="field-row range-row">
+                        <label for="tuning_sentence_gap_ms">Sentence gap (ms)</label>
+                        <input type="range" id="tuning_sentence_gap_ms" name="tuning_sentence_gap_ms" data-tuning
+                            min="{{ page.tts.tuning.pad_ms_min }}" max="{{ page.tts.tuning.pad_ms_max }}" step="{{ page.tts.tuning.pad_ms_step }}"
+                            value="{{ page.tts.tuning.sentence_gap_ms }}" oninput="this.nextElementSibling.value = this.value">
+                        <output class="range-output">{{ page.tts.tuning.sentence_gap_ms }}</output>
+                    </div>
+                    <div class="field-row range-row">
+                        <label for="tuning_gain_db">Output gain (dB)</label>
+                        <input type="range" id="tuning_gain_db" name="tuning_gain_db" data-tuning
+                            min="{{ page.tts.tuning.gain_db_min }}" max="{{ page.tts.tuning.gain_db_max }}" step="{{ page.tts.tuning.gain_db_step }}"
+                            value="{{ page.tts.tuning.gain_db }}" oninput="this.nextElementSibling.value = this.value">
+                        <output class="range-output">{{ page.tts.tuning.gain_db }}</output>
+                    </div>
+
+                    <p class="settings-subtitle">PocketTTS sampling</p>
+                    <div class="field-row range-row">
+                        <label for="tuning_temperature">Temperature</label>
+                        <input type="range" id="tuning_temperature" name="tuning_temperature" data-tuning
+                            min="{{ page.tts.tuning.temperature_min }}" max="{{ page.tts.tuning.temperature_max }}" step="{{ page.tts.tuning.temperature_step }}"
+                            value="{{ page.tts.tuning.temperature }}" oninput="this.nextElementSibling.value = this.value">
+                        <output class="range-output">{{ page.tts.tuning.temperature }}</output>
+                    </div>
+                    <div class="field-row">
+                        <label for="tuning_lsd_decode_steps">LSD decode steps</label>
+                        <input type="number" id="tuning_lsd_decode_steps" name="tuning_lsd_decode_steps" class="number" data-tuning
+                            min="{{ page.tts.tuning.lsd_steps_min }}" max="{{ page.tts.tuning.lsd_steps_max }}" step="1" value="{{ page.tts.tuning.lsd_decode_steps }}">
+                        <label for="tuning_max_tokens">Max tokens / chunk</label>
+                        <input type="number" id="tuning_max_tokens" name="tuning_max_tokens" class="number" data-tuning
+                            min="{{ page.tts.tuning.max_tokens_min }}" max="{{ page.tts.tuning.max_tokens_max }}" step="1" value="{{ page.tts.tuning.max_tokens }}">
+                        <label for="tuning_frames_after_eos">Frames after EOS (0 = auto)</label>
+                        <input type="number" id="tuning_frames_after_eos" name="tuning_frames_after_eos" class="number" data-tuning
+                            min="0" max="{{ page.tts.tuning.frames_after_eos_max }}" step="1" value="{{ page.tts.tuning.frames_after_eos }}">
+                    </div>
+                    <div class="field-row range-row">
+                        <label for="tuning_eos_threshold">EOS threshold</label>
+                        <input type="range" id="tuning_eos_threshold" name="tuning_eos_threshold" data-tuning
+                            min="{{ page.tts.tuning.eos_threshold_min }}" max="{{ page.tts.tuning.eos_threshold_max }}" step="{{ page.tts.tuning.eos_threshold_step }}"
+                            value="{{ page.tts.tuning.eos_threshold }}" oninput="this.nextElementSibling.value = this.value">
+                        <output class="range-output">{{ page.tts.tuning.eos_threshold }}</output>
+                    </div>
+                    <div class="field-row range-row">
+                        <label for="tuning_noise_clamp">Noise clamp (0 = off)</label>
+                        <input type="range" id="tuning_noise_clamp" name="tuning_noise_clamp" data-tuning
+                            min="{{ page.tts.tuning.noise_clamp_min }}" max="{{ page.tts.tuning.noise_clamp_max }}" step="{{ page.tts.tuning.noise_clamp_step }}"
+                            value="{{ page.tts.tuning.noise_clamp }}" oninput="this.nextElementSibling.value = this.value">
+                        <output class="range-output">{{ page.tts.tuning.noise_clamp }}</output>
+                    </div>
+
+                    <p class="settings-subtitle">Tune &amp; test</p>
+                    <div class="field-row">
+                        {% if page.voice_clone.cloned_count > 0 %}
+                            <label for="tuning_test_voice">Test voice</label>
+                            <select id="tuning_test_voice" class="select">
+                                {% for c in page.voice_clone.characters %}
+                                    {% if c.status == "cloned" %}
+                                        <option value="{{ c.name }}">{{ c.name }}</option>
+                                    {% endif %}
+                                {% endfor %}
+                            </select>
+                            <button type="button" class="button small tuning-test-btn">Test with these values</button>
+                        {% else %}
+                            <p class="settings-note">Clone at least one character above to test these values on a voice.</p>
+                        {% endif %}
+                    </div>
+                    <p class="settings-note tuning-test-status" hidden></p>
+                </details>
+
+                <div class="settings-actions">
+                    <button type="submit" class="button primary">Save TTS settings</button>
+                </div>
+            </form>
+        {% else if page.category == "llm" %}
+            <form class="settings-form" method="post" action="/settings/llm">
+                <header class="settings-head">
+                    <p class="settings-eyebrow">AI</p>
+                    <h1 class="settings-title">LLM</h1>
+                    <p class="settings-lede">chasm generates against a local <strong>koboldcpp</strong> server (OpenAI-compatible). Pick the model below and tune sampling &mdash; both take effect on save.</p>
+                </header>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Model <span class="chev" aria-hidden="true"></span></summary>
+                    <p class="settings-host">{{ page.llm_models.host_summary }}</p>
+                    <ul class="engine-list pick-list">
+                        {% for model in page.llm_models.models %}
+                            <li class="pick-row{% if model.selected %} is-selected{% endif %}">
+                                <label class="pick-label">
+                                    <input type="radio" name="model" value="{{ model.id }}"{% if model.selected %} checked{% endif %}{% if !model.selectable %} disabled{% endif %}>
+                                    <span class="engine-name">
+                                        {{ model.name }}
+                                        <span class="model-meta">~{{ model.vram_gb }} GB VRAM &middot; {{ model.fit_label }}</span>
+                                        {% if model.recommended %}<span class="tag-badge yes">Recommended</span>{% endif %}
+                                    </span>
+                                </label>
+                                <span class="engine-actions">
+                                    {% if model.selected %}<span class="install-pill is-installed">● Active</span>{% endif %}
+                                    <span class="install-pill is-{{ model.status }}">{{ model.status_label }}</span>
+                                    {% if model.can_download %}
+                                        <button type="submit" class="button small" formaction="/llm-models/{{ model.id }}/download" formmethod="post">Download</button>
+                                    {% else if model.downloading %}
+                                        <a class="button small" href="/settings/llm">Refresh</a>
+                                    {% endif %}
+                                </span>
+                            </li>
+                        {% endfor %}
+                    </ul>
+                    <p class="settings-note">Pick the model with its radio &mdash; saving relaunches <strong>koboldcpp</strong> on the LLM port (<code>:5001</code>) with the new <code>--model</code>, unloading the previous one (a full reload). The <span class="install-pill is-installed">● Active</span> badge marks the loaded model; only downloaded models can be selected. Download fetches the <code>UD-Q4_K_XL</code> GGUF into the LLM models folder in the background &mdash; click Refresh to update status.</p>
+                    <div class="model-path">
+                        <p class="model-path-label">Runtime &mdash; the local server that runs your models:</p>
+                        <div class="model-path-row">
+                            <span class="model-path-value">{{ page.kobold_runtime.name }}</span>
+                            <span class="install-pill is-{{ page.kobold_runtime.status }}">{% if page.kobold_runtime.installed %}&check; {% endif %}{{ page.kobold_runtime.status_label }}</span>
+                            {% if page.kobold_runtime.downloading %}<a class="button small" href="/settings/llm">Refresh</a>{% endif %}
+                        </div>
+                        <p class="model-path-label">{{ page.kobold_runtime.detail }} Downloading a model also pulls <strong>koboldcpp</strong> if it isn't here yet.</p>
+                    </div>
+                    <div class="model-path">
+                        <p class="model-path-label">Model folder &mdash; drop <code>.gguf</code> files here to add them manually (a dropped GGUF whose name matches a model above shows as Downloaded):</p>
+                        <div class="model-path-row">
+                            <span class="model-path-value">{{ page.model_paths.llm }}</span>
+                            <button type="submit" class="button small" formaction="/open-folder/llm" formmethod="post">Open folder</button>
+                        </div>
+                    </div>
+                    <label class="field-label" for="llm_provider">Provider label</label>
+                    <p class="field-help">Free-text label for your own reference (the request always targets the configured koboldcpp endpoint).</p>
+                    <input type="text" id="llm_provider" name="provider" class="text" value="{{ page.llm.provider }}" placeholder="e.g. custom / koboldcpp">
+                </details>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Generation sampling <span class="chev" aria-hidden="true"></span></summary>
+                    <p class="field-help">Forwarded verbatim to llama.cpp's <code>/v1/chat/completions</code> on every turn (read fresh per request). Defaults match prior behaviour; off-values (top-k/min-p 0, max tokens 0, seed -1) are omitted from the request.</p>
+
+                    <div class="field-row range-row">
+                        <label for="sampling_temperature">Temperature</label>
+                        <input type="range" id="sampling_temperature" name="sampling_temperature"
+                            min="{{ page.llm_sampling.temperature_min }}" max="{{ page.llm_sampling.temperature_max }}" step="{{ page.llm_sampling.temperature_step }}"
+                            value="{{ page.llm_sampling.temperature }}" oninput="this.nextElementSibling.value = this.value">
+                        <output class="range-output">{{ page.llm_sampling.temperature }}</output>
+                    </div>
+                    <p class="field-help">Higher = more varied/creative; lower = more focused and deterministic.</p>
+
+                    <div class="field-row range-row">
+                        <label for="sampling_top_p">Top-p (nucleus)</label>
+                        <input type="range" id="sampling_top_p" name="sampling_top_p"
+                            min="{{ page.llm_sampling.top_p_min }}" max="{{ page.llm_sampling.top_p_max }}" step="{{ page.llm_sampling.top_p_step }}"
+                            value="{{ page.llm_sampling.top_p }}" oninput="this.nextElementSibling.value = this.value">
+                        <output class="range-output">{{ page.llm_sampling.top_p }}</output>
+                    </div>
+
+                    <div class="field-row range-row">
+                        <label for="sampling_min_p">Min-p</label>
+                        <input type="range" id="sampling_min_p" name="sampling_min_p"
+                            min="{{ page.llm_sampling.min_p_min }}" max="{{ page.llm_sampling.min_p_max }}" step="{{ page.llm_sampling.min_p_step }}"
+                            value="{{ page.llm_sampling.min_p }}" oninput="this.nextElementSibling.value = this.value">
+                        <output class="range-output">{{ page.llm_sampling.min_p }}</output>
+                    </div>
+                    <p class="field-help">0 disables min-p (the default).</p>
+
+                    <div class="field-row range-row">
+                        <label for="sampling_repeat_penalty">Repeat penalty</label>
+                        <input type="range" id="sampling_repeat_penalty" name="sampling_repeat_penalty"
+                            min="{{ page.llm_sampling.repeat_penalty_min }}" max="{{ page.llm_sampling.repeat_penalty_max }}" step="{{ page.llm_sampling.repeat_penalty_step }}"
+                            value="{{ page.llm_sampling.repeat_penalty }}" oninput="this.nextElementSibling.value = this.value">
+                        <output class="range-output">{{ page.llm_sampling.repeat_penalty }}</output>
+                    </div>
+                    <p class="field-help">1.0 = off. Above 1.0 discourages repeating tokens.</p>
+
+                    <div class="field-row">
+                        <label for="sampling_top_k">Top-k</label>
+                        <input type="number" id="sampling_top_k" name="sampling_top_k" class="number"
+                            min="{{ page.llm_sampling.top_k_min }}" max="{{ page.llm_sampling.top_k_max }}" step="1" value="{{ page.llm_sampling.top_k }}">
+                        <label for="sampling_max_tokens">Max tokens</label>
+                        <input type="number" id="sampling_max_tokens" name="sampling_max_tokens" class="number wide"
+                            min="{{ page.llm_sampling.max_tokens_min }}" max="{{ page.llm_sampling.max_tokens_max }}" step="1" value="{{ page.llm_sampling.max_tokens }}">
+                        <label for="sampling_n_ctx">Context (n_ctx)</label>
+                        <input type="number" id="sampling_n_ctx" name="sampling_n_ctx" class="number wide"
+                            min="{{ page.llm_sampling.n_ctx_min }}" max="{{ page.llm_sampling.n_ctx_max }}" step="256" value="{{ page.llm_sampling.n_ctx }}">
+                        <label for="sampling_seed">Seed</label>
+                        <input type="number" id="sampling_seed" name="sampling_seed" class="number wide"
+                            min="-1" step="1" value="{{ page.llm_sampling.seed }}">
+                    </div>
+                    <p class="field-help">Top-k 0 = disabled. Max tokens 0 = no cap (server decides). n_ctx 0 = use the model's loaded context. Seed -1 = random each call.</p>
+                </details>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Live chat orchestrator <span class="chev" aria-hidden="true"></span></summary>
+                    <p class="settings-note">In a scene with two or more present, audible NPCs, a small "director" call decides who speaks next and in what order. With one NPC (or when off) the single present NPC just speaks &mdash; no extra call.</p>
+                    <label class="checkbox"><input type="checkbox" name="orchestrator_enabled"{% if page.llm.orchestrator_enabled %} checked{% endif %}> Enable the director (multi-NPC scenes)</label>
+                    <div class="field-row">
+                        <label for="orchestrator_max_speakers">Max speakers per turn</label>
+                        <input type="number" id="orchestrator_max_speakers" name="orchestrator_max_speakers" class="number"
+                            min="1" max="10" step="1" value="{{ page.llm.orchestrator_max_speakers }}">
+                        <label for="orchestrator_temperature">Director temperature</label>
+                        <input type="number" id="orchestrator_temperature" name="orchestrator_temperature" class="number"
+                            min="0" max="2" step="0.05" value="{{ page.llm.orchestrator_temperature }}">
+                    </div>
+                    <label class="field-label" for="orchestrator_system_prompt">Director system prompt</label>
+                    <textarea id="orchestrator_system_prompt" name="orchestrator_system_prompt" class="textarea" rows="8" placeholder="Leave blank to use the built-in default">{{ page.llm.orchestrator_system_prompt }}</textarea>
+                    <p class="settings-note">The director sees only the list of present characters and the recent conversation. Leave the prompt blank to reset it to the default.</p>
+                </details>
+                <div class="settings-actions">
+                    <button type="submit" class="button primary">Save LLM settings</button>
+                </div>
+            </form>
+        {% else if page.category == "stt" %}
+            <form class="settings-form" method="post" action="/settings/stt">
+                <header class="settings-head">
+                    <p class="settings-eyebrow">AI</p>
+                    <h1 class="settings-title">Speech-to-Text</h1>
+                    <p class="settings-lede">Speech recognition runs against <strong>koboldcpp's Whisper</strong> (OpenAI-compatible <code>/v1/audio/transcriptions</code>, on the same port as the LLM). The in-game <code>/speech/recognize</code> calls point here. Pick the Whisper model below.</p>
+                </header>
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Provider <span class="chev" aria-hidden="true"></span></summary>
+                    <div class="field-row">
+                        <select name="provider" id="stt_provider" class="select">
+                            {% for provider in page.stt_panel.providers %}
+                                <option value="{{ provider.value }}"{% if provider.selected %} selected{% endif %}>{{ provider.label }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <p class="field-help">koboldcpp Whisper is the only provider (Parakeet has been removed).</p>
+                </details>
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Whisper model <span class="chev" aria-hidden="true"></span></summary>
+                    <p class="settings-host">{{ page.stt_panel.host.summary }}</p>
+                    <ul class="engine-list pick-list">
+                        {% for model in page.stt_panel.models %}
+                            <li class="pick-row{% if model.selected %} is-selected{% endif %}">
+                                <label class="pick-label">
+                                    <input type="radio" name="model" value="{{ model.file }}"{% if model.selected %} checked{% endif %}>
+                                    <span class="engine-name">
+                                        {{ model.name }}
+                                        <span class="model-meta">{{ model.file }} &middot; {{ model.size_label }} &middot; {{ model.fit_hint }}</span>
+                                    </span>
+                                </label>
+                                <span class="engine-actions">
+                                    {% if model.recommended %}<span class="tag-badge yes">Recommended</span>{% endif %}
+                                    <span class="install-pill is-{{ model.status }}">{{ model.status_label }}</span>
+                                    {% if model.can_download %}
+                                        <button type="submit" class="button small" formaction="/whisper-models/{{ model.id }}/download" formmethod="post">Download</button>
+                                    {% else if model.downloading %}
+                                        <a class="button small" href="/settings/stt">Refresh</a>
+                                    {% endif %}
+                                </span>
+                            </li>
+                        {% endfor %}
+                    </ul>
+                    <p class="settings-note">Downloads the GGML <code>.bin</code> from <code>ggerganov/whisper.cpp</code> into koboldcpp's models folder (background &mdash; click Refresh to update status). Picking a model with its radio and saving rewrites koboldcpp's <code>--whispermodel</code> and stops koboldcpp so the old model unloads &mdash; the next <strong>Play</strong> relaunches it with the new model. koboldcpp can't hot-swap just the Whisper slot, so that relaunch also reloads the LLM (slower first start, but the previous Whisper model is guaranteed gone from VRAM).</p>
+                    <div class="model-path">
+                        <p class="model-path-label">Runtime &mdash; koboldcpp serves Whisper STT (same exe + port as the LLM):</p>
+                        <div class="model-path-row">
+                            <span class="model-path-value">{{ page.kobold_runtime.name }}</span>
+                            <span class="install-pill is-{{ page.kobold_runtime.status }}">{% if page.kobold_runtime.installed %}&check; {% endif %}{{ page.kobold_runtime.status_label }}</span>
+                            {% if page.kobold_runtime.downloading %}<a class="button small" href="/settings/stt">Refresh</a>{% endif %}
+                        </div>
+                        <p class="model-path-label">{{ page.kobold_runtime.detail }} Downloading a Whisper model also pulls <strong>koboldcpp</strong> if it isn't here yet.</p>
+                    </div>
+                    <div class="model-path">
+                        <p class="model-path-label">Whisper model folder &mdash; drop GGML <code>.bin</code> files here (e.g. <code>ggml-large-v3-turbo.bin</code>) to add them manually:</p>
+                        <div class="model-path-row">
+                            <span class="model-path-value">{{ page.model_paths.stt }}</span>
+                            <button type="submit" class="button small" formaction="/open-folder/stt" formmethod="post">Open folder</button>
+                        </div>
+                    </div>
+                </details>
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Request <span class="chev" aria-hidden="true"></span></summary>
+                    <label class="field-label" for="stt_language">Language (optional)</label>
+                    <p class="field-help">A language hint sent with the request; blank lets Whisper auto-detect.</p>
+                    <input type="text" id="stt_language" name="language" class="text" value="{{ page.stt_panel.language }}" placeholder="e.g. en (blank = auto)">
+                    <label class="field-label" for="stt_prompt">Default biasing prompt (optional)</label>
+                    <p class="field-help">Sent as the OpenAI <code>prompt</code> field when a request doesn't supply its own &mdash; a hint for names/terms the recognizer should prefer. Reaches koboldcpp's transcription form.</p>
+                    <textarea id="stt_prompt" name="prompt" class="textarea" rows="2" placeholder="e.g. proper nouns, place names, in-world jargon the recognizer should prefer">{{ page.stt_panel.prompt }}</textarea>
+                    <div class="field-row range-row">
+                        <label for="stt_timeout_ms">Request timeout (ms)</label>
+                        <input type="range" id="stt_timeout_ms" name="timeout_ms"
+                            min="{{ page.stt_panel.timeout_ms_min }}" max="{{ page.stt_panel.timeout_ms_max }}" step="1000"
+                            value="{{ page.stt_panel.timeout_ms }}" oninput="this.nextElementSibling.value = this.value">
+                        <output class="range-output">{{ page.stt_panel.timeout_ms }}</output>
+                    </div>
+                    <p class="field-help">Used as the actual HTTP deadline when a request omits <code>timeoutMs</code>.</p>
+                </details>
+                <div class="settings-actions">
+                    <button type="submit" class="button primary">Save STT settings</button>
+                </div>
+            </form>
+        {% else if page.category == "retrieval" %}
+            <form class="settings-form" method="post" action="/settings/retrieval">
+                <header class="settings-head">
+                    <p class="settings-eyebrow">AI</p>
+                    <h1 class="settings-title">Retrieval</h1>
+                    <p class="settings-lede">In-process semantic retrieval (embed + rerank, ONNX). Defaults to small, CPU-capable, INT8-quantized models and auto-scales to a GPU when one is detected. Models download to <code>models/embed</code> on first use; nothing loads until a consumer needs it.</p>
+                </header>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">General <span class="chev" aria-hidden="true"></span></summary>
+                    <label class="checkbox"><input type="checkbox" name="enabled"{% if page.retrieval.enabled %} checked{% endif %}> Enable semantic retrieval (master switch)</label>
+                </details>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Sources <span class="chev" aria-hidden="true"></span></summary>
+                    <label class="checkbox"><input type="checkbox" name="chat_memory_enabled"{% if page.retrieval.chat_memory_enabled %} checked{% endif %}> Chat memory</label>
+                    <label class="checkbox"><input type="checkbox" name="lore_semantic_enabled"{% if page.retrieval.lore_semantic_enabled %} checked{% endif %}> Lorebook semantic activation</label>
+                    <label class="checkbox"><input type="checkbox" name="action_semantic_enabled"{% if page.retrieval.action_semantic_enabled %} checked{% endif %}> Action book semantic activation</label>
+                    <label class="checkbox"><input type="checkbox" name="quest_semantic_enabled"{% if page.retrieval.quest_semantic_enabled %} checked{% endif %}> Quest semantic activation</label>
+                    <div class="field-row">
+                        <label for="chat_memory_limit">Chat memory limit</label>
+                        <input type="number" id="chat_memory_limit" name="chat_memory_limit" class="number"
+                            min="{{ page.retrieval.source_limit_min }}" max="{{ page.retrieval.source_limit_max }}" step="1" value="{{ page.retrieval.chat_memory_limit }}">
+                        <label for="lore_limit">Lore limit</label>
+                        <input type="number" id="lore_limit" name="lore_limit" class="number"
+                            min="{{ page.retrieval.source_limit_min }}" max="{{ page.retrieval.source_limit_max }}" step="1" value="{{ page.retrieval.lore_limit }}">
+                        <label for="quest_limit">Quest limit</label>
+                        <input type="number" id="quest_limit" name="quest_limit" class="number"
+                            min="{{ page.retrieval.source_limit_min }}" max="{{ page.retrieval.source_limit_max }}" step="1" value="{{ page.retrieval.quest_limit }}">
+                    </div>
+                </details>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Models &amp; hardware <span class="chev" aria-hidden="true"></span></summary>
+                    <p class="settings-note">Detected: <strong>{{ page.retrieval.host.summary }}</strong></p>
+
+                    <p class="settings-subtitle">Embedder &mdash; pick which model is used</p>
+                    <ul class="engine-list pick-list">
+                        {% for model in page.retrieval.models %}
+                            {% if model.kind == "embedder" %}
+                                <li class="pick-row{% if model.selected %} is-selected{% endif %}">
+                                    <label class="pick-label">
+                                        <input type="radio" name="embedder_tier" value="{{ model.tier }}"{% if model.selected %} checked{% endif %}>
+                                        <span class="engine-name">
+                                            {{ model.label }}
+                                            <span class="model-meta">{{ model.tier }} &middot; {{ model.size_label }} &middot; {{ model.fit_hint }}</span>
+                                        </span>
+                                    </label>
+                                    <span class="engine-actions">
+                                        {% if model.recommended %}
+                                            <span class="tag-badge yes">recommended</span>
+                                        {% endif %}
+                                        <span class="install-pill is-{{ model.status }}">{{ model.status_label }}</span>
+                                        {% if model.can_download %}
+                                            <button type="submit" class="button small" formaction="/retrieval-models/{{ model.id }}/download" formmethod="post">Download</button>
+                                        {% else if model.downloading %}
+                                            <a class="button small" href="/settings/retrieval">Refresh</a>
+                                        {% endif %}
+                                    </span>
+                                </li>
+                            {% endif %}
+                        {% endfor %}
+                    </ul>
+
+                    <label class="checkbox"><input type="checkbox" name="reranker_enabled"{% if page.retrieval.reranker_enabled %} checked{% endif %}> Enable cross-encoder reranker (else cosine fallback)</label>
+                    <p class="settings-subtitle">Reranker &mdash; pick which model is used</p>
+                    <ul class="engine-list pick-list">
+                        {% for model in page.retrieval.models %}
+                            {% if model.kind == "reranker" %}
+                                <li class="pick-row{% if model.selected %} is-selected{% endif %}">
+                                    <label class="pick-label">
+                                        <input type="radio" name="reranker_tier" value="{{ model.tier }}"{% if model.selected %} checked{% endif %}>
+                                        <span class="engine-name">
+                                            {{ model.label }}
+                                            <span class="model-meta">{{ model.tier }} &middot; {{ model.size_label }} &middot; {{ model.fit_hint }}</span>
+                                        </span>
+                                    </label>
+                                    <span class="engine-actions">
+                                        <span class="install-pill is-{{ model.status }}">{{ model.status_label }}</span>
+                                        {% if model.can_download %}
+                                            <button type="submit" class="button small" formaction="/retrieval-models/{{ model.id }}/download" formmethod="post">Download</button>
+                                        {% else if model.downloading %}
+                                            <a class="button small" href="/settings/retrieval">Refresh</a>
+                                        {% endif %}
+                                    </span>
+                                </li>
+                            {% endif %}
+                        {% endfor %}
+                    </ul>
+
+                    <p class="settings-subtitle">Execution provider</p>
+                    <div class="seg-toggle">
+                        {% for option in page.retrieval.executions %}
+                            <label class="seg-option"><input type="radio" name="execution" value="{{ option.value }}"{% if option.selected %} checked{% endif %}> {{ option.label }}</label>
+                        {% endfor %}
+                    </div>
+                    <p class="settings-note">Pick the embedder/reranker to use with its radio; Download writes weights to <code>models/embed</code> in the background &mdash; click Refresh to update status. The <strong>recommended</strong> badge marks the largest embedder that fits this host comfortably. GPU support requires a build with the <code>cuda</code> feature; otherwise everything runs on CPU regardless of this setting.</p>
+                </details>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Search <span class="chev" aria-hidden="true"></span></summary>
+                    <div class="field-row">
+                        <label for="candidates">Candidates (top-N before rerank)</label>
+                        <input type="number" id="candidates" name="candidates" class="number"
+                            min="{{ page.retrieval.candidates_min }}" max="{{ page.retrieval.candidates_max }}" step="1" value="{{ page.retrieval.candidates }}">
+                        <label for="top_k">Results (top-K)</label>
+                        <input type="number" id="top_k" name="top_k" class="number"
+                            min="{{ page.retrieval.top_k_min }}" max="{{ page.retrieval.top_k_max }}" step="1" value="{{ page.retrieval.top_k }}">
+                    </div>
+                    <div class="field-row">
+                        <label for="min_score">Minimum score</label>
+                        <input type="number" id="min_score" name="min_score" class="number"
+                            min="0" max="1" step="0.01" value="{{ page.retrieval.min_score }}">
+                    </div>
+                </details>
+
+                <div class="settings-actions">
+                    <button type="submit" class="button primary">Save Retrieval settings</button>
+                </div>
+            </form>
+        {% else %}
+            <form class="settings-form" method="post" action="/settings/game">
+                <header class="settings-head">
+                    <p class="settings-eyebrow">System</p>
+                    <h1 class="settings-title">Bridge</h1>
+                    <p class="settings-lede">chasm is a passive backend. The connected game's bridge mod talks to it over a local file channel and writes a heartbeat while it's running. This page shows where chasm looks for that bridge folder; blank fields auto-detect.</p>
+                </header>
+
+                <details class="settings-group" open>
+                    <summary class="settings-legend">Bridge folder <span class="chev" aria-hidden="true"></span></summary>
+                    <ul class="status-list">
+                        <li class="status-row">
+                            <span class="status-key">Resolved location</span>
+                            <span class="status-val"><code class="status-path">{{ page.game.game_dir }}</code></span>
+                        </li>
+                    </ul>
+                    <label class="field-label" for="game_dir">Bridge folder (blank = auto-detect)</label>
+                    <input type="text" id="game_dir" name="game_dir" class="text" value="{{ page.game.game_dir_override }}" placeholder="{{ page.game.game_dir }}">
+                    <p class="settings-note">The local folder the bridge mod reads and writes through &mdash; the file channel, the heartbeat, and per-request traces all live under here. Leave blank to auto-detect from the bridge's own config; set it to point chasm at a non-default location.</p>
+                </details>
+
+                <div class="settings-actions">
+                    <button type="submit" class="button primary">Save bridge settings</button>
+                </div>
+            </form>
+        {% endif %}
+    </section>
+</main>
+{% endblock %}

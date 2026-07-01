@@ -1,0 +1,5 @@
+/target/
+node_modules/
+crates/chasm-web/ui/dist/
+*.tsbuildinfo
+.verify-data/

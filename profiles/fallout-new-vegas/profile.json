@@ -1,0 +1,24 @@
+{
+  "id": "fallout-new-vegas",
+  "name": "Fallout: New Vegas",
+  "description": "Game profile for Fallout: New Vegas. Owns the FNV characters and a voice extractor that resolves each NPC's exact voice from the game's plugin + BSA.",
+  "voice": {
+    "extractor": "extract_voices.py",
+    "steam_app": "Fallout New Vegas",
+    "plugin": "FalloutNV.esm",
+    "bsa_relative": "Data\\Fallout - Voices1.bsa",
+    "voice_root": "sound\\voice\\falloutnv.esm"
+  },
+  "comment": "Named NPCs resolve to their own lines via 'edid' (exact). Generic/un-named NPCs use a 'voicetype' override. Names match the character-card files.",
+  "characters": [
+    { "name": "Easy Pete", "edid": "GSEasyPete" },
+    { "name": "Sunny Smiles", "edid": "GSSunnySmiles" },
+    { "name": "Chet", "edid": "GSChet" },
+    { "name": "Doc Mitchell", "edid": "DocMitchell" },
+    { "name": "Ringo", "edid": "GSRingo" },
+    { "name": "Trudy", "edid": "GSTrudy" },
+    { "name": "Joe Cobb", "edid": "GSJoeCobb" },
+    { "name": "Goodsprings settler", "voicetype": "MaleAdult03" },
+    { "name": "Powder Ganger", "voicetype": "MaleAdult05" }
+  ]
+}

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>chasm</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #0b0e12;
+        color: #e7edf0;
+        font: 16px/1.5 "Segoe UI", system-ui, sans-serif;
+        display: grid;
+        place-items: center;
+      }
+      .splash {
+        text-align: center;
+        opacity: 0.85;
+      }
+      .ring {
+        width: 48px;
+        height: 48px;
+        margin: 0 auto 18px;
+        border: 4px solid #1f2a30;
+        border-top-color: #40c4b4;
+        border-radius: 50%;
+        animation: spin 0.9s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="splash">
+      <div class="ring"></div>
+      <div>Starting chasm…</div>
+    </div>
+  </body>
+</html>

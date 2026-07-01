@@ -1,0 +1,147 @@
+<aside class="sidebar" aria-label="Game profile, library and participants">
+    <div class="profile-select" id="profile-select">
+        <button type="button" class="profile-trigger" id="profile-trigger" aria-haspopup="true" aria-expanded="false">
+            <span class="profile-badge" aria-hidden="true">{{ sidebar.profile_initials }}</span>
+            <span class="profile-trigger-main">
+                <span class="profile-eyebrow">Game profile</span>
+                <span class="profile-name">{{ sidebar.profile_name }}</span>
+                <span class="profile-sub">{{ sidebar.character_count }} in scene</span>
+            </span>
+            <span class="profile-caret" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+            </span>
+        </button>
+        <div class="profile-menu" id="profile-menu" role="menu" hidden>
+            <p class="profile-menu-eyebrow">Switch profile</p>
+            {% for profile in sidebar.profiles %}
+                <button type="button" class="profile-option{% if profile.active %} is-active{% endif %}" role="menuitemradio" aria-checked="{% if profile.active %}true{% else %}false{% endif %}" data-profile-id="{{ profile.id }}">
+                    <span class="profile-option-badge" aria-hidden="true">{{ profile.initials }}</span>
+                    <span class="profile-option-main">
+                        <span class="profile-option-name">{{ profile.name }}</span>
+                        {% if profile.description.len() > 0 %}<span class="profile-option-desc">{{ profile.description }}</span>{% endif %}
+                    </span>
+                    {% if profile.active %}
+                        <span class="profile-option-check" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                        </span>
+                    {% endif %}
+                </button>
+            {% endfor %}
+            <p class="profile-menu-foot">Drop a new profile folder in <code>/profiles</code> to add a game.</p>
+        </div>
+    </div>
+
+    <div class="roster-head">
+        <span class="roster-title">
+            <span class="roster-dot" aria-hidden="true"></span>
+            Characters
+        </span>
+        <span class="roster-count">{{ sidebar.character_count }}</span>
+    </div>
+
+    <nav class="participant-list" aria-label="Participants">
+        {% for participant in live_chat.participants %}
+            <a
+                class="participant-link{% if participant.selected %} is-selected{% endif %}{% if participant.present %} is-present{% endif %}{% if !participant.audible %} is-muted{% endif %}"
+                href="{{ live_chat.id|participant_url(participant.id) }}"
+                data-name="{{ participant.name }}"
+            >
+                <span class="avatar">{{ participant.initial }}</span>
+                <span class="participant-main">
+                    <span class="participant-name">{{ participant.name }}</span>
+                    <span class="participant-sub">
+                        {{ participant.kind }}
+                        {% if participant.distance_label.len() > 0 %} · {{ participant.distance_label }}{% endif %}
+                    </span>
+                </span>
+                <span class="badge">{{ participant.message_count }}</span>
+            </a>
+        {% endfor %}
+    </nav>
+</aside>
+
+<div id="char-ctx-menu" class="ctx-menu" hidden>
+    <button type="button" class="ctx-item ctx-danger" data-action="clear-history">Clear history</button>
+</div>
+<script>
+(function () {
+    // --- Profile switcher: open the menu, POST the choice, reload on success. ---
+    var select = document.getElementById('profile-select');
+    if (select) {
+        var trigger = document.getElementById('profile-trigger');
+        var menu = document.getElementById('profile-menu');
+
+        function closeMenu() {
+            menu.hidden = true;
+            trigger.setAttribute('aria-expanded', 'false');
+        }
+        function toggleMenu() {
+            var open = menu.hidden;
+            menu.hidden = !open;
+            trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+        }
+
+        trigger.addEventListener('click', function (event) {
+            event.stopPropagation();
+            toggleMenu();
+        });
+
+        menu.querySelectorAll('.profile-option').forEach(function (option) {
+            option.addEventListener('click', function () {
+                var id = option.getAttribute('data-profile-id');
+                if (!id || option.classList.contains('is-active')) { closeMenu(); return; }
+                option.classList.add('is-switching');
+                fetch('/profile/select', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id: id })
+                }).then(function (res) {
+                    if (res.ok) { window.location.reload(); }
+                    else { option.classList.remove('is-switching'); }
+                }).catch(function () { option.classList.remove('is-switching'); });
+            });
+        });
+
+        document.addEventListener('click', function (event) {
+            if (!select.contains(event.target)) { closeMenu(); }
+        });
+        document.addEventListener('keydown', function (event) {
+            if (event.key === 'Escape') { closeMenu(); }
+        });
+    }
+
+    // --- Participant right-click context menu ("Clear history"). ---
+    var ctx = document.getElementById('char-ctx-menu');
+    if (!ctx) { return; }
+    var current = null;
+
+    function hide() { ctx.hidden = true; current = null; }
+
+    document.querySelectorAll('.participant-link').forEach(function (link) {
+        link.addEventListener('contextmenu', function (event) {
+            event.preventDefault();
+            current = link;
+            ctx.style.left = event.pageX + 'px';
+            ctx.style.top = event.pageY + 'px';
+            ctx.hidden = false;
+        });
+    });
+
+    ctx.querySelector('[data-action="clear-history"]').addEventListener('click', function (event) {
+        event.stopPropagation();
+        if (!current) { return; }
+        var backHref = current.getAttribute('href');
+        var name = current.getAttribute('data-name') || 'this character';
+        hide();
+        if (!window.confirm('Clear all chat history with ' + name + '? This cannot be undone.')) { return; }
+        fetch(backHref + '/clear-history', { method: 'POST' }).then(function (res) {
+            window.location = res.redirected ? res.url : backHref;
+        }).catch(function () { window.location.reload(); });
+    });
+
+    document.addEventListener('click', hide);
+    document.addEventListener('scroll', hide, true);
+    window.addEventListener('blur', hide);
+    document.addEventListener('keydown', function (event) { if (event.key === 'Escape') { hide(); } });
+})();
+</script>

@@ -1,0 +1,44 @@
+[workspace]
+members = [
+    "apps/chasm",
+    "apps/chasm-desktop",
+    "crates/chasm-core",
+    "crates/chasm-embed",
+    "crates/chasm-fnv-bridge",
+    "crates/chasm-prompt",
+    "crates/chasm-st-compat",
+    "crates/chasm-web",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "AGPL-3.0"
+publish = false
+rust-version = "1.80"
+
+[workspace.dependencies]
+anyhow = "1"
+askama = "0.12"
+fastembed = "5"
+sha2 = "0.10"
+async-stream = "0.3"
+async-trait = "0.1"
+axum = "0.7"
+base64 = "0.22"
+futures-util = "0.3"
+mime_guess = "2"
+notify = "6"
+rand = "0.9"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.6", features = ["fs", "trace", "set-header"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+urlencoding = "2"
+

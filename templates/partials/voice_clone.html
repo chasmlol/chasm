@@ -1,0 +1,29 @@
+{% if voice_clone.has_profile %}
+    <p class="settings-note">
+        Profile <strong>{{ voice_clone.profile_name }}</strong> &middot;
+        engine <strong>{{ voice_clone.engine_label }}</strong> &middot;
+        {{ voice_clone.cloned_count }}/{{ voice_clone.characters.len() }} cloned
+    </p>
+    <ul class="engine-list">
+        {% for c in voice_clone.characters %}
+            <li>
+                <span class="engine-name">{{ c.name }}</span>
+                <span class="engine-actions">
+                    {% if c.status == "cloned" %}
+                        <button type="button" class="button small voice-test-btn" data-character="{{ c.name }}">Test</button>
+                    {% endif %}
+                    <span class="install-pill clone-{{ c.status }}">{{ c.status_label }}</span>
+                </span>
+            </li>
+        {% endfor %}
+    </ul>
+    <div class="field-row">
+        <button type="submit" class="button primary" formaction="/voices/clone" formmethod="post">Clone all characters</button>
+        {% if voice_clone.any_cloning %}
+            <a class="button small" href="/settings/tts">Refresh</a>
+        {% endif %}
+    </div>
+    <p class="settings-note">Extracts each character's real in-game voice (their own dialogue lines) as a reference clip via the game profile. The chosen TTS clones from it at speak time. Test generates a fresh sample on the fly and discards it after playback.</p>
+{% else %}
+    <p class="settings-note">No active game profile, so there are no characters. Activate a profile to clone its characters.</p>
+{% endif %}

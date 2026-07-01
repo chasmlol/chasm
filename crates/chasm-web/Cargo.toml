@@ -1,0 +1,39 @@
+[package]
+name = "chasm-web"
+version = "0.2.18"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+askama.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+futures-util.workspace = true
+mime_guess.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+# Compares the running version against the latest GitHub release tag for the
+# Settings → Updates check (see `app_version` in lib.rs).
+semver = "1"
+serde.workspace = true
+# preserve_order keeps `serde_json::Value` object key order on read+write, so the
+# lorebook editor round-trips entries (and top-level keys) in their original order.
+serde_json = { workspace = true, features = ["preserve_order"] }
+sha2.workspace = true
+chasm-core = { path = "../chasm-core" }
+chasm-embed = { path = "../chasm-embed" }
+chasm-fnv-bridge = { path = "../chasm-fnv-bridge" }
+chasm-prompt = { path = "../chasm-prompt" }
+chasm-st-compat = { path = "../chasm-st-compat" }
+thiserror.workspace = true
+# `sync` adds tokio::sync::mpsc, used to bridge the synchronous TurnSink callbacks
+# (called inside the spawned run_turn task) to the streaming HTTP response body.
+tokio = { workspace = true, features = ["sync"] }
+tower-http.workspace = true
+tracing.workspace = true
+urlencoding.workspace = true

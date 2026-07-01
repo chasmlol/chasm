@@ -1,0 +1,148 @@
+@import "tailwindcss";
+
+/*
+ * chasm design system (Tailwind v4, CSS-first).
+ *
+ * Ports + elevates the existing vanilla palette (static/app.css :root) into
+ * design tokens. Dark-first; the desktop WebView2 renders this. shadcn-style
+ * semantic tokens (--background/--foreground/--card/…) sit on top so dropped-in
+ * Radix components theme correctly.
+ */
+
+@theme {
+  /* Brand + base surfaces (lifted from the original chasm palette). */
+  --color-ink-950: #0c0d10;
+  --color-ink-900: #101114;
+  --color-ink-850: #131419;
+  --color-ink-800: #16181d;
+  --color-ink-750: #1a1d24;
+  --color-ink-700: #1d2027;
+  --color-ink-600: #242a35;
+  --color-line: #262a33;
+  --color-line-soft: #20242d;
+
+  --color-accent: #55a7ff;
+  --color-accent-strong: #3f97ff;
+  --color-player: #5fb784;
+  --color-npc: #d7b15d;
+  --color-system: #a68bd8;
+  --color-danger: #e36d6d;
+
+  --color-fg: #edf0f6;
+  --color-fg-muted: #9ba3b2;
+  --color-fg-soft: #c6ccd7;
+
+  --font-sans:
+    "Geist", "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+
+  --radius-xl: 1rem;
+  --radius-2xl: 1.25rem;
+
+  /* Easing used by the motion layer. */
+  --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/*
+ * shadcn/ui semantic tokens, mapped to the chasm palette. These are read by the
+ * dropped-in components (Button, Switch, …) via their utility classes.
+ */
+@layer base {
+  :root {
+    --background: var(--color-ink-900);
+    --foreground: var(--color-fg);
+    --card: var(--color-ink-800);
+    --card-foreground: var(--color-fg);
+    --popover: var(--color-ink-750);
+    --popover-foreground: var(--color-fg);
+    --primary: var(--color-accent);
+    --primary-foreground: #06121f;
+    --secondary: var(--color-ink-700);
+    --secondary-foreground: var(--color-fg);
+    --muted: var(--color-ink-700);
+    --muted-foreground: var(--color-fg-muted);
+    --border: var(--color-line);
+    --input: var(--color-line);
+    --ring: var(--color-accent);
+    color-scheme: dark;
+  }
+
+  * {
+    border-color: var(--border);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* App-wide ambient backdrop — a soft top sheen over the base ink, matching the
+     original shell's gradient but a touch richer. */
+  body {
+    background-image:
+      radial-gradient(
+        1200px 600px at 80% -10%,
+        color-mix(in srgb, var(--color-accent) 9%, transparent),
+        transparent 60%
+      ),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.022), transparent 32%);
+    background-attachment: fixed;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--color-accent) 35%, transparent);
+  }
+
+  /* Slim, unobtrusive scrollbars to match the premium dark look. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-ink-600) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: var(--color-ink-600);
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+}
+
+/* Respect the OS / app reduce-motion preference for the Motion layer. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/*
+ * Live appearance, driven by the saved Interface settings. lib/theme.ts loads
+ * the backend's /theme.css (which sets --accent, --bg, --panel, --line, … from
+ * the settings); here we map the app's semantic tokens onto those vars so accent,
+ * theme preset, and font scale apply. Unlayered so it wins over the @theme/@layer
+ * defaults above; the static fallbacks keep the look intact before /theme.css loads.
+ */
+:root {
+  --color-accent: var(--accent, #55a7ff);
+  --primary: var(--accent, #55a7ff);
+  --ring: var(--accent, #55a7ff);
+  --background: var(--bg, #101114);
+  --card: var(--panel, #16181d);
+  --popover: var(--panel-2, #1d2027);
+  --border: var(--line, #292d36);
+  --input: var(--line, #292d36);
+}

@@ -1,0 +1,66 @@
+{% extends "layout.html" %}
+
+{% block title %}{{ live_chat.title }} - chasm{% endblock %}
+
+{% block body %}
+<main class="app-shell">
+    <aside class="rail" aria-label="chasm spaces">
+        <div class="mark">ch</div>
+        <!-- Connection indicator: chasm is a passive backend; the in-game plugin
+             writes a heartbeat while running. app.js polls /connection/status and
+             toggles `is-connected` + the label. -->
+        <div class="rail-connection" id="connection-indicator" title="Game connection" aria-label="Game connection: not connected" aria-live="polite">
+            <span class="connection-dot" aria-hidden="true"></span>
+            <span class="connection-label" id="connection-label">Not connected</span>
+        </div>
+        <div class="rail-dot"></div>
+        <nav class="rail-books" aria-label="Content books">
+            <a class="rail-link" href="/lorebook" title="Lorebook — World Info" aria-label="Lorebook">
+                <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+            </a>
+            <a class="rail-link" href="/questbook" title="Quest Book" aria-label="Quest Book">
+                <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 11l3 3 8-8"/><path d="M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"/></svg>
+            </a>
+            <a class="rail-link" href="/actionbook" title="Action Book" aria-label="Action Book">
+                <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            </a>
+        </nav>
+        <a class="rail-settings" href="/settings/tts" title="Settings" aria-label="Settings">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="3"></circle>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            </svg>
+        </a>
+    </aside>
+
+    {% include "partials/character_list.html" %}
+
+    <section class="chat" aria-label="Live chat messages">
+        <header class="chat-header">
+            <div class="chat-title">
+                {% match selected_participant %}
+                {% when Some with (participant) %}
+                    <h1>{{ participant.name }}</h1>
+                    <p>{{ live_chat.title }}{% if participant.kind.len() > 0 %} &middot; {{ participant.kind }}{% endif %}{% if participant.distance_label.len() > 0 %} &middot; {{ participant.distance_label }}{% endif %}</p>
+                {% when None %}
+                    <h1>{{ live_chat.title }}</h1>
+                    <p>Select a character from the sidebar to view the conversation.</p>
+                {% endmatch %}
+            </div>
+            <nav class="toolbar" aria-label="Chat actions">
+                {% match selected_participant %}
+                {% when Some with (participant) %}
+                    <a class="button" href="/partials/live/{{ live_chat.id }}/messages/{{ participant.id }}">Partial</a>
+                    <a class="button" href="{{ live_chat.id|participant_url(participant.id) }}">Refresh</a>
+                {% when None %}
+                    <a class="button" href="/">Refresh</a>
+                {% endmatch %}
+            </nav>
+        </header>
+
+        {% include "partials/message_list.html" %}
+    </section>
+
+    {% include "partials/prompt_panel.html" %}
+</main>
+{% endblock %}

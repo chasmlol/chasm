@@ -1,0 +1,300 @@
+{% extends "layout.html" %}
+
+{% block title %}{{ book.name }} - Action Book - chasm{% endblock %}
+
+{% block body %}
+<main class="settings-shell book-shell">
+    <aside class="settings-nav" aria-label="Library navigation">
+        <a class="settings-back" href="/">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+            Back to chat
+        </a>
+        <p class="eyebrow">Library</p>
+        <div class="settings-nav-group">
+            <a class="settings-nav-link" href="/lorebook">Lorebook</a>
+            <a class="settings-nav-link" href="/questbook">Quest Book</a>
+            <a class="settings-nav-link is-active" href="/actionbook">Action Book</a>
+        </div>
+        <p class="settings-path" title="{{ book.path }}">{{ book.path }}</p>
+    </aside>
+
+    <section class="settings-main">
+        <form class="book-form" method="post" action="/actionbook" id="book-form">
+            <input type="hidden" name="id" value="{{ book.id }}">
+            <input type="hidden" name="deleted" id="book-deleted" value="">
+
+            <header class="book-bar">
+                <div class="book-bar-main">
+                    <p class="settings-eyebrow">Action Book</p>
+                    <label class="book-name-label" for="book-name">Action book name</label>
+                    <input class="text book-name" type="text" id="book-name" name="name" value="{{ book.name }}">
+                    <label class="field-label" for="book-description">Description</label>
+                    <textarea class="textarea" id="book-description" name="description" rows="2">{{ book.description }}</textarea>
+                    <p class="book-sub"><span id="book-entry-count">{{ book.entries.len() }}</span> actions · the NPCs can perform these in-game</p>
+                </div>
+                <div class="book-bar-actions">
+                    {% if book.saved %}<span class="book-saved" id="book-saved">Saved</span>{% endif %}
+                    <button type="button" class="button" id="book-add">Add action</button>
+                    <button type="submit" class="button primary">Save action book</button>
+                </div>
+            </header>
+
+            {% if book.entries.len() == 0 %}
+                <section class="empty-state">
+                    <h2>No actions</h2>
+                    <p>This action book has no entries yet. Use <strong>Add action</strong> to create one.</p>
+                </section>
+            {% endif %}
+
+            <div class="book-entries" id="book-entries">
+                {% for entry in book.entries %}
+                <details class="settings-group book-entry{% if entry.disable %} is-disabled{% endif %}" data-uid="{{ entry.uid }}">
+                    <summary class="settings-legend book-entry-legend">
+                        <span class="book-entry-title">
+                            <span class="book-entry-name">{{ entry.title }}</span>
+                            <code class="book-entry-uid">#{{ entry.uid }}</code>
+                            {% if entry.action_id.len() > 0 %}<code class="book-entry-uid">{{ entry.action_id }}</code>{% endif %}
+                            {% if entry.risk_tier.len() > 0 %}<span class="chip book-badge">{{ entry.risk_tier }}</span>{% endif %}
+                            {% if entry.vectorized %}<span class="chip chip-vectorized book-badge">vector</span>{% endif %}
+                            {% if entry.constant %}<span class="chip chip-constant book-badge">constant</span>{% endif %}
+                            {% if entry.disable %}<span class="chip chip-disabled book-badge">disabled</span>{% endif %}
+                        </span>
+                        <span class="book-legend-right">
+                            <button type="button" class="book-del" title="Delete this action" aria-label="Delete action">Delete</button>
+                            <span class="chev" aria-hidden="true"></span>
+                        </span>
+                    </summary>
+
+                    <input type="hidden" name="entry.{{ entry.uid }}.__present" value="1">
+
+                    {# ---- Body ---- #}
+                    <div class="book-section">
+                        <p class="book-section-eyebrow">Body</p>
+                        <label class="field-label" for="e{{ entry.uid }}-comment">Title / comment</label>
+                        <input class="text" type="text" id="e{{ entry.uid }}-comment" name="entry.{{ entry.uid }}.comment" value="{{ entry.comment }}">
+                        <label class="field-label" for="e{{ entry.uid }}-content">Content / description</label>
+                        <textarea class="textarea book-content" id="e{{ entry.uid }}-content" name="entry.{{ entry.uid }}.content" rows="4">{{ entry.content }}</textarea>
+                        <label class="field-label" for="e{{ entry.uid }}-commandTemplate">Command template</label>
+                        <textarea class="textarea" id="e{{ entry.uid }}-commandTemplate" name="entry.{{ entry.uid }}.commandTemplate" rows="3" spellcheck="false">{{ entry.command_template }}</textarea>
+                        <label class="field-label" for="e{{ entry.uid }}-vectorizableText">Vectorizable text</label>
+                        <textarea class="textarea" id="e{{ entry.uid }}-vectorizableText" name="entry.{{ entry.uid }}.vectorizableText" rows="3">{{ entry.vectorizable_text }}</textarea>
+                    </div>
+
+                    {# ---- Action ---- #}
+                    <div class="book-section">
+                        <p class="book-section-eyebrow">Action</p>
+                        <div class="book-grid">
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-actionId">Action id</label>
+                                <input class="text" type="text" id="e{{ entry.uid }}-actionId" name="entry.{{ entry.uid }}.actionId" value="{{ entry.action_id }}">
+                            </div>
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-riskTier">Risk tier</label>
+                                <select class="select book-select" id="e{{ entry.uid }}-riskTier" name="entry.{{ entry.uid }}.riskTier">
+                                    {% for opt in entry.risk_tier_options %}
+                                    <option value="{{ opt.value }}"{% if opt.selected %} selected{% endif %}>{{ opt.label }}</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-targetGame">Target game</label>
+                                <input class="text" type="text" id="e{{ entry.uid }}-targetGame" name="entry.{{ entry.uid }}.targetGame" value="{{ entry.target_game }}">
+                            </div>
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-pluginSource">Plugin source</label>
+                                <input class="text" type="text" id="e{{ entry.uid }}-pluginSource" name="entry.{{ entry.uid }}.pluginSource" value="{{ entry.plugin_source }}">
+                            </div>
+                        </div>
+
+                        {% for arr in entry.arrays %}
+                        <label class="field-label" for="e{{ entry.uid }}-{{ arr.field }}">{{ arr.label }} — one per line</label>
+                        <textarea class="textarea book-keys" id="e{{ entry.uid }}-{{ arr.field }}" name="entry.{{ entry.uid }}.{{ arr.field }}" rows="2">{{ arr.value }}</textarea>
+                        {% endfor %}
+                    </div>
+
+                    {# ---- Matching & scope ---- #}
+                    <div class="book-section">
+                        <p class="book-section-eyebrow">Matching &amp; scope</p>
+                        <label class="field-label" for="e{{ entry.uid }}-key">Primary keys (triggers) — one per line</label>
+                        <textarea class="textarea book-keys" id="e{{ entry.uid }}-key" name="entry.{{ entry.uid }}.key" rows="2">{{ entry.key }}</textarea>
+                        <label class="field-label" for="e{{ entry.uid }}-keysecondary">Secondary keys</label>
+                        <textarea class="textarea book-keys" id="e{{ entry.uid }}-keysecondary" name="entry.{{ entry.uid }}.keysecondary" rows="2">{{ entry.keysecondary }}</textarea>
+
+                        <div class="book-checks">
+                            <label class="checkbox"><input type="checkbox" name="entry.{{ entry.uid }}.constant"{% if entry.constant %} checked{% endif %}> Constant (always on)</label>
+                            <label class="checkbox"><input type="checkbox" name="entry.{{ entry.uid }}.vectorized"{% if entry.vectorized %} checked{% endif %}> Vectorized (semantic match)</label>
+                            <label class="checkbox"><input type="checkbox" name="entry.{{ entry.uid }}.selective"{% if entry.selective %} checked{% endif %}> Selective</label>
+                            <label class="checkbox"><input type="checkbox" name="entry.{{ entry.uid }}.disable"{% if entry.disable %} checked{% endif %}> Disabled</label>
+                            <label class="checkbox"><input type="checkbox" name="entry.{{ entry.uid }}.addMemo"{% if entry.add_memo %} checked{% endif %}> Add memo</label>
+                            <label class="checkbox"><input type="checkbox" name="entry.{{ entry.uid }}.useProbability"{% if entry.use_probability %} checked{% endif %}> Use probability</label>
+                            <label class="checkbox"><input type="checkbox" name="entry.{{ entry.uid }}.groupOverride"{% if entry.group_override %} checked{% endif %}> Group override</label>
+                        </div>
+
+                        <div class="book-grid">
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-position">Position</label>
+                                <select class="select book-select" id="e{{ entry.uid }}-position" name="entry.{{ entry.uid }}.position">
+                                    {% for opt in entry.position_options %}
+                                    <option value="{{ opt.value }}"{% if opt.selected %} selected{% endif %}>{{ opt.label }}</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-role">Role (@depth)</label>
+                                <select class="select book-select" id="e{{ entry.uid }}-role" name="entry.{{ entry.uid }}.role">
+                                    {% for opt in entry.role_options %}
+                                    <option value="{{ opt.value }}"{% if opt.selected %} selected{% endif %}>{{ opt.label }}</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-selectiveLogic">Selective logic</label>
+                                <input class="number book-num" type="number" id="e{{ entry.uid }}-selectiveLogic" name="entry.{{ entry.uid }}.selectiveLogic" value="{{ entry.selective_logic }}">
+                            </div>
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-order">Order</label>
+                                <input class="number book-num" type="number" id="e{{ entry.uid }}-order" name="entry.{{ entry.uid }}.order" value="{{ entry.order }}">
+                            </div>
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-probability">Probability</label>
+                                <input class="number book-num" type="number" id="e{{ entry.uid }}-probability" name="entry.{{ entry.uid }}.probability" value="{{ entry.probability }}">
+                            </div>
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-depth">Depth</label>
+                                <input class="number book-num" type="number" id="e{{ entry.uid }}-depth" name="entry.{{ entry.uid }}.depth" value="{{ entry.depth }}">
+                            </div>
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-group">Group</label>
+                                <input class="text" type="text" id="e{{ entry.uid }}-group" name="entry.{{ entry.uid }}.group" value="{{ entry.group }}">
+                            </div>
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-groupWeight">Group weight</label>
+                                <input class="number book-num" type="number" id="e{{ entry.uid }}-groupWeight" name="entry.{{ entry.uid }}.groupWeight" value="{{ entry.group_weight }}">
+                            </div>
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-automationId">Automation id</label>
+                                <input class="text" type="text" id="e{{ entry.uid }}-automationId" name="entry.{{ entry.uid }}.automationId" value="{{ entry.automation_id }}">
+                            </div>
+                        </div>
+                    </div>
+
+                    {# ---- Advanced ---- #}
+                    <div class="book-section">
+                        <p class="book-section-eyebrow">Advanced</p>
+                        <div class="book-checks">
+                            {% for bf in entry.advanced_bools %}
+                            <label class="checkbox"><input type="checkbox" name="entry.{{ entry.uid }}.{{ bf.field }}"{% if bf.checked %} checked{% endif %}> {{ bf.label }}</label>
+                            {% endfor %}
+                        </div>
+                        <div class="book-checks">
+                            {% for tri in entry.tristates %}
+                            <label class="checkbox book-tri" title="Tri-state: unset leaves it null">
+                                <select class="select book-tri-select" name="entry.{{ entry.uid }}.{{ tri.field }}">
+                                    <option value="unset"{% if tri.state == "unset" %} selected{% endif %}>(unset)</option>
+                                    <option value="true"{% if tri.state == "true" %} selected{% endif %}>true</option>
+                                    <option value="false"{% if tri.state == "false" %} selected{% endif %}>false</option>
+                                </select>
+                                {{ tri.label }}
+                            </label>
+                            {% endfor %}
+                        </div>
+                        <div class="book-grid">
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-delayUntilRecursion">Delay until recursion</label>
+                                <input class="number book-num" type="number" id="e{{ entry.uid }}-delayUntilRecursion" name="entry.{{ entry.uid }}.delayUntilRecursion" value="{{ entry.delay_until_recursion }}">
+                            </div>
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-scanDepth">Scan depth</label>
+                                <input class="number book-num" type="number" id="e{{ entry.uid }}-scanDepth" name="entry.{{ entry.uid }}.scanDepth" value="{{ entry.scan_depth }}">
+                            </div>
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-sticky">Sticky</label>
+                                <input class="number book-num" type="number" id="e{{ entry.uid }}-sticky" name="entry.{{ entry.uid }}.sticky" value="{{ entry.sticky }}">
+                            </div>
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-cooldown">Cooldown</label>
+                                <input class="number book-num" type="number" id="e{{ entry.uid }}-cooldown" name="entry.{{ entry.uid }}.cooldown" value="{{ entry.cooldown }}">
+                            </div>
+                            <div class="book-field">
+                                <label class="field-label" for="e{{ entry.uid }}-delay">Delay</label>
+                                <input class="number book-num" type="number" id="e{{ entry.uid }}-delay" name="entry.{{ entry.uid }}.delay" value="{{ entry.delay }}">
+                            </div>
+                        </div>
+                    </div>
+
+                    {# ---- Nested JSON ---- #}
+                    <div class="book-section">
+                        <p class="book-section-eyebrow">Parameters, effects &amp; binding (JSON)</p>
+                        <p class="field-help">Structured action data edited as JSON. On save each is parsed back into the entry; invalid JSON is ignored (the prior value is kept), and a blank box clears the field to null.</p>
+                        {% for jf in entry.json_fields %}
+                        <label class="field-label" for="e{{ entry.uid }}-{{ jf.field }}">{{ jf.label }}</label>
+                        <textarea class="textarea book-extra" id="e{{ entry.uid }}-{{ jf.field }}" name="entry.{{ entry.uid }}.{{ jf.field }}" rows="4" spellcheck="false">{{ jf.value }}</textarea>
+                        {% endfor %}
+                    </div>
+
+                    {% if entry.extra_json.len() > 0 %}
+                    <div class="book-section">
+                        <p class="book-section-eyebrow">Other fields (raw JSON)</p>
+                        <p class="field-help">Fields on this action without a dedicated control. Edit as a JSON object; on save it is merged back over the entry. Invalid JSON is ignored.</p>
+                        <textarea class="textarea book-extra" name="entry.{{ entry.uid }}.__extra" rows="4" spellcheck="false">{{ entry.extra_json }}</textarea>
+                    </div>
+                    {% endif %}
+                </details>
+                {% endfor %}
+            </div>
+
+            <footer class="book-foot">
+                <button type="button" class="button" id="book-add-foot">Add action</button>
+                <button type="submit" class="button primary">Save action book</button>
+            </footer>
+        </form>
+    </section>
+</main>
+
+<template id="book-entry-template">
+    <details class="settings-group book-entry" data-uid="__UID__" open>
+        <summary class="settings-legend book-entry-legend">
+            <span class="book-entry-title">
+                <span class="book-entry-name">New action</span>
+                <code class="book-entry-uid">#__UID__</code>
+            </span>
+            <span class="book-legend-right">
+                <button type="button" class="book-del" title="Delete this action" aria-label="Delete action">Delete</button>
+                <span class="chev" aria-hidden="true"></span>
+            </span>
+        </summary>
+        <input type="hidden" name="entry.__UID__.__present" value="1">
+        <div class="book-section">
+            <p class="book-section-eyebrow">Body</p>
+            <label class="field-label">Title / comment</label>
+            <input class="text" type="text" name="entry.__UID__.comment" value="">
+            <label class="field-label">Content / description</label>
+            <textarea class="textarea book-content" name="entry.__UID__.content" rows="4"></textarea>
+            <label class="field-label">Command template</label>
+            <textarea class="textarea" name="entry.__UID__.commandTemplate" rows="3" spellcheck="false"></textarea>
+        </div>
+        <div class="book-section">
+            <p class="book-section-eyebrow">Action</p>
+            <div class="book-grid">
+                <div class="book-field">
+                    <label class="field-label">Action id</label>
+                    <input class="text" type="text" name="entry.__UID__.actionId" value="">
+                </div>
+                <div class="book-field">
+                    <label class="field-label">Risk tier</label>
+                    <input class="text" type="text" name="entry.__UID__.riskTier" value="low">
+                </div>
+            </div>
+        </div>
+        <div class="book-section">
+            <p class="book-section-eyebrow">Matching &amp; scope</p>
+            <label class="field-label">Primary keys (triggers) — one per line</label>
+            <textarea class="textarea book-keys" name="entry.__UID__.key" rows="2"></textarea>
+            <div class="book-checks">
+                <label class="checkbox"><input type="checkbox" name="entry.__UID__.constant"> Constant (always on)</label>
+                <label class="checkbox"><input type="checkbox" name="entry.__UID__.vectorized"> Vectorized (semantic match)</label>
+            </div>
+        </div>
+    </details>
+</template>
+{% endblock %}
