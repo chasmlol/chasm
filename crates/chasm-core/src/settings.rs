@@ -57,34 +57,24 @@ impl Default for AppSettings {
 }
 
 /// Default hard cap on the stored persona description, in characters. The
-/// generation prompt demands a single ~100-word paragraph (~700 chars); this
-/// is a safety net above that, not the primary length control.
+/// generation prompt demands two paragraphs of ~80 + ~120 words (~1250 chars
+/// total); this is a safety net above that, not the primary length control.
 pub const PERSONA_MAX_CHARS_DEFAULT: u32 = 1400;
 
-/// Player-persona generation settings. The FNV mod uploads a stealth capture
-/// (front screenshot + stats snapshot); chasm-web's persona module turns it
-/// into a SillyTavern-style user-persona description via a vision-capable LLM
-/// when one is reachable, else a stats-only text generation.
+/// Player-persona generation settings. The FNV mod uploads a game-data capture
+/// (stats + appearance records) on every save; chasm-web's persona module
+/// turns it into a SillyTavern-style user-persona description with the main
+/// text LLM. (The old screenshot + vision-endpoint path is retired; stored
+/// `vision_*` keys in older settings files are simply ignored.)
 ///
 /// `#[serde(default)]` so older settings files (no `persona` key) load fine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersonaSettings {
-    /// Master switch: when off, incoming captures are still stored (image +
-    /// stats visible on the Persona page) but no LLM generation runs and no
+    /// Master switch: when off, incoming captures are still stored (stats
+    /// visible on the Persona page) but no LLM generation runs and no
     /// description is injected into prompts.
     pub enabled: bool,
-    /// Optional SEPARATE vision-capable OpenAI-compatible endpoint base URL
-    /// (the `/v1/chat/completions` suffix is appended, mirroring the main LLM
-    /// client). Blank = try the main LLM endpoint with the image first. Set
-    /// this when the main model has no multimodal projector.
-    pub vision_endpoint: String,
-    /// Optional model id sent to the vision endpoint (blank = the endpoint's
-    /// first advertised `/v1/models` entry / server default).
-    pub vision_model: String,
-    /// Optional bearer token for the vision endpoint (`Authorization: Bearer
-    /// <key>`). Stored as-is; never logged.
-    pub vision_api_key: String,
     /// Hard cap on the stored persona description length, in characters
     /// (truncated at a word boundary). 0 = use the default.
     pub max_chars: u32,
@@ -94,9 +84,6 @@ impl Default for PersonaSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            vision_endpoint: String::new(),
-            vision_model: String::new(),
-            vision_api_key: String::new(),
             max_chars: PERSONA_MAX_CHARS_DEFAULT,
         }
     }

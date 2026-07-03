@@ -100,7 +100,6 @@ pub(crate) fn api_router() -> Router<Arc<AppState>> {
         // --- persona (the generated player persona: description + screenshot
         // + stats snapshot; regenerate = the manual test hook) -----------------
         .route("/persona", get(persona::persona_view))
-        .route("/persona/image", get(persona::persona_image))
         .route("/persona/regenerate", post(persona::persona_regenerate))
         // --- globals (global scenario template: the production macro surface,
         // replacing the per-character card scenario; + resolved preview) ------

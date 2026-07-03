@@ -1,11 +1,9 @@
 // Persona domain of the UI API — the Persona page.
 //
-// Three endpoints (crates/chasm-web/src/ui/persona.rs):
+// Two endpoints (crates/chasm-web/src/ui/persona.rs):
 //   - GET  /api/ui/v1/persona            the stored player persona: generated
-//     description + provenance, the stats snapshot it used, timestamps, and
-//     whether a screenshot exists (empty state before the first capture).
-//   - GET  /api/ui/v1/persona/image      the last stored screenshot bytes
-//     (used directly as an <img src>; 404 before the first image capture).
+//     description + provenance, the character-data snapshot it used, and
+//     timestamps (empty state before the first capture).
 //   - POST /api/ui/v1/persona/regenerate re-runs generation from the last
 //     received capture and returns the refreshed view (the manual test hook).
 //
@@ -22,30 +20,23 @@ export interface PersonaViewDto {
   generated_at?: string | null;
   /** ISO timestamp of the capture the description came from. */
   captured_at?: string | null;
-  /** "vision" (described from the screenshot) or "stats_only". */
+  /** "game_data" (older records may carry "vision" / "stats_only"). */
   source?: string | null;
-  /** Which generation path produced it (vision endpoint / main LLM / …). */
+  /** Human note on the generation outcome. */
   model_note?: string | null;
   /** Last generation error (a previous good description is kept alongside). */
   generation_error?: string | null;
   /** The exact prompt text sent to the LLM for the current description
    *  (absent on records generated before prompt persistence existed). */
   prompt?: string | null;
-  /** The stats snapshot used (player_name, level, special, skills, perks,
-   *  equipped_weapon, equipped_apparel, location — display strings). */
+  /** The character-data snapshot used (stats + appearance display strings:
+   *  player_name, level, special, skills, perks, equipped_weapon,
+   *  equipped_apparel, location, sex, race, hair_*, eye_color, facial_hair). */
   stats: Record<string, string | number>;
-  /** True when a screenshot is stored (render `${UI_API}/persona/image`). */
-  has_image: boolean;
   /** True while a generation task is currently running. */
   generating: boolean;
   /** True when a capture exists (Regenerate is meaningful). */
   has_capture: boolean;
-}
-
-/** URL of the stored screenshot; `bust` forces a fresh fetch after updates. */
-export function personaImageUrl(bust?: string | null): string {
-  const base = `${UI_API}/persona/image`;
-  return bust ? `${base}?t=${encodeURIComponent(bust)}` : base;
 }
 
 export const personaApi = {

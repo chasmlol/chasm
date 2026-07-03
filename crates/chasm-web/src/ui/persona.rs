@@ -1,14 +1,11 @@
 //! UI persona domain — the Persona page backend.
 //!
-//! Three endpoints under `/api/ui/v1` (registered in `ui.rs`, mirroring the
+//! Two endpoints under `/api/ui/v1` (registered in `ui.rs`, mirroring the
 //! gamestate domain):
 //!
 //!   * `GET  /persona`            — the stored persona view: the generated
-//!     description + provenance, the stats snapshot it used, timestamps, and
-//!     whether a screenshot/generation exists (empty state before the first
-//!     capture).
-//!   * `GET  /persona/image`      — the last stored screenshot bytes (JPEG or
-//!     PNG; 404 before the first image capture).
+//!     description + provenance, the character-data snapshot it used, and
+//!     timestamps (empty state before the first capture).
 //!   * `POST /persona/regenerate` — re-runs generation from the LAST received
 //!     capture (the manual test hook), awaiting the result so the page can
 //!     show the fresh description in one round-trip.
@@ -18,12 +15,7 @@
 
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::{header, StatusCode},
-    response::{IntoResponse, Response},
-    Json,
-};
+use axum::{extract::State, Json};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -41,10 +33,10 @@ pub(crate) struct UiPersonaView {
     /// When the underlying capture was taken in-game / received.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub captured_at: Option<String>,
-    /// `"vision"` (described from the screenshot) or `"stats_only"`.
+    /// `"game_data"` (older records may carry `"vision"` / `"stats_only"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// Human note on which path generated it (vision endpoint / main LLM / …).
+    /// Human note on the generation outcome.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_note: Option<String>,
     /// Last generation error (kept alongside a previous good description).
@@ -54,11 +46,9 @@ pub(crate) struct UiPersonaView {
     /// (records generated before prompt persistence existed have none).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
-    /// The stats snapshot the description was generated from (else the latest
-    /// received capture's snapshot; `{}` before any capture).
+    /// The character-data snapshot the description was generated from (else
+    /// the latest received capture's snapshot; `{}` before any capture).
     pub stats: Value,
-    /// True when a screenshot is stored (the page then shows `/persona/image`).
-    pub has_image: bool,
     /// True while a generation task is currently running.
     pub generating: bool,
     /// True when a capture exists (Regenerate is meaningful).
@@ -98,6 +88,14 @@ fn build_view(state: &AppState) -> UiPersonaView {
                     "equipped_weapon",
                     "equipped_apparel",
                     "location",
+                    "sex",
+                    "race",
+                    "age_years",
+                    "hair_color",
+                    "hair_style",
+                    "hair_length",
+                    "eye_color",
+                    "facial_hair",
                 ] {
                     if let Some(value) = capture.get(key) {
                         if value.is_string() || value.is_number() {
@@ -126,7 +124,6 @@ fn build_view(state: &AppState) -> UiPersonaView {
         generation_error: stored_ref.and_then(|persona| field(persona, "generation_error")),
         prompt: stored_ref.and_then(|persona| field(persona, "prompt")),
         stats,
-        has_image: persona::stored_image(&dir).is_some(),
         generating: persona::generation_in_flight(),
         has_capture: capture.is_some(),
     }
@@ -138,27 +135,6 @@ pub(crate) async fn persona_view(
     State(state): State<Arc<AppState>>,
 ) -> WebResult<Json<UiPersonaView>> {
     Ok(Json(build_view(&state)))
-}
-
-/// `GET /api/ui/v1/persona/image` — the last stored screenshot bytes.
-/// `Cache-Control: no-store` so the page always shows the newest capture
-/// (the file name never changes between captures).
-pub(crate) async fn persona_image(State(state): State<Arc<AppState>>) -> Response {
-    let dir = persona::persona_dir(&state);
-    match persona::stored_image(&dir).and_then(|(path, mime)| {
-        std::fs::read(&path).ok().map(|bytes| (bytes, mime))
-    }) {
-        Some((bytes, mime)) => (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, mime),
-                (header::CACHE_CONTROL, "no-store"),
-            ],
-            bytes,
-        )
-            .into_response(),
-        None => (StatusCode::NOT_FOUND, "no persona capture stored yet").into_response(),
-    }
 }
 
 /// `POST /api/ui/v1/persona/regenerate` — re-runs generation from the last

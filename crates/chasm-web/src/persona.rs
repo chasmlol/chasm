@@ -1,18 +1,18 @@
 //! Player persona — the SillyTavern-style "user persona" built from the FNV
-//! mod's stealth capture.
+//! mod's game-data capture.
 //!
-//! The mod POSTs `/api/game/v1/persona` (see `mod-source/docs/persona.md` for
-//! the frozen contract): the player's stats snapshot (display strings reusing
-//! the gamestate-macro extractors) plus an optional base64 JPEG/PNG of the
-//! player photographed from the front. This module:
+//! The mod POSTs `/api/game/v1/persona` on EVERY save (see
+//! `mod-source/docs/persona.md` for the frozen contract): the player's stats
+//! snapshot plus appearance records (sex, race, hair style/color/length, eye
+//! color, facial hair, worn apparel) — all display strings reusing the
+//! gamestate-macro extractors. Pure data; no screenshot (the old offscreen
+//! portrait + vision-LLM path is fully retired). This module:
 //!
 //!   * stores the capture profile-aware under [`chasm_core::ProfilePaths::persona_dir`]
-//!     (`capture.json` + `capture.jpg|png`),
-//!   * generates a compact third-person description of the player with a
-//!     vision-capable LLM when one is reachable — the optional separate
-//!     `persona.vision_endpoint` first, then the main LLM endpoint with the
-//!     image — and ALWAYS falls back to a stats-only text generation so the
-//!     feature works with no vision model at all,
+//!     (`capture.json`),
+//!   * generates a two-paragraph third-person description with the main text
+//!     LLM: looks written from the appearance facts, manner written from the
+//!     attribute/skill magnitudes,
 //!   * writes the result to `persona.json`, which prompt assembly injects at
 //!     SillyTavern's story-string persona slot (see `chasm-prompt`) and the
 //!     Persona UI page reads (see `ui/persona.rs`).
@@ -29,33 +29,32 @@ use std::{
 };
 
 use axum::{extract::State, Json};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Map, Value};
 use chasm_core::AppSettings;
 
 use crate::{AppState, WebError, WebResult};
 
-/// Max decoded screenshot size accepted from the mod (a 1080p JPEG is well
-/// under 1 MB; this only guards against garbage).
-const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
-
 /// Request-body limit for `POST /api/game/v1/persona` (applied as a
-/// route-scoped [`axum::extract::DefaultBodyLimit`] in `lib.rs`; axum's 2 MB
-/// default would otherwise 413 a large capture before this module ever saw
-/// it). Sized for [`MAX_IMAGE_BYTES`] of image after base64's 4/3 inflation
-/// (~10.7 MB) plus the stats snapshot and JSON framing.
-pub(crate) const MAX_BODY_BYTES: usize = 12 * 1024 * 1024;
+/// route-scoped [`axum::extract::DefaultBodyLimit`] in `lib.rs`). Captures are
+/// pure game-data JSON now (a few KB); this is a generous guard, not a budget.
+pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024;
 
-/// `max_tokens` for the persona generation. The prompt demands TWO compact
-/// paragraphs (looks, then manner) of at most ~80 words each (~230 tokens
-/// total); this clamp keeps the output bounded even when the model ignores
-/// the instruction.
-const PERSONA_MAX_TOKENS: i64 = 320;
+/// `max_tokens` for the persona generation. The prompt demands TWO paragraphs
+/// (looks at ~80 words, then manner at ~120 words — ~280 tokens total); this
+/// clamp keeps the output bounded even when the model ignores the
+/// instruction.
+const PERSONA_MAX_TOKENS: i64 = 480;
 
 /// One persona generation at a time, process-wide. A capture arriving while a
-/// generation runs is stored; its generation is skipped (the next capture or a
-/// manual Regenerate re-runs it) — persona is periodic + self-healing.
+/// generation runs is stored and sets [`RERUN_REQUESTED`]; the running task
+/// picks it up as soon as the current generation finishes, so EVERY save
+/// regenerates (the mod uploads on every save, unthrottled).
 static GENERATING: AtomicBool = AtomicBool::new(false);
+
+/// Set when a capture arrives mid-generation; the in-flight task re-runs from
+/// the (newer) stored capture before clearing [`GENERATING`]. Latest wins:
+/// several captures during one generation collapse into a single re-run.
+static RERUN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// True while a persona generation task is in flight (read by the UI view).
 pub(crate) fn generation_in_flight() -> bool {
@@ -81,27 +80,11 @@ pub(crate) fn persona_path(dir: &Path) -> PathBuf {
     dir.join("persona.json")
 }
 
-/// Path of the stored screenshot for `format` (`jpeg` → capture.jpg).
-fn image_path(dir: &Path, format: &str) -> PathBuf {
-    dir.join(if format.eq_ignore_ascii_case("png") {
-        "capture.png"
-    } else {
-        "capture.jpg"
-    })
-}
-
-/// The stored screenshot, if any: `(path, mime)`. JPEG wins when both exist
-/// (the writer removes the other format, so both only exist transiently).
-pub(crate) fn stored_image(dir: &Path) -> Option<(PathBuf, &'static str)> {
-    let jpg = dir.join("capture.jpg");
-    if jpg.is_file() {
-        return Some((jpg, "image/jpeg"));
-    }
-    let png = dir.join("capture.png");
-    if png.is_file() {
-        return Some((png, "image/png"));
-    }
-    None
+/// Deletes screenshots left behind by the retired portrait feature so old
+/// stores converge on the data-only layout. Best-effort.
+fn remove_stale_images(dir: &Path) {
+    let _ = fs::remove_file(dir.join("capture.jpg"));
+    let _ = fs::remove_file(dir.join("capture.png"));
 }
 
 /// Reads a JSON file as a `Value`; `None` when absent or unparseable.
@@ -128,7 +111,7 @@ fn write_json_atomic(path: &Path, value: &Value) -> std::io::Result<()> {
 
 /// The capture fields that constitute the "stats snapshot" (the display
 /// strings the mod extracts — see `mod-source/docs/persona.md`).
-const STAT_KEYS: [&str; 13] = [
+const STAT_KEYS: [&str; 16] = [
     "player_name",
     "level",
     "special",
@@ -139,9 +122,12 @@ const STAT_KEYS: [&str; 13] = [
     "location",
     "sex",
     "race",
+    "age_years",
     "hair_color",
     "hair_style",
+    "hair_length",
     "eye_color",
+    "facial_hair",
 ];
 
 /// Projects the stats snapshot out of a capture/persona body (string/number
@@ -253,7 +239,10 @@ fn skills_lines(raw: &str) -> Vec<String> {
     if pairs.is_empty() || pairs.iter().all(|(_, value)| value.is_none()) {
         return vec![format!("Skills: {raw}")];
     }
-    let mut lines = vec![format!("Skills, each rated 0 to 100: {raw}")];
+    let mut lines = vec![format!(
+        "Skills, each rated 0 to 100 — untrained people sit around 10 to 30, 85 or more is \
+         true mastery: {raw}"
+    )];
     let extremes: Vec<String> = pairs
         .iter()
         .filter_map(|(label, value)| {
@@ -268,43 +257,201 @@ fn skills_lines(raw: &str) -> Vec<String> {
     lines
 }
 
-/// The human-readable stat sheet embedded in the generation prompt. SPECIAL
-/// and skills are rendered as natural language (full attribute names, explicit
-/// scales, qualitative bands) so the model never sees bare `STR 9`-style
-/// abbreviations it might misread.
-fn stats_block(stats: &Value) -> String {
-    let field = |key: &str| -> String {
-        match stats.get(key) {
-            Some(Value::String(text)) => text.trim().to_string(),
-            Some(Value::Number(number)) => number.to_string(),
-            _ => String::new(),
+/// Pulls a trimmed string/number field out of the stats snapshot.
+fn stat_field(stats: &Value, key: &str) -> String {
+    match stats.get(key) {
+        Some(Value::String(text)) => text.trim().to_string(),
+        Some(Value::Number(number)) => number.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Maps the mod's `#RRGGBB` hair color to a plain color word the LLM can use
+/// (`None` on malformed input — the line is then omitted rather than guessed).
+fn hair_color_name(hex: &str) -> Option<&'static str> {
+    let hex = hex.trim().trim_start_matches('#');
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()? as f32;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()? as f32;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()? as f32;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let lightness = (max + min) / 2.0 / 255.0;
+    let saturation = if max <= 0.0 { 0.0 } else { (max - min) / max };
+    Some(if lightness < 0.09 {
+        "black"
+    } else if saturation < 0.15 {
+        // Desaturated: the gray/white ramp.
+        if lightness > 0.8 {
+            "white"
+        } else if lightness > 0.5 {
+            "gray"
+        } else if lightness > 0.25 {
+            "graying dark"
+        } else {
+            "black"
         }
-    };
+    } else if r > g * 1.6 && r > b * 1.6 && lightness < 0.55 {
+        "red"
+    } else if lightness > 0.72 {
+        "platinum blonde"
+    } else if lightness > 0.55 {
+        "blonde"
+    } else if lightness > 0.42 {
+        if r > g * 1.25 {
+            "auburn"
+        } else {
+            "light brown"
+        }
+    } else if lightness > 0.28 {
+        "brown"
+    } else {
+        "dark brown"
+    })
+}
+
+/// Age phrase implied by the race record's name, when it carries a marker.
+/// FNV encodes coarse age in race VARIANTS (the GECK AgeRace system):
+/// `Caucasian Old`, `Hispanic Middle Aged`, child races... A plain adult race
+/// says nothing (`None`) — the FaceGen-derived `age_years` speaks instead.
+fn race_age_marker(race: &str) -> Option<&'static str> {
+    let lower = race.to_ascii_lowercase();
+    if lower.contains("child") || lower.contains("young") {
+        Some("a child")
+    } else if lower.contains("middle") {
+        Some("middle-aged")
+    } else if lower.contains("old") || lower.contains("elder") || lower.contains("aged") {
+        Some("older, well past middle age")
+    } else {
+        None
+    }
+}
+
+/// The ethnicity implied by the race name: age tokens stripped, the stock FNV
+/// race names mapped to plain words; anything else (mod races, ghouls...)
+/// passes through as-is so nothing is ever invented.
+fn race_ethnicity(race: &str) -> String {
+    let stripped: Vec<&str> = race
+        .split_whitespace()
+        .filter(|token| {
+            !matches!(
+                token.to_ascii_lowercase().as_str(),
+                "old" | "older" | "aged" | "middle" | "child" | "young"
+            )
+        })
+        .collect();
+    let base = stripped.join(" ");
+    match base.to_ascii_lowercase().as_str() {
+        "caucasian" => "white".to_string(),
+        "african american" | "africanamerican" => "Black".to_string(),
+        "hispanic" => "Hispanic".to_string(),
+        "asian" => "Asian".to_string(),
+        _ => base,
+    }
+}
+
+/// The appearance facts block: one `- Label: value` line per fact the capture
+/// carries, natural-language values only (hex colors mapped to words, style
+/// names lowercased into prose). Absent facts are simply not listed — the
+/// prompt forbids the model from remarking on absence.
+fn appearance_lines(stats: &Value) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
-    let name = field("player_name");
+    let sex = stat_field(stats, "sex");
+    if !sex.is_empty() {
+        lines.push(format!("- Sex: {sex}"));
+    }
+    // Age: an explicit race marker (Old / Middle Aged / child races) wins —
+    // aged races look aged regardless of the face. Otherwise the FaceGen-
+    // derived years (the chargen Age slider) speak. With neither, the line is
+    // omitted and the description claims nothing about age.
+    let race = stat_field(stats, "race");
+    let marker = if race.is_empty() {
+        None
+    } else {
+        race_age_marker(&race)
+    };
+    if let Some(phrase) = marker {
+        lines.push(format!("- Age: {phrase}"));
+    } else if let Ok(years) = stat_field(stats, "age_years").parse::<u32>() {
+        lines.push(format!("- Age: about {years} years old"));
+    }
+    if !race.is_empty() {
+        let ethnicity = race_ethnicity(&race);
+        if !ethnicity.is_empty() {
+            lines.push(format!("- Ethnicity: {ethnicity}"));
+        }
+    }
+    let mut hair_parts: Vec<String> = Vec::new();
+    if let Some(color) = hair_color_name(&stat_field(stats, "hair_color")) {
+        hair_parts.push(color.to_string());
+    }
+    let style = stat_field(stats, "hair_style");
+    if !style.is_empty() {
+        hair_parts.push(format!("styled in a {}", style.to_lowercase()));
+    }
+    // The GECK hair-length slider (0..1) scales the chosen style; only the
+    // extremes say anything a stranger would notice.
+    if let Ok(length) = stat_field(stats, "hair_length").parse::<f64>() {
+        if length >= 0.75 {
+            hair_parts.push("worn long".to_string());
+        } else if length <= 0.25 {
+            hair_parts.push("kept short".to_string());
+        }
+    }
+    if !hair_parts.is_empty() {
+        lines.push(format!("- Hair: {}", hair_parts.join(", ")));
+    }
+    let eyes = stat_field(stats, "eye_color");
+    if !eyes.is_empty() {
+        lines.push(format!("- Eyes: {}", eyes.to_lowercase()));
+    }
+    let facial_hair = stat_field(stats, "facial_hair");
+    if !facial_hair.is_empty() {
+        lines.push(format!("- Facial hair: {}", facial_hair.to_lowercase()));
+    }
+    let apparel = stat_field(stats, "equipped_apparel");
+    if !apparel.is_empty() {
+        lines.push(format!("- Wearing: {apparel}"));
+    }
+    lines
+}
+
+/// The human-readable character sheet embedded in the generation prompt:
+/// appearance facts first (natural-language values), then SPECIAL and skills
+/// rendered with full attribute names, explicit scales, and qualitative bands
+/// so the model never sees bare `STR 9`-style abbreviations it might misread.
+fn stats_block(stats: &Value) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let name = stat_field(stats, "player_name");
     if !name.is_empty() {
         lines.push(format!("Name: {name}"));
     }
-    let level = field("level");
+    let level = stat_field(stats, "level");
     if !level.is_empty() {
         lines.push(format!("Level: {level}"));
     }
-    let special = field("special");
+    let appearance = appearance_lines(stats);
+    if !appearance.is_empty() {
+        lines.push("Appearance (authoritative character data):".to_string());
+        lines.extend(appearance);
+    }
+    let special = stat_field(stats, "special");
     if !special.is_empty() {
-        lines.push("Attributes (each 1 to 10):".to_string());
+        lines.push(
+            "Attributes, each rated 1 to 10 — 5 is an ordinary adult, 1 or less is a \
+             crippling deficiency, 10 is the human limit:"
+                .to_string(),
+        );
         lines.extend(special_lines(&special));
     }
-    let skills = field("skills");
+    let skills = stat_field(stats, "skills");
     if !skills.is_empty() {
         lines.extend(skills_lines(&skills));
     }
-    // Clothing IS in the sheet (the photo is a face shot, so the outfit must
-    // come from game data); weapon and perks stay out (weapon is scene-specific
-    // and perk names pulled the description in odd directions).
-    let apparel = field("equipped_apparel");
-    if !apparel.is_empty() {
-        lines.push(format!("Wearing (game data): {apparel}"));
-    }
+    // Weapon and perks stay out (weapon is scene-specific and perk names
+    // pulled the description in odd directions).
     lines.join("\n")
 }
 
@@ -327,169 +474,80 @@ fn cap_description(text: &str, max_chars: usize) -> String {
 // The generation prompt
 // ---------------------------------------------------------------------------
 
-/// Builds the persona-generation prompt. `with_image` selects the vision
-/// variant ("the person in this photo") vs. the stats-only variant.
-fn persona_prompt(stats: &Value, with_image: bool) -> String {
+/// Builds the persona-generation prompt: one text-only prompt writing TWO
+/// paragraphs from the character sheet — looks from the appearance facts,
+/// manner from the attribute/skill magnitudes.
+fn persona_prompt(stats: &Value) -> String {
     let name = stats
         .get("player_name")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .unwrap_or("the person");
-    let opening = if with_image {
-        "You are looking at a close-up photo of a person's face. Write a sketch of their face and \
-         head, as if telling someone how to recognize this person in a crowd."
-            .to_string()
-    } else {
-        format!(
-            "Write a sketch of the face and presence of {name}, a person someone is about to \
-             meet, working only from the stat sheet below — as if telling someone how to \
-             recognize them in a crowd."
-        )
-    };
-    let rules = if with_image {
-        "- FIRST PARAGRAPH — their looks, purely from the photo: apparent age and sex, face, \
-         complexion, eyes, hair (color and style), facial hair, scars and other marks, and any \
-         headwear (hat, helmet, goggles, mask). Open it with one plain sentence like \
-         \"<name> is a middle-aged man with slicked-back blonde hair and pale blue eyes.\" \
-         Trust ONLY the photo here — no stats, no personality. Do NOT describe clothing below \
-         the neck, their body, build, or hands.\n\
-         - Mention facial hair, scars, or headwear ONLY when actually present — never remark \
-         on their absence (never write \"no visible scars\", \"clean-shaven\", or \
-         \"wears no hat\"). Never describe their expression or what it lacks.\n\
-         - END the first paragraph with what they are wearing, from the \"Wearing\" line of \
-         the stat sheet (the photo does not show their outfit) — phrase it naturally as worn \
-         clothing, not as a list. If the Wearing line names headwear, treat it as worn.\n\
-         - SECOND PARAGRAPH — how they come across: manner, capability, presence, drawn from \
-         the stat sheet. Never quote numbers or stat names. Only extremes deserve expression \
-         (brilliant Intelligence → sharp, appraising; rock-bottom Speech → halting and \
-         wordless; immense Strength → radiates physical power). Say nothing about middling \
-         values.\n\
-         - Never describe the background, surroundings, lighting, or framing. Never mention that \
-         this is a photo, screenshot, render, or game.\n\
+    let opening = format!(
+        "Write a sketch of {name}, a person someone is about to meet, working only from the \
+         character sheet below — as if telling someone how to recognize this person in a \
+         crowd."
+    );
+    // The honesty/calibration rule for the manner paragraph. Deliberately
+    // generic — it teaches the model how to weigh ANY rating against its
+    // scale, never naming specific attributes or skills (special-casing a
+    // skill here would silently bias every other sheet).
+    let calibration = "- Take the character sheet at face value and give every rating its full \
+         weight — each line states its scale and a plain-language judgment; trust them \
+         over politeness. Ratings near the middle are ordinary: pass over them in silence \
+         rather than padding the paragraph — and when nearly everything is ordinary, say \
+         that plainly in a sentence or two and stop, instead of restating each ordinary \
+         thing. The further a rating sits from the middle, the \
+         more space and force it deserves. A rating at the very bottom of its scale is a \
+         glaring, crippling deficiency a stranger would notice within a minute of meeting \
+         them — say what it actually looks like, bluntly; do not soften it, dress it up in \
+         dignity, or shrink it to a quirk. A rating at the very top is genuine mastery or a \
+         formidable gift — show it concretely in how they move, act, or react, not as a \
+         one-word compliment. When the sheet mixes both, let the contrast stand at full \
+         strength.\n\
+         - Never quote numbers, ratings, stat names, or game terms — render them as \
+         observed character. Describe only what the sheet supports; never mention what it \
+         lacks or leaves unsaid.\n";
+    let rules = format!(
+        "- FIRST PARAGRAPH — their looks, from the \"Appearance\" facts ONLY: age and sex, \
+         ethnicity, hair, eyes, facial hair when listed — ending with what they are \
+         wearing, phrased naturally as worn clothing, not as a list. Open it with one \
+         plain sentence like \"{name} is a middle-aged man with dark brown hair and blue \
+         eyes.\" Use every Appearance fact given and invent nothing beyond connective \
+         phrasing — never guess at features the sheet does not state (face shape, \
+         complexion, scars, marks, build).\n\
+         - Describe only what is listed — never remark on what is absent or unstated \
+         (never write \"no visible scars\", \"clean-shaven\", or \"wears no hat\"). Never \
+         describe their expression.\n\
+         - SECOND PARAGRAPH — how they come across in person, drawn ONLY from the \
+         attributes and skills: their mind, their social presence, and how they move and \
+         carry themselves. Give each of those a sentence or two whenever the sheet speaks \
+         to it.\n\
+         {calibration}\
+         - Never mention that this is a game, a character, or a sheet.\n\
          - Write in third person, present tense. Use their name.\n\
-         - Output ONLY the description: exactly TWO compact paragraphs separated by one blank \
-         line, each at most about 80 words. No headings, no lists, no preamble.\n"
-    } else {
-        "- Describe the impression their face and presence give. Invent no specific facial \
-         features; keep physical details to what the stats imply.\n\
-         - Use the stat sheet, but never quote numbers or stat names. Only extremes deserve \
-         expression; say nothing about middling values.\n\
-         - Write in third person, present tense. Use their name.\n\
-         - Output ONLY the description: exactly ONE compact paragraph, at most about 100 words. \
+         - Output ONLY the description: exactly TWO paragraphs separated by one blank \
+         line — the FIRST at most about 80 words, the SECOND at most about 120 words. \
          No headings, no lists, no preamble.\n"
-    };
+    );
     format!(
         "{opening}\n\n\
          Rules:\n\
          {rules}\n\
-         Stat sheet:\n{stats}",
+         Character sheet:\n{stats}",
         stats = stats_block(stats)
     )
 }
 
-/// The OpenAI-compatible message list for one persona generation. With an
-/// image, the user content is the multimodal parts array (text + `image_url`
-/// data URI) that koboldcpp/llama.cpp/OpenAI-compat vision servers accept.
-fn persona_messages(prompt: &str, image: Option<(&str, &str)>) -> Vec<Value> {
-    let content = match image {
-        Some((mime, base64)) => json!([
-            { "type": "text", "text": prompt },
-            { "type": "image_url",
-              "image_url": { "url": format!("data:{mime};base64,{base64}") } },
-        ]),
-        None => json!(prompt),
-    };
-    vec![json!({ "role": "user", "content": content })]
+/// The OpenAI-compatible message list for one persona generation.
+fn persona_messages(prompt: &str) -> Vec<Value> {
+    vec![json!({ "role": "user", "content": prompt })]
 }
 
 // ---------------------------------------------------------------------------
 // LLM transport
 // ---------------------------------------------------------------------------
-
-/// Minimal OpenAI-compatible chat completion against an EXPLICIT endpoint,
-/// with optional bearer auth + model override — used for the separate
-/// `persona.vision_endpoint`. (The main-endpoint attempts reuse
-/// [`crate::llm::chat_completion_capturing_sampled`].) Kept here so the
-/// persona feature never touches `llm.rs`.
-async fn openai_chat_completion(
-    endpoint: &str,
-    api_key: &str,
-    model: &str,
-    messages: &[Value],
-    max_tokens: i64,
-) -> Result<String, String> {
-    let endpoint = endpoint.trim_end_matches('/');
-    let client = reqwest::Client::new();
-
-    // Explicit model wins; else probe /v1/models like the main client does.
-    let model = if model.trim().is_empty() {
-        let mut probe = client.get(format!("{endpoint}/v1/models"));
-        if !api_key.is_empty() {
-            probe = probe.bearer_auth(api_key);
-        }
-        match probe.send().await {
-            Ok(response) if response.status().is_success() => response
-                .json::<Value>()
-                .await
-                .ok()
-                .and_then(|body| {
-                    body.get("data")?
-                        .as_array()?
-                        .first()?
-                        .get("id")?
-                        .as_str()
-                        .map(str::to_string)
-                }),
-            _ => None,
-        }
-    } else {
-        Some(model.trim().to_string())
-    };
-
-    let mut body = json!({
-        "messages": messages,
-        "stream": false,
-        "max_tokens": max_tokens,
-    });
-    if let Some(model) = model {
-        body["model"] = json!(model);
-    }
-
-    let mut request = client
-        .post(format!("{endpoint}/v1/chat/completions"))
-        .json(&body);
-    if !api_key.is_empty() {
-        request = request.bearer_auth(api_key);
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|error| format!("vision endpoint request failed: {error}"))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(format!("vision endpoint returned {status}: {text}"));
-    }
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("vision endpoint decode failed: {error}"))?;
-    let content = body
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if content.is_empty() {
-        return Err("vision endpoint returned an empty completion".to_string());
-    }
-    Ok(content)
-}
 
 /// One attempt against the MAIN local LLM endpoint (the same client NPC turns
 /// use), honoring the saved sampling with a persona max_tokens override.
@@ -522,18 +580,13 @@ async fn main_llm_completion(
 // Generation
 // ---------------------------------------------------------------------------
 
-/// Runs one persona generation from the STORED capture (capture.json +
-/// capture image) and writes `persona.json`. Attempt order:
+/// Runs one persona generation from the STORED capture (capture.json) and
+/// writes `persona.json`: one text prompt against the main LLM endpoint, the
+/// character sheet (appearance facts + stats) as the only source.
 ///
-///   1. image + separate `persona.vision_endpoint` (when configured),
-///   2. image + the main LLM endpoint (multimodal content parts — works when
-///      the loaded model has a projector; llama.cpp without one rejects the
-///      request, which cleanly falls through),
-///   3. stats-only text prompt on the main LLM endpoint (always available).
-///
-/// On total failure the previous good `persona.json` description is KEPT and
-/// only the error fields are refreshed, so a transient LLM outage never
-/// destroys a working persona.
+/// On failure the previous good `persona.json` description is KEPT and only
+/// the error fields are refreshed, so a transient LLM outage never destroys a
+/// working persona.
 pub(crate) async fn generate_from_stored_capture(state: &AppState) -> WebResult<Value> {
     let dir = persona_dir(state);
     let capture = read_json(&capture_path(&dir)).ok_or_else(|| {
@@ -545,99 +598,31 @@ pub(crate) async fn generate_from_stored_capture(state: &AppState) -> WebResult<
     let settings = AppSettings::load(&state.config.settings_path).persona;
     let stats = stats_of(&capture);
 
-    // The stored screenshot, as (mime, base64), when present + decodeable.
-    let image = stored_image(&dir).and_then(|(path, mime)| {
-        fs::read(&path)
-            .ok()
-            .map(|bytes| (mime, STANDARD.encode(bytes)))
-    });
-
-    let mut note = String::new();
-    let mut source = "stats_only";
+    let note;
     let mut description: Option<String> = None;
-    // The exact prompt text of the attempt that PRODUCED the description
-    // (persisted with the record so the Persona page can show precisely what
-    // the LLM was asked; the screenshot rides along as an image part when
-    // source == "vision").
+    // The exact prompt text that PRODUCED the description (persisted with the
+    // record so the Persona page can show precisely what the LLM was asked).
     let mut used_prompt: Option<String> = None;
 
     if !settings.enabled {
         note = "persona generation is disabled in settings".to_string();
     } else {
-        // 1. Separate vision endpoint (explicitly vision-capable).
-        if let Some((mime, base64)) = image.as_ref() {
-            let prompt = persona_prompt(&stats, true);
-            let messages = persona_messages(&prompt, Some((mime, base64)));
-            let vision_endpoint = settings.vision_endpoint.trim();
-            if !vision_endpoint.is_empty() {
-                match openai_chat_completion(
-                    vision_endpoint,
-                    settings.vision_api_key.trim(),
-                    settings.vision_model.trim(),
-                    &messages,
-                    PERSONA_MAX_TOKENS,
-                )
-                .await
-                {
-                    Ok(text) => {
-                        description = Some(text);
-                        source = "vision";
-                        used_prompt = Some(prompt.clone());
-                        note = "generated from the screenshot via the separate vision endpoint"
-                            .to_string();
-                    }
-                    Err(error) => {
-                        note = format!("separate vision endpoint failed ({error}); ");
-                        tracing::info!(target: "chasm::persona", %error, "vision endpoint failed");
-                    }
-                }
+        let prompt = persona_prompt(&stats);
+        match main_llm_completion(state, &persona_messages(&prompt)).await {
+            Ok(text) => {
+                description = Some(text);
+                used_prompt = Some(prompt);
+                note = "generated from the character-data snapshot".to_string();
             }
-            // 2. Main endpoint with the image.
-            if description.is_none() {
-                match main_llm_completion(state, &messages).await {
-                    Ok(text) => {
-                        description = Some(text);
-                        source = "vision";
-                        used_prompt = Some(prompt.clone());
-                        note.push_str("generated from the screenshot via the main LLM endpoint");
-                    }
-                    Err(error) => {
-                        note.push_str(&format!(
-                            "main LLM did not accept the image ({error}); "
-                        ));
-                        tracing::info!(target: "chasm::persona", %error, "main-LLM vision failed");
-                    }
-                }
-            }
-        }
-        // 3. Stats-only fallback (also the no-image path).
-        if description.is_none() {
-            let prompt = persona_prompt(&stats, false);
-            let messages = persona_messages(&prompt, None);
-            match main_llm_completion(state, &messages).await {
-                Ok(text) => {
-                    description = Some(text);
-                    source = "stats_only";
-                    used_prompt = Some(prompt);
-                    note.push_str("generated from the stats snapshot (no vision model available)");
-                }
-                Err(error) => {
-                    note.push_str(&format!("stats-only generation failed ({error})"));
-                    tracing::warn!(target: "chasm::persona", %error, "persona generation failed");
-                }
+            Err(error) => {
+                note = format!("generation failed ({error})");
+                tracing::warn!(target: "chasm::persona", %error, "persona generation failed");
             }
         }
     }
 
     let now = chrono_now_iso();
     let previous = read_json(&persona_path(&dir)).unwrap_or_else(|| json!({}));
-    let image_file = stored_image(&dir)
-        .map(|(path, _)| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
     let captured_at = capture
         .get("captured_at")
         .and_then(Value::as_str)
@@ -652,13 +637,11 @@ pub(crate) async fn generate_from_stored_capture(state: &AppState) -> WebResult<
                 "description": capped,
                 "generated_at": now,
                 "captured_at": captured_at,
-                "source": source,
+                "source": "game_data",
                 "model_note": note,
-                "image_file": image_file,
                 "stats": stats,
-                // The exact prompt text sent to the LLM for this description
-                // (the screenshot is attached as an image part when source is
-                // "vision" — see persona_messages). Shown on the Persona page.
+                // The exact prompt text sent to the LLM for this description.
+                // Shown on the Persona page.
                 "prompt": used_prompt.unwrap_or_default(),
             })
         }
@@ -678,16 +661,25 @@ pub(crate) async fn generate_from_stored_capture(state: &AppState) -> WebResult<
     Ok(persona)
 }
 
-/// Spawns [`generate_from_stored_capture`] on a background task unless one is
-/// already running. Returns whether a task was started. NPC turn generation is
-/// never awaited on this — the whole point.
+/// Spawns [`generate_from_stored_capture`] on a background task. If one is
+/// already running, requests a re-run instead (the running task regenerates
+/// from the freshly stored capture right after the current pass) — so a save
+/// landing mid-generation is never lost. Returns whether a NEW task was
+/// started. NPC turn generation is never awaited on this — the whole point.
 pub(crate) fn spawn_generation(state: Arc<AppState>) -> bool {
     if GENERATING.swap(true, Ordering::SeqCst) {
-        return false; // one at a time; the next capture re-triggers
+        RERUN_REQUESTED.store(true, Ordering::SeqCst);
+        return false; // the in-flight task re-runs for us
     }
     tokio::spawn(async move {
-        if let Err(error) = generate_from_stored_capture(&state).await {
-            tracing::warn!(target: "chasm::persona", error = %format!("{error:?}"), "persona generation task failed");
+        loop {
+            if let Err(error) = generate_from_stored_capture(&state).await {
+                tracing::warn!(target: "chasm::persona", error = %format!("{error:?}"), "persona generation task failed");
+            }
+            if !RERUN_REQUESTED.swap(false, Ordering::SeqCst) {
+                break;
+            }
+            tracing::info!(target: "chasm::persona", "re-running persona generation for a capture that arrived mid-generation");
         }
         GENERATING.store(false, Ordering::SeqCst);
     });
@@ -723,12 +715,14 @@ pub(crate) fn chrono_now_iso() -> String {
 // ---------------------------------------------------------------------------
 
 /// `POST /api/game/v1/persona` — the mod's capture upload (frozen contract in
-/// `mod-source/docs/persona.md`). Stores the stats snapshot + screenshot under
-/// the active profile's persona dir and queues an async generation. Returns
-/// immediately; never blocks on the LLM.
+/// `mod-source/docs/persona.md`): a pure game-data snapshot (stats +
+/// appearance). Stores it under the active profile's persona dir and queues an
+/// async generation. Returns immediately; never blocks on the LLM.
 ///
 /// Response: `{ "status": "stored", "generation": "queued" | "busy" |
-/// "unchanged" | "disabled", "image": "stored" | "none" | "rejected: …" }`.
+/// "unchanged" | "disabled" }`. `busy` still regenerates: the in-flight
+/// generation re-runs from this capture as soon as it finishes (see
+/// [`spawn_generation`]).
 pub async fn receive_capture(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
@@ -739,49 +733,15 @@ pub async fn receive_capture(
 
     let dir = persona_dir(&state);
     fs::create_dir_all(&dir).map_err(WebError::from)?;
+    remove_stale_images(&dir);
 
-    // --- Screenshot (optional): decode, bound, store; degrade gracefully. ---
-    let mut image_status = "none".to_string();
-    let image_b64 = body
-        .get("image_base64")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|data| !data.is_empty());
-    if let Some(data) = image_b64 {
-        match STANDARD.decode(data) {
-            Ok(bytes) if bytes.len() <= MAX_IMAGE_BYTES && !bytes.is_empty() => {
-                let format = body
-                    .get("image_format")
-                    .and_then(Value::as_str)
-                    .unwrap_or("jpeg");
-                let path = image_path(&dir, format);
-                match fs::write(&path, &bytes) {
-                    Ok(()) => {
-                        // Drop the other-format leftover so stored_image() is unambiguous.
-                        let other = if path.ends_with("capture.jpg") {
-                            dir.join("capture.png")
-                        } else {
-                            dir.join("capture.jpg")
-                        };
-                        let _ = fs::remove_file(other);
-                        image_status = "stored".to_string();
-                    }
-                    Err(error) => image_status = format!("rejected: write failed ({error})"),
-                }
-            }
-            Ok(bytes) => {
-                image_status = format!("rejected: {} bytes exceeds limit", bytes.len());
-            }
-            Err(error) => image_status = format!("rejected: base64 decode failed ({error})"),
-        }
-    }
-
-    // --- Stats snapshot: everything except the image bytes. -----------------
     let mut capture = body.clone();
     if let Some(map) = capture.as_object_mut() {
+        // Tolerate uploads from an outdated plugin: the screenshot feature is
+        // retired, so any image payload is simply dropped, never stored.
         map.remove("image_base64");
+        map.remove("image_format");
         map.insert("received_at".to_string(), json!(chrono_now_iso()));
-        map.insert("image".to_string(), json!(image_status.clone()));
     }
     write_json_atomic(&capture_path(&dir), &capture).map_err(WebError::from)?;
 
@@ -800,12 +760,10 @@ pub async fn receive_capture(
     let generation = if !settings.enabled {
         "disabled"
     } else if !is_save_trigger(&capture) && is_unchanged(&dir, &capture) {
-        // Same stats as the stored persona and a description already exists:
-        // skip the LLM. Save-driven captures (the mod's whole trigger model,
-        // see docs/persona.md) always regenerate — the player saved, the
-        // screenshot is fresh, and they expect a fresh description even with
-        // identical stats. The unchanged short-circuit only remains for
-        // non-save uploads. The fresh image was still stored above either way.
+        // Same snapshot as the stored persona and a description already
+        // exists: skip the LLM. Save-driven captures (the mod's whole trigger
+        // model, see docs/persona.md) always regenerate. The unchanged
+        // short-circuit only remains for non-save uploads.
         "unchanged"
     } else if spawn_generation(state.clone()) {
         "queued"
@@ -816,7 +774,6 @@ pub async fn receive_capture(
     Ok(Json(json!({
         "status": "stored",
         "generation": generation,
-        "image": image_status,
     })))
 }
 
@@ -862,41 +819,135 @@ mod tests {
             "race": "Caucasian Old",
             "hair_color": "#D6B569",
             "hair_style": "Wavy",
+            "hair_length": "0.80",
             "eye_color": "Blue",
+            "facial_hair": "Chin Curtain",
             "trigger": "quicksave",
         })
     }
 
     #[test]
-    fn prompt_variants_carry_rules_and_stats() {
+    fn prompt_carries_appearance_facts_and_stats() {
         let stats = stats_of(&capture_body("Courier"));
-        let vision = persona_prompt(&stats, true);
-        assert!(vision.contains("close-up photo of a person's face"));
-        assert!(vision.contains("Never mention that this is a photo, screenshot, render, or game"));
+        let prompt = persona_prompt(&stats);
+        assert!(prompt.contains("Write a sketch of Courier"));
+        assert!(!prompt.contains("photo"), "the vision path is retired");
+        // Appearance facts render as natural language, never raw game data.
+        assert!(prompt.contains("Appearance (authoritative character data):"));
+        assert!(prompt.contains("- Sex: male"));
+        assert!(prompt.contains("- Age: older, well past middle age"), "race variant drives age");
+        assert!(prompt.contains("- Ethnicity: white"), "Caucasian maps to a plain word");
+        assert!(prompt.contains("- Hair: blonde, styled in a wavy, worn long"));
+        assert!(!prompt.contains("#D6B569"), "hex colors are mapped, never shown");
+        assert!(prompt.contains("- Eyes: blue"));
+        assert!(prompt.contains("- Facial hair: chin curtain"));
+        assert!(prompt.contains("- Wearing: Leather Armor, Goggles"));
         // Natural-language stats: full attribute names + explicit scale +
         // qualitative band + meaning hint, never bare abbreviations.
-        assert!(vision.contains("Strength 9 of 10 — exceptional (raw physical power and muscle)"));
-        assert!(vision.contains("Charisma 1 of 10 — abysmal (charm and social grace)"));
-        assert!(vision.contains("Intelligence 3 of 10 — very low (reasoning and wits)"));
-        assert!(!vision.contains("STR 9,"), "no raw abbreviations in the rendered attributes");
-        assert!(vision.contains("Wearing (game data): Leather Armor, Goggles"), "outfit drives the clothing sentence");
-        assert!(vision.contains("any headwear"));
-        assert!(!vision.contains("Appearance facts"), "looks must come from the photo alone");
-        assert!(!vision.contains("#D6B569"), "no character-data colors in the prompt");
-        assert!(!vision.contains("Eyes: Blue"), "no character-data eye color in the prompt");
-        assert!(!vision.contains("Perks:"), "perks must stay out of the prompt");
-        assert!(vision.contains("FIRST PARAGRAPH"));
-        assert!(vision.contains("SECOND PARAGRAPH"));
-        assert!(vision.contains("exactly TWO compact paragraphs"));
-        // Exactly one paragraph, ~100 words — the 180-word allowance is gone.
-        assert!(!vision.contains("180 words"));
-
-        let stats_only = persona_prompt(&stats, false);
-        assert!(stats_only.contains("the face and presence of Courier"));
-        assert!(!stats_only.contains("photo"));
-        assert!(stats_only.contains("Skills, each rated 0 to 100: Barter 15, Guns 45, Speech 4, Unarmed 80"));
+        assert!(prompt.contains("Strength 9 of 10 — exceptional (raw physical power and muscle)"));
+        assert!(prompt.contains("Charisma 1 of 10 — abysmal (charm and social grace)"));
+        assert!(!prompt.contains("STR 9,"), "no raw abbreviations in the rendered attributes");
+        assert!(prompt.contains(
+            "Skills, each rated 0 to 100 — untrained people sit around 10 to 30, 85 or more \
+             is true mastery: Barter 15, Guns 45, Speech 4, Unarmed 80"
+        ));
         // Only genuine extremes are called out (Barter 15 is ordinary early-game).
-        assert!(stats_only.contains("Notable skills: Speech 4 of 100 (dreadful); Unarmed 80 of 100 (highly skilled)"));
+        assert!(prompt.contains("Notable skills: Speech 4 of 100 (dreadful); Unarmed 80 of 100 (highly skilled)"));
+        assert!(!prompt.contains("Perks:"), "perks must stay out of the prompt");
+        assert!(prompt.contains("FIRST PARAGRAPH"));
+        assert!(prompt.contains("SECOND PARAGRAPH"));
+        assert!(prompt.contains("exactly TWO paragraphs"));
+    }
+
+    #[test]
+    fn prompt_calibration_is_honest_and_stat_agnostic() {
+        let stats = stats_of(&capture_body("Courier"));
+        let prompt = persona_prompt(&stats);
+        // The honesty rule is present with its full weight...
+        assert!(prompt.contains("crippling deficiency"));
+        assert!(prompt.contains("do not soften it"));
+        assert!(prompt.contains("genuine mastery"));
+        // ...the old euphemism-teaching examples are gone...
+        assert!(!prompt.contains("halting and wordless"));
+        assert!(!prompt.contains("rock-bottom Speech"));
+        // ...and the RULES never special-case a skill (skill names may only
+        // appear as sheet data, i.e. after the character sheet starts).
+        let rules_end = prompt.find("Character sheet:").unwrap();
+        let rules = &prompt[..rules_end];
+        for skill in ["Unarmed", "Speech", "Guns", "Barter"] {
+            assert!(!rules.contains(skill), "rules must not name {skill}");
+        }
+    }
+
+    #[test]
+    fn hair_color_hex_maps_to_plain_words() {
+        assert_eq!(hair_color_name("#000000"), Some("black"));
+        assert_eq!(hair_color_name("#54462E"), Some("dark brown"));
+        assert_eq!(hair_color_name("#8A6E4B"), Some("brown"));
+        assert_eq!(hair_color_name("#D6B569"), Some("blonde"));
+        assert_eq!(hair_color_name("#F2E6C9"), Some("platinum blonde"));
+        assert_eq!(hair_color_name("#8B2E16"), Some("red"));
+        assert_eq!(hair_color_name("#AAAAAA"), Some("gray"));
+        assert_eq!(hair_color_name("#F4F4F4"), Some("white"));
+        assert_eq!(hair_color_name("not-a-color"), None);
+        assert_eq!(hair_color_name(""), None);
+    }
+
+    #[test]
+    fn race_maps_to_age_and_ethnicity() {
+        // Plain adult races claim nothing — age_years speaks instead.
+        assert_eq!(race_age_marker("Caucasian"), None);
+        assert_eq!(race_age_marker("Caucasian Old"), Some("older, well past middle age"));
+        assert_eq!(race_age_marker("Hispanic Old Aged"), Some("older, well past middle age"));
+        assert_eq!(race_age_marker("Asian Middle Aged"), Some("middle-aged"));
+        assert_eq!(race_age_marker("African American Child"), Some("a child"));
+        assert_eq!(race_ethnicity("Caucasian Old"), "white");
+        assert_eq!(race_ethnicity("African American"), "Black");
+        assert_eq!(race_ethnicity("Hispanic Old Aged"), "Hispanic");
+        assert_eq!(race_ethnicity("Asian"), "Asian");
+        // Unknown/mod races pass through minus the age tokens.
+        assert_eq!(race_ethnicity("Ghoul Old"), "Ghoul");
+    }
+
+    #[test]
+    fn appearance_lines_skip_absent_facts_and_length_middles() {
+        // Minimal capture: nothing appearance-ish → no lines at all.
+        let empty = appearance_lines(&json!({}));
+        assert!(empty.is_empty());
+        // Facial hair and hair length only appear when meaningful.
+        let stats = json!({
+            "sex": "female",
+            "race": "Hispanic",
+            "age_years": "23",
+            "hair_color": "#101010",
+            "hair_style": "Bob",
+            "hair_length": "0.50",
+            "eye_color": "Green",
+        });
+        let lines = appearance_lines(&stats).join("\n");
+        assert!(lines.contains("- Sex: female"));
+        assert!(lines.contains("- Age: about 23 years old"), "FaceGen years drive the age");
+        assert!(lines.contains("- Ethnicity: Hispanic"));
+        assert!(lines.contains("- Hair: black, styled in a bob"));
+        assert!(!lines.contains("worn long"), "middling hair length says nothing");
+        assert!(!lines.contains("kept short"));
+        assert!(lines.contains("- Eyes: green"));
+        assert!(!lines.contains("Facial hair"), "absent facts are never mentioned");
+    }
+
+    #[test]
+    fn age_line_priority_marker_then_years_then_silence() {
+        // Race marker wins even when years are present (aged races look aged).
+        let both = appearance_lines(&json!({ "race": "Caucasian Old", "age_years": "30" })).join("\n");
+        assert!(both.contains("- Age: older, well past middle age"));
+        assert!(!both.contains("about 30 years old"));
+        // Plain race + years → years.
+        let years = appearance_lines(&json!({ "race": "Caucasian", "age_years": "44" })).join("\n");
+        assert!(years.contains("- Age: about 44 years old"));
+        // Plain race, no years → NO age claim at all.
+        let silent = appearance_lines(&json!({ "race": "Caucasian" })).join("\n");
+        assert!(!silent.contains("- Age:"), "no data, no claim: {silent}");
+        assert!(silent.contains("- Ethnicity: white"));
     }
 
     #[test]
@@ -921,7 +972,11 @@ mod tests {
     #[test]
     fn skills_rendering_calls_out_extremes_only() {
         let lines = skills_lines("Guns 45, Speech 4, Sneak 30, Unarmed 90");
-        assert_eq!(lines[0], "Skills, each rated 0 to 100: Guns 45, Speech 4, Sneak 30, Unarmed 90");
+        assert_eq!(
+            lines[0],
+            "Skills, each rated 0 to 100 — untrained people sit around 10 to 30, 85 or more \
+             is true mastery: Guns 45, Speech 4, Sneak 30, Unarmed 90"
+        );
         assert_eq!(
             lines[1],
             "Notable skills: Speech 4 of 100 (dreadful); Unarmed 90 of 100 (masterful)"
@@ -944,19 +999,11 @@ mod tests {
     }
 
     #[test]
-    fn messages_embed_image_as_data_uri_parts() {
-        let with_image = persona_messages("describe", Some(("image/jpeg", "QUJD")));
-        let content = &with_image[0]["content"];
-        assert!(content.is_array());
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[1]["type"], "image_url");
-        assert_eq!(
-            content[1]["image_url"]["url"],
-            "data:image/jpeg;base64,QUJD"
-        );
-
-        let text_only = persona_messages("describe", None);
-        assert_eq!(text_only[0]["content"], "describe");
+    fn messages_are_a_single_text_user_turn() {
+        let messages = persona_messages("describe");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "describe");
     }
 
     #[test]
