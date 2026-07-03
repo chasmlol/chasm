@@ -142,6 +142,20 @@ impl Retriever {
         &self.inner.model_id
     }
 
+    /// Returns the text to embed for a retrieval QUERY. BGE models are trained
+    /// asymmetric: passages embed as-is, but short queries should carry the
+    /// instruction prefix below — without it, query embeddings live in
+    /// "passage space" and match same-shaped sentences (a past question that
+    /// merely resembles the query) over the passages that ANSWER it. Only BGE
+    /// English v1.5 models use this prefix; other models embed queries raw.
+    pub fn query_text(&self, query: &str) -> String {
+        if self.inner.model_id.starts_with("BGE") {
+            format!("Represent this sentence for searching relevant passages: {query}")
+        } else {
+            query.to_string()
+        }
+    }
+
     /// Embeds a single string.
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let mut out = self.embed_batch(&[text])?;
@@ -184,8 +198,12 @@ impl Retriever {
                     .lock()
                     .map_err(|_| anyhow::anyhow!("reranker mutex poisoned"))?;
                 let docs: Vec<&str> = candidates.to_vec();
+                // Explicit large batch: the default (None) reranks in small
+                // internal batches, serializing ~40 cross-encoder passes per
+                // subsystem (~5-6ms each = 200-270ms/turn measured). One big
+                // batch amortizes the launch overhead. Identical scores.
                 let results = reranker
-                    .rerank(query, docs, false, None)
+                    .rerank(query, docs, false, Some(64))
                     .context("rerank failed")?;
                 // `rerank` returns results sorted by score; realign to input order.
                 let mut scores = vec![0.0f32; candidates.len()];
@@ -397,19 +415,22 @@ pub fn embed_cache_dir() -> PathBuf {
 /// reusing the same fastembed loaders the retriever uses. Constructing the model
 /// triggers the hf-hub download into [`embed_cache_dir`]; we drop it immediately.
 ///
-/// The ids mirror `chasm_core::RETRIEVAL_MODELS`. Downloads always fetch
-/// the CPU/quantized variant where the tier has one, matching the default
-/// (CPU-only) build's runtime selection. Returns an error for unknown ids or on
-/// download/load failure.
+/// The ids mirror `chasm_core::RETRIEVAL_MODELS`. Small/base embedders fetch
+/// BOTH the INT8 (CPU-build) and full-precision (CUDA-build) variants, so the
+/// same download works whichever build/device loads at runtime — the CUDA
+/// build resolving full-precision weights that were never downloaded was
+/// exactly the "installed but keyword-only" trap. Returns an error for unknown
+/// ids or on download/load failure.
 pub fn download_model(id: &str) -> Result<()> {
     let cache_dir = cache_dir();
     fs::create_dir_all(&cache_dir).ok();
 
     match id {
-        // Embedders. Use the same per-device pick the retriever resolves to on a
-        // CPU build so the cached weights match what gets loaded at runtime.
-        "bge-small" => force_embedder(EmbeddingModel::BGESmallENV15Q, &cache_dir),
-        "bge-base" => force_embedder(EmbeddingModel::BGEBaseENV15Q, &cache_dir),
+        // Embedders: both device variants (a few hundred MB total, one-time).
+        "bge-small" => force_embedder(EmbeddingModel::BGESmallENV15Q, &cache_dir)
+            .and_then(|()| force_embedder(EmbeddingModel::BGESmallENV15, &cache_dir)),
+        "bge-base" => force_embedder(EmbeddingModel::BGEBaseENV15Q, &cache_dir)
+            .and_then(|()| force_embedder(EmbeddingModel::BGEBaseENV15, &cache_dir)),
         "bge-large" => force_embedder(EmbeddingModel::BGELargeENV15, &cache_dir),
         // Rerankers.
         "jina-turbo" => force_reranker(RerankerModel::JINARerankerV1TurboEn, &cache_dir),
@@ -451,6 +472,34 @@ pub fn models_present(cfg: &RetrieverConfig) -> bool {
     }
 
     true
+}
+
+/// Whether ALL weight variants [`download_model`] fetches for a registry `id`
+/// are already on disk. The download skip-check and the settings-UI status must
+/// use THIS (not a single hardcoded dir): the CPU and CUDA builds load
+/// different variants, and "one variant present" previously read as
+/// "downloaded" while the runtime resolved the missing one and silently fell
+/// back to keyword-only retrieval.
+pub fn model_downloaded(id: &str) -> bool {
+    let cache = cache_dir();
+    let embed_codes = |models: &[EmbeddingModel]| -> Vec<String> {
+        models
+            .iter()
+            .filter_map(|m| TextEmbedding::get_model_info(m).ok().map(|i| i.model_code.clone()))
+            .collect()
+    };
+    let codes: Vec<String> = match id {
+        "bge-small" => embed_codes(&[EmbeddingModel::BGESmallENV15Q, EmbeddingModel::BGESmallENV15]),
+        "bge-base" => embed_codes(&[EmbeddingModel::BGEBaseENV15Q, EmbeddingModel::BGEBaseENV15]),
+        "bge-large" => embed_codes(&[EmbeddingModel::BGELargeENV15]),
+        "jina-turbo" => vec![TextRerank::get_model_info(&RerankerModel::JINARerankerV1TurboEn).model_code.clone()],
+        "bge-reranker-v2-m3" => vec![TextRerank::get_model_info(&RerankerModel::BGERerankerV2M3).model_code.clone()],
+        _ => return false,
+    };
+    !codes.is_empty()
+        && codes
+            .iter()
+            .all(|code| cache.join(model_code_to_cache_dir(code)).is_dir())
 }
 
 /// Maps a fastembed `model_code` (`<org>/<repo>`) to the `models--<org>--<repo>`
@@ -549,22 +598,40 @@ pub fn search_with_query_vec(
         return Ok(Vec::new());
     }
 
-    // Stage 1: cosine recall.
+    // Stage 1: cosine recall. Candidates whose text IS the query (the current
+    // player message flows into the chat-memory pool) are excluded — the turn
+    // text is already in the prompt, so re-injecting it wastes a top_k slot.
+    let query_trimmed = query.trim();
     let query_vec = query_vec.to_vec();
     let mut scored: Vec<(usize, f32)> = candidates
         .iter()
         .enumerate()
+        .filter(|(_, (_, _, text))| text.trim() != query_trimmed)
         .map(|(i, (_, vec, _))| (i, cosine_similarity(&query_vec, vec)))
         .collect();
     scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    // Chat history repeats verbatim lines across sessions; keep only the
+    // best-scoring instance of each distinct text so top_n (and ultimately
+    // top_k) hold distinct information instead of copies.
+    let mut seen = std::collections::HashSet::new();
+    scored.retain(|(i, _)| seen.insert(candidates[*i].2.trim()));
     scored.truncate(top_n);
 
-    // Stage 2: rerank the recalled candidates by text.
-    let texts: Vec<&str> = scored
-        .iter()
-        .map(|(i, _)| candidates[*i].2.as_str())
-        .collect();
-    let rerank_scores = retriever.rerank(query, &texts)?;
+    // Stage 2: rerank the recalled candidates by text — ONLY when a real
+    // cross-encoder exists. Without one, stage 1's cosine scores ARE the
+    // final scores: the old fallback re-embedded the query + all top_n
+    // candidate texts through raw ONNX (bypassing every cache) just to
+    // recompute cosines identical to the vectors already in hand — measured
+    // at 230-350ms/turn of pure waste.
+    let rerank_scores: Vec<f32> = if retriever.has_reranker() {
+        let texts: Vec<&str> = scored
+            .iter()
+            .map(|(i, _)| candidates[*i].2.as_str())
+            .collect();
+        retriever.rerank(query, &texts)?
+    } else {
+        scored.iter().map(|(_, score)| *score).collect()
+    };
 
     // Normalize to a 0..1 relevance so `min_score` is a meaningful knob — but the
     // mapping DEPENDS on which scorer ran:
@@ -572,17 +639,20 @@ pub fn search_with_query_vec(
     //     irrelevant, positive for relevant) -> sigmoid gives clean 0..1
     //     separation (irrelevant ~0.0, relevant ~0.8+).
     //   * Cosine fallback (reranker disabled): scores are ALREADY cosine
-    //     similarities (~0.4..0.8 for BGE, which has a high baseline). Sigmoiding
-    //     those compresses the whole useful range into ~0.60..0.69, so `min_score`
-    //     can no longer separate relevant from irrelevant and every book dumps its
-    //     full top-K. So pass cosine through (clamped to >= 0) instead.
+    //     similarities, and BGE cosines have a high baseline — measured on real
+    //     game data (prefixed queries): unrelated text sits ~0.30-0.50 while
+    //     genuinely relevant passages sit ~0.55-0.80. Passing that through raw
+    //     made min_score=0.2 a no-op (everything kept, every book dumped its
+    //     full top-K). Linearly remap that observed band so 0.35 cosine -> 0.0
+    //     and 0.85 cosine -> 1.0: the default min_score 0.2 then corresponds to
+    //     ~0.45 cosine, which is where junk and signal actually separate.
     // Without this split, the no-reranker path silently over-injects everything.
     let has_reranker = retriever.has_reranker();
     let normalize = |x: f32| {
         if has_reranker {
             1.0 / (1.0 + (-x).exp())
         } else {
-            x.max(0.0)
+            ((x - 0.35) / 0.5).clamp(0.0, 1.0)
         }
     };
     let mut reranked: Vec<(String, f32)> = scored
@@ -663,6 +733,55 @@ impl EmbeddingCache {
         }
         self.remember(&key, &vec);
         Ok(vec.as_ref().clone())
+    }
+
+    /// Batched [`Self::get_or_embed`]: returns one vector per text, resolving
+    /// RAM/disk hits individually and embedding ALL misses in a single model
+    /// call. On GPU this is the difference between one kernel launch and N:
+    /// per-call latency (~50 ms) dominated per-turn retrieval when new chat
+    /// messages were embedded one at a time.
+    pub fn get_or_embed_batch(
+        &self,
+        retriever: &Retriever,
+        texts: &[&str],
+    ) -> Vec<Option<Vec<f32>>> {
+        let mut out: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        let mut miss_indices: Vec<usize> = Vec::new();
+        for (index, text) in texts.iter().enumerate() {
+            let key = cache_key(retriever.model_id(), text);
+            if let Ok(memory) = self.memory.lock() {
+                if let Some(vec) = memory.get(&key) {
+                    out[index] = Some(vec.as_ref().clone());
+                    continue;
+                }
+            }
+            let path = self.dir.join(format!("{key}.json"));
+            if let Ok(bytes) = fs::read(&path) {
+                if let Ok(vec) = serde_json::from_slice::<Vec<f32>>(&bytes) {
+                    let vec = std::sync::Arc::new(vec);
+                    self.remember(&key, &vec);
+                    out[index] = Some(vec.as_ref().clone());
+                    continue;
+                }
+            }
+            miss_indices.push(index);
+        }
+        if !miss_indices.is_empty() {
+            let miss_texts: Vec<&str> = miss_indices.iter().map(|&i| texts[i]).collect();
+            if let Ok(vectors) = retriever.embed_batch(&miss_texts) {
+                for (&index, vector) in miss_indices.iter().zip(vectors) {
+                    let key = cache_key(retriever.model_id(), texts[index]);
+                    let path = self.dir.join(format!("{key}.json"));
+                    if let Ok(json) = serde_json::to_vec(&vector) {
+                        let _ = fs::write(&path, json);
+                    }
+                    let vector = std::sync::Arc::new(vector);
+                    self.remember(&key, &vector);
+                    out[index] = Some(vector.as_ref().clone());
+                }
+            }
+        }
+        out
     }
 
     /// Pre-warms the cache for `texts`, embedding only the misses in batches.

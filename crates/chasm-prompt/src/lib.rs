@@ -119,16 +119,19 @@ fn build_candidates(
     ctx: &RetrievalCtx,
     items: impl IntoIterator<Item = (String, String)>,
 ) -> Vec<(String, Vec<f32>, String)> {
-    items
+    let kept: Vec<(String, String)> = items
         .into_iter()
-        .filter_map(|(id, text)| {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            let vector = ctx.cache.get_or_embed(ctx.retriever, trimmed).ok()?;
-            Some((id, vector, text))
-        })
+        .filter(|(_, text)| !text.trim().is_empty())
+        .collect();
+    let trimmed: Vec<&str> = kept.iter().map(|(_, text)| text.trim()).collect();
+    // One batched call: cache hits resolve individually, ALL misses embed in a
+    // single model invocation (one GPU kernel launch instead of N).
+    let mut probe = PhaseTimer::new();
+    let vectors = ctx.cache.get_or_embed_batch(ctx.retriever, &trimmed);
+    probe.mark(&format!("  candidates:embed_batch n={}", trimmed.len()));
+    kept.into_iter()
+        .zip(vectors)
+        .filter_map(|((id, text), vector)| Some((id, vector?, text)))
         .collect()
 }
 
@@ -146,13 +149,20 @@ fn retrieve_ids(
         return Vec::new();
     }
     // Embed the query THROUGH the cache: its in-process memo means the same
-    // turn text is embedded once, not once per retrieval subsystem.
-    let Ok(query_vec) = ctx.cache.get_or_embed(ctx.retriever, query) else {
+    // turn text is embedded once, not once per retrieval subsystem. The query
+    // embeds with the model's retrieval-query prefix (BGE is asymmetric:
+    // prefixed queries match ANSWERING passages instead of similar-shaped
+    // questions); the prefixed string is the cache key, so it never collides
+    // with the same text embedded as a passage.
+    let mut probe = PhaseTimer::new();
+    let query_text = ctx.retriever.query_text(query);
+    let Ok(query_vec) = ctx.cache.get_or_embed(ctx.retriever, &query_text) else {
         return Vec::new();
     };
+    probe.mark("  retrieve:query_embed");
     // `top_k` bounds the rerank stage; cap the per-source contribution to `limit`.
     let top_k = ctx.top_k.max(limit);
-    match chasm_embed::search_with_query_vec(
+    let result = match chasm_embed::search_with_query_vec(
         ctx.retriever,
         &query_vec,
         query,
@@ -161,12 +171,55 @@ fn retrieve_ids(
         top_k,
         min_score,
     ) {
-        Ok(hits) => hits
-            .into_iter()
-            .take(limit)
-            .map(|(id, _score)| id)
-            .collect(),
+        Ok(hits) => {
+            dump_retrieval(ctx, query, &hits, candidates, limit, min_score);
+            hits.into_iter()
+                .take(limit)
+                .map(|(id, _score)| id)
+                .collect()
+        }
         Err(_) => Vec::new(),
+    };
+    probe.mark("  retrieve:search+rerank");
+    result
+}
+
+/// Env-gated (CHASM_RETRIEVAL_DUMP=1) content dump of what semantic retrieval
+/// actually selected — query, per-hit score, kept/cut line, and a text snippet —
+/// so ranking quality can be inspected offline. Appends to
+/// %TEMP%\chasm-retrieval-dump.log.
+fn dump_retrieval(
+    ctx: &RetrievalCtx,
+    query: &str,
+    hits: &[(String, f32)],
+    candidates: &[(String, Vec<f32>, String)],
+    limit: usize,
+    min_score: f32,
+) {
+    if std::env::var_os("CHASM_RETRIEVAL_DUMP").is_none() {
+        return;
+    }
+    let Some(dir) = std::env::var_os("TEMP") else { return };
+    let path = std::path::Path::new(&dir).join("chasm-retrieval-dump.log");
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    use std::io::Write as _;
+    let reranker = if ctx.retriever.has_reranker() { "on" } else { "off" };
+    let _ = writeln!(
+        f,
+        "== query [reranker {reranker}, cands {} min {min_score}]: {}",
+        candidates.len(),
+        query.replace('\n', " | ")
+    );
+    for (rank, (id, score)) in hits.iter().enumerate() {
+        let text = candidates
+            .iter()
+            .find(|(cid, _, _)| cid == id)
+            .map(|(_, _, t)| t.chars().take(110).collect::<String>().replace('\n', " "))
+            .unwrap_or_default();
+        let kept = if rank < limit { "KEEP" } else { "cut " };
+        let _ = writeln!(f, "  {kept} #{rank} {score:.3} {id}: {text}");
     }
 }
 

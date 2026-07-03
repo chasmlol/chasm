@@ -2287,9 +2287,8 @@ pub(crate) fn retrieval_model_statuses(cache_dir: &std::path::Path) -> HashMap<S
     RETRIEVAL_MODELS
         .iter()
         .map(|model| {
-            let weights = cache_dir.join(model.cache_dir);
             let markers = retrieval_marker_dir(cache_dir, model.id);
-            let status = if weights.is_dir() {
+            let status = if chasm_embed::model_downloaded(model.id) {
                 "downloaded"
             } else if markers.join(".downloading").exists() {
                 "downloading"
@@ -2882,8 +2881,9 @@ pub(crate) fn start_retrieval_download(state: &AppState, id: &str) -> std::io::R
     };
 
     let cache_dir = embed_cache_dir();
-    // Already present (or in flight): nothing to do.
-    if cache_dir.join(model.cache_dir).is_dir() {
+    // Already present (ALL variants the runtime may resolve) or in flight:
+    // nothing to do.
+    if chasm_embed::model_downloaded(model.id) {
         return Ok(true);
     }
     let markers = retrieval_marker_dir(&cache_dir, id);
