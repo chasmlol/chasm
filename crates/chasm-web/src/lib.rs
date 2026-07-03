@@ -3569,9 +3569,14 @@ async fn app_version() -> Json<AppVersionResponse> {
 /// Fetches the latest release from the public chasm repo. Returns `None` on any
 /// network/parse error (the endpoint never fails). GitHub requires a User-Agent.
 async fn fetch_latest_release() -> Option<GithubRelease> {
+    // NOT `/releases/latest`: that endpoint only ever returns a NON-pre-release,
+    // and this project marks every release as a pre-release while pre-1.0 (plus
+    // a rolling `nightly` tag). List releases instead and take the highest
+    // semver-tagged one, skipping non-version tags like `nightly` — the in-app
+    // updater tracks versioned milestones; the nightly is a manual download.
     let client = reqwest::Client::new();
     let resp = client
-        .get("https://api.github.com/repos/chasmlol/chasm/releases/latest")
+        .get("https://api.github.com/repos/chasmlol/chasm/releases?per_page=20")
         .header("User-Agent", "chasm")
         .header("Accept", "application/vnd.github+json")
         .timeout(std::time::Duration::from_secs(10))
@@ -3581,7 +3586,28 @@ async fn fetch_latest_release() -> Option<GithubRelease> {
     if !resp.status().is_success() {
         return None;
     }
-    resp.json::<GithubRelease>().await.ok()
+    let releases = resp.json::<Vec<GithubRelease>>().await.ok()?;
+    releases
+        .into_iter()
+        .filter_map(|release| {
+            let tag = release.tag_name.as_deref()?.trim();
+            let version = parse_semver(tag.trim_start_matches('v'))?;
+            Some((version, release))
+        })
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, release)| release)
+}
+
+/// `"0.3.0"` -> `(0, 3, 0)`; anything non-semver (e.g. `nightly`) -> None.
+fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = s.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
 }
 
 /// `POST /api/app/update/install` — one-click self-update. Downloads the latest
