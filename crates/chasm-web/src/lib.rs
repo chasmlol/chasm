@@ -53,6 +53,7 @@ mod persona;
 mod save_sync;
 mod stack_lifecycle;
 mod stt_api;
+mod stt_vocab;
 mod trace_routes;
 mod tts_api;
 mod ui;
@@ -1350,6 +1351,23 @@ async fn speech_recognize(
         }
         if !prompt.is_empty() {
             form = form.text("prompt", prompt.clone());
+        }
+        // Word boosting: ship the active profile's character + lore names (per
+        // the source toggles) as a `vocab` field so the Parakeet server snaps
+        // near-miss proper nouns to them. Only on this managed-local Parakeet
+        // path; hosted API providers never see it.
+        if settings.stt.boost_vocab {
+            let boost = stt_vocab::summarize(
+                &state,
+                settings.stt.boost_vocab,
+                settings.stt.boost_characters,
+                settings.stt.boost_lore,
+            );
+            if !boost.words.is_empty() {
+                if let Ok(json) = serde_json::to_string(&boost.words) {
+                    form = form.text("vocab", json);
+                }
+            }
         }
         let endpoint = state.config.parakeet_stt_endpoint.clone();
         tracing::debug!("speech recognize: provider=local (Parakeet) endpoint={endpoint}");
@@ -2881,6 +2899,16 @@ pub(crate) fn apply_stt_form(stt: &mut SttSettings, form: &HashMap<String, Strin
     }
     if let Some(value) = form.get("timeout_ms").and_then(|v| v.parse::<u64>().ok()) {
         stt.timeout_ms = chasm_core::normalize_stt_timeout_ms(value);
+    }
+    let as_bool = |v: &str| v == "true" || v == "on" || v == "1";
+    if let Some(value) = form.get("boost_vocab") {
+        stt.boost_vocab = as_bool(value);
+    }
+    if let Some(value) = form.get("boost_characters") {
+        stt.boost_characters = as_bool(value);
+    }
+    if let Some(value) = form.get("boost_lore") {
+        stt.boost_lore = as_bool(value);
     }
 }
 

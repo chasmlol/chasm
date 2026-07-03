@@ -143,8 +143,10 @@ try {
             # huggingface-hub). nano-parakeet pulls a CPU torch by default; we
             # swap it for a verified CUDA build below. torchaudio only for
             # resampling non-16kHz clips; python-multipart for the OpenAI
-            # multipart transcription form.
-            & $script:uv pip install --python $py nano-parakeet torchaudio soundfile numpy fastapi uvicorn python-multipart *>> $log
+            # multipart transcription form; rapidfuzz powers the word-boosting
+            # fuzzy corrector (scripts/stt_vocab_boost.py) — the server degrades
+            # to stdlib difflib if it is ever missing.
+            & $script:uv pip install --python $py nano-parakeet torchaudio soundfile numpy fastapi uvicorn python-multipart rapidfuzz *>> $log
             if ($LASTEXITCODE -ne 0) { throw "pip install nano-parakeet failed (exit $LASTEXITCODE)" }
             # If an NVIDIA GPU is present, swap the CPU torch for a verified CUDA build.
             Install-TorchCuda $py

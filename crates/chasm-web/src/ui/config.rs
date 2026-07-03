@@ -176,6 +176,32 @@ pub(crate) struct SttConfig {
     pub language: String,
     pub prompt: String,
     pub timeout_ms: u64,
+    /// Master switch for word boosting (Parakeet only).
+    #[serde(default = "default_true")]
+    pub boost_vocab: bool,
+    /// Include character-book names in the boost vocabulary.
+    #[serde(default = "default_true")]
+    pub boost_characters: bool,
+    /// Include lorebook entry names + keys in the boost vocabulary.
+    #[serde(default = "default_true")]
+    pub boost_lore: bool,
+    // --- read-only, filled in by get_config/save_config (need profile data) ---
+    /// How many proper nouns are actually being boosted (respects the toggles).
+    #[serde(default)]
+    pub boosted_word_count: usize,
+    /// Distinct character-derived terms available (independent of the toggle).
+    #[serde(default)]
+    pub boosted_character_count: usize,
+    /// Distinct lore-derived terms available (independent of the toggle).
+    #[serde(default)]
+    pub boosted_lore_count: usize,
+    /// A small preview of the boosted words.
+    #[serde(default)]
+    pub boost_sample: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl SttConfig {
@@ -184,6 +210,13 @@ impl SttConfig {
             language: s.language.clone(),
             prompt: s.prompt.clone(),
             timeout_ms: chasm_core::normalize_stt_timeout_ms(s.timeout_ms),
+            boost_vocab: s.boost_vocab,
+            boost_characters: s.boost_characters,
+            boost_lore: s.boost_lore,
+            boosted_word_count: 0,
+            boosted_character_count: 0,
+            boosted_lore_count: 0,
+            boost_sample: Vec::new(),
         }
     }
 
@@ -192,6 +225,9 @@ impl SttConfig {
         form.insert("language".into(), self.language.clone());
         form.insert("prompt".into(), self.prompt.clone());
         form.insert("timeout_ms".into(), self.timeout_ms.to_string());
+        form.insert("boost_vocab".into(), self.boost_vocab.to_string());
+        form.insert("boost_characters".into(), self.boost_characters.to_string());
+        form.insert("boost_lore".into(), self.boost_lore.to_string());
         form
     }
 }
@@ -339,12 +375,33 @@ impl UiConfig {
 
 /// `GET /api/ui/v1/config/:domain` — the per-engine config for one AI domain,
 /// read (normalized) from the same `AppSettings` the runtime reads.
+/// Fills the read-only boost counts + preview on an STT config. Needs the
+/// profile's characters/lore, so it runs where we have `state` (not in
+/// `from_settings`). The vocabulary is gathered live, so the numbers always
+/// track the current Characters and Lore books.
+fn fill_stt_boost(state: &AppState, stt: &mut SttConfig) {
+    let boost = crate::stt_vocab::summarize(
+        state,
+        stt.boost_vocab,
+        stt.boost_characters,
+        stt.boost_lore,
+    );
+    stt.boosted_word_count = boost.words.len();
+    stt.boosted_character_count = boost.available_characters;
+    stt.boosted_lore_count = boost.available_lore;
+    stt.boost_sample = boost.sample;
+}
+
 pub(crate) async fn get_config(
     State(state): State<Arc<AppState>>,
     Path(domain): Path<String>,
 ) -> Json<UiConfig> {
     let settings = AppSettings::load(&state.config.settings_path);
-    Json(UiConfig::build(&settings, &domain))
+    let mut config = UiConfig::build(&settings, &domain);
+    if let Some(stt) = config.stt.as_mut() {
+        fill_stt_boost(&state, stt);
+    }
+    Json(config)
 }
 
 /// `POST /api/ui/v1/config/:domain` — persist the edited config and return the
@@ -382,5 +439,9 @@ pub(crate) async fn save_config(
         _ => return Ok(Json(UiConfig::empty())),
     }
     settings.save(&state.config.settings_path)?;
-    Ok(Json(UiConfig::build(&settings, &domain)))
+    let mut fresh = UiConfig::build(&settings, &domain);
+    if let Some(stt) = fresh.stt.as_mut() {
+        fill_stt_boost(&state, stt);
+    }
+    Ok(Json(fresh))
 }

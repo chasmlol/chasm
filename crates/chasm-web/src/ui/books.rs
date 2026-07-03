@@ -565,6 +565,15 @@ fn list_characters(state: &AppState) -> WebResult<Vec<UiBookEntry>> {
     Ok(cards)
 }
 
+/// The display name of every character card under the active profile — the
+/// same names the Characters book shows. Used to build the STT boost vocabulary
+/// (see `crate::stt_vocab`).
+pub(crate) fn character_names(state: &AppState) -> Vec<String> {
+    list_characters(state)
+        .map(|cards| cards.into_iter().map(|c| c.title).collect())
+        .unwrap_or_default()
+}
+
 /// Reads a card field, preferring `data.<key>` (V2/V3) then the legacy top-level
 /// `<key>` (mirrors the compat reader's fallbacks).
 fn card_field(card: &Value, key: &str) -> String {

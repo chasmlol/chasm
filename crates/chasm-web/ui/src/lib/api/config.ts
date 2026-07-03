@@ -36,11 +36,25 @@ export interface TtsConfig {
   frames_after_eos: number;
 }
 
-/** STT language / prompt / timeout. Mirrors `SttConfig`. */
+/** STT language / prompt / timeout + word-boosting. Mirrors `SttConfig`. */
 export interface SttConfig {
   language: string;
   prompt: string;
   timeout_ms: number;
+  /** Master switch for word boosting (Parakeet only). */
+  boost_vocab: boolean;
+  /** Include character-book names in the boost vocabulary. */
+  boost_characters: boolean;
+  /** Include lorebook entry names + keys in the boost vocabulary. */
+  boost_lore: boolean;
+  /** Read-only: proper nouns actually being boosted (respects the toggles). */
+  boosted_word_count?: number;
+  /** Read-only: distinct character-derived terms available. */
+  boosted_character_count?: number;
+  /** Read-only: distinct lore-derived terms available. */
+  boosted_lore_count?: number;
+  /** Read-only: a small preview of the boosted words. */
+  boost_sample?: string[];
 }
 
 /** Retrieval toggles / tiers / limits / scores. Mirrors `RetrievalConfig`. */

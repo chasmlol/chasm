@@ -452,6 +452,17 @@ pub struct SttSettings {
     /// request body omits `timeoutMs`. Wired as the actual reqwest timeout on the
     /// transcription POST. Clamped to [`STT_TIMEOUT_MS_MIN`]..=[`STT_TIMEOUT_MS_MAX`].
     pub timeout_ms: u64,
+    /// Master switch for word boosting (Parakeet only): ship the active
+    /// profile's proper nouns with each transcription so the server snaps
+    /// near-misses ("sunny smells" -> "Sunny Smiles"). Default on; no effect on
+    /// the Whisper path. The two `boost_*` source flags below pick what's
+    /// included; the vocabulary always tracks the current characters/lore.
+    pub boost_vocab: bool,
+    /// Include character-book names in the boost vocabulary. Default on.
+    pub boost_characters: bool,
+    /// Include lorebook entry names + trigger keys in the boost vocabulary.
+    /// Default on.
+    pub boost_lore: bool,
 }
 
 impl Default for SttSettings {
@@ -462,6 +473,9 @@ impl Default for SttSettings {
             language: String::new(),
             prompt: String::new(),
             timeout_ms: STT_TIMEOUT_MS_DEFAULT,
+            boost_vocab: true,
+            boost_characters: true,
+            boost_lore: true,
         }
     }
 }

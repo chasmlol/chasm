@@ -15,6 +15,7 @@ import {
   Cpu,
   AudioLines,
   Mic,
+  Megaphone,
   Database,
   Server,
   Cable,
@@ -115,6 +116,12 @@ export const NAV_GROUPS: NavGroup[] = [
       { key: "llm", label: "LLM", path: "settings/llm", icon: Cpu },
       { key: "tts", label: "TTS", path: "settings/tts", icon: AudioLines },
       { key: "stt", label: "STT", path: "settings/stt", icon: Mic },
+      {
+        key: "stt-boost",
+        label: "Word Boosting",
+        path: "settings/stt-boost",
+        icon: Megaphone,
+      },
       {
         key: "retrieval",
         label: "Retrieval",
