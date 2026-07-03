@@ -18,13 +18,16 @@
 //! the PID field fall back to a stale-heartbeat grace window ([`STOP_GRACE_SECS`]).
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
 use chasm_core::{default_bridge_root, AppSettings};
 
-use crate::{connection, launcher, AppState};
+use crate::{connection, launcher, warmup, AppState};
 
 /// How often the lifecycle task samples the heartbeat. 2s keeps it responsive to
 /// a game launch/quit without busy-looping.
@@ -65,12 +68,25 @@ impl Phase {
 #[derive(Debug)]
 pub(crate) struct StackLifecycle {
     phase: Mutex<Phase>,
+    /// Exclusivity flag for the connect-time stack warm-up ([`crate::warmup`]):
+    /// `true` while a warm-up run is in flight, so the connect edge and the
+    /// manual `/api/stack/start` endpoint can't run two at once (idempotent per
+    /// connect — the edge itself only fires once per connect). `Arc` so the
+    /// [`WarmupPermit`] can release it on Drop even when the task is aborted.
+    warmup_in_flight: Arc<AtomicBool>,
+    /// The in-flight warm-up task, so the DISCONNECT edge can abort it. Without
+    /// this, a warm-up from a session that just ended would keep polling the
+    /// (now killed) runtimes for up to its ready-timeout — and hold the permit
+    /// across a quick game restart, silently starving the next session's warm-up.
+    warmup_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Default for StackLifecycle {
     fn default() -> Self {
         Self {
             phase: Mutex::new(Phase::Disconnected),
+            warmup_in_flight: Arc::new(AtomicBool::new(false)),
+            warmup_task: Mutex::new(None),
         }
     }
 }
@@ -83,6 +99,61 @@ impl StackLifecycle {
 
     fn set(&self, phase: Phase) {
         *self.phase.lock().expect("stack-lifecycle phase mutex") = phase;
+    }
+
+    /// Claims the warm-up slot. Returns `None` when a warm-up is already running
+    /// (the caller skips instead of doubling the work). The returned permit
+    /// releases the slot on Drop — including on panic and on task abort — so the
+    /// slot can never be wedged shut by a warm-up that didn't finish cleanly.
+    pub(crate) fn try_begin_warmup(&self) -> Option<WarmupPermit> {
+        self.warmup_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+            .then(|| WarmupPermit {
+                flag: Arc::clone(&self.warmup_in_flight),
+            })
+    }
+
+    /// Records the spawned warm-up task so [`Self::abort_warmup`] can cancel it.
+    /// Only ever called with a task that holds the [`WarmupPermit`] (the permit
+    /// is claimed BEFORE spawning), so the stored handle is always THE running
+    /// warm-up, never a duplicate that skipped.
+    pub(crate) fn track_warmup_task(&self, handle: tokio::task::JoinHandle<()>) {
+        *self
+            .warmup_task
+            .lock()
+            .expect("stack-lifecycle warmup-task mutex") = Some(handle);
+    }
+
+    /// Aborts the in-flight warm-up task (if any). Called on the disconnect edge:
+    /// the runtimes it would warm are being torn down, and its permit must not
+    /// leak into the next connect. Dropping the aborted future releases the
+    /// permit via [`WarmupPermit::drop`]. Returns the handle so tests can await
+    /// the abort deterministically; production callers ignore it.
+    pub(crate) fn abort_warmup(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let handle = self
+            .warmup_task
+            .lock()
+            .expect("stack-lifecycle warmup-task mutex")
+            .take();
+        if let Some(handle) = &handle {
+            handle.abort();
+        }
+        handle
+    }
+}
+
+/// RAII claim on the warm-up slot: exactly one exists at a time, and dropping it
+/// (normal completion, panic, or task abort) reopens the slot. Handed out by
+/// [`StackLifecycle::try_begin_warmup`] and held across the whole warm-up run.
+#[derive(Debug)]
+pub(crate) struct WarmupPermit {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for WarmupPermit {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
     }
 }
 
@@ -183,12 +254,12 @@ pub(crate) async fn spawn_lifecycle(state: Arc<AppState>) {
                     launcher::start_ai_stack(&start_state);
                 })
                 .await;
-                // Warm the in-process retriever (embedder + reranker) alongside the
-                // external servers, so it comes up with the stack rather than at boot.
-                let warm_state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    launcher::warm_retrieval(&warm_state).await;
-                });
+                // Warm the WHOLE stack off the readiness path: retriever
+                // (embedder + reranker), LLM KV-cache prefix, Whisper, and the
+                // TTS first-inference — so the FIRST in-game line costs the same
+                // as every later one. Fire-and-forget; a real turn arriving
+                // mid-warm-up just reuses whatever finished (see `warmup.rs`).
+                warmup::spawn_stack_warmup(&state);
                 // Only advance to Connected if we're still meant to be up (the game
                 // didn't quit mid-boot, which the next poll would catch anyway).
                 if state.lifecycle.phase() == Phase::Starting {
@@ -212,6 +283,11 @@ pub(crate) async fn spawn_lifecycle(state: Arc<AppState>) {
                         "AI stack lifecycle: game disconnected — stopping the AI stack"
                     );
                     state.lifecycle.set(Phase::Stopping);
+                    // Cancel any still-running warm-up: the runtimes it polls are
+                    // about to be killed, and its permit must not survive into the
+                    // next connect (a quick game restart would otherwise skip its
+                    // warm-up because a dead session's run still held the slot).
+                    state.lifecycle.abort_warmup();
                     let stop_state = Arc::clone(&state);
                     let _ = tokio::task::spawn_blocking(move || {
                         launcher::stop_ai_stack(&stop_state);
@@ -223,5 +299,53 @@ pub(crate) async fn spawn_lifecycle(state: Arc<AppState>) {
             // Already in the right steady state (or mid start/stop) — nothing to do.
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The warm-up slot is exclusive while a permit is alive, and dropping the
+    /// permit (normal completion or panic unwinding) reopens it.
+    #[test]
+    fn warmup_permit_is_exclusive_and_releases_on_drop() {
+        let lifecycle = StackLifecycle::default();
+        let permit = lifecycle.try_begin_warmup().expect("first claim wins");
+        assert!(
+            lifecycle.try_begin_warmup().is_none(),
+            "a second claim while one is in flight must be refused"
+        );
+        drop(permit);
+        assert!(
+            lifecycle.try_begin_warmup().is_some(),
+            "dropping the permit must reopen the slot"
+        );
+    }
+
+    /// Aborting a tracked warm-up task releases its permit: a warm-up killed on
+    /// the disconnect edge can never starve the NEXT session's warm-up (the bug
+    /// class this guards against: quick game restart while a stale warm-up still
+    /// polls dead endpoints for minutes, holding the slot the whole time).
+    #[tokio::test]
+    async fn aborting_the_tracked_warmup_task_releases_the_permit() {
+        let lifecycle = StackLifecycle::default();
+        let permit = lifecycle.try_begin_warmup().expect("claim");
+        let handle = tokio::spawn(async move {
+            let _held = permit; // released only when this future is dropped
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        });
+        lifecycle.track_warmup_task(handle);
+        assert!(lifecycle.try_begin_warmup().is_none(), "slot busy while task runs");
+
+        let handle = lifecycle.abort_warmup().expect("a task was tracked");
+        let joined = handle.await;
+        assert!(joined.is_err(), "the warm-up task must have been cancelled");
+        assert!(
+            lifecycle.try_begin_warmup().is_some(),
+            "abort must drop the permit and reopen the slot"
+        );
+        // The slot is now empty; a second abort is a clean no-op.
+        assert!(lifecycle.abort_warmup().is_none());
     }
 }

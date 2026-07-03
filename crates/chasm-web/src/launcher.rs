@@ -1216,57 +1216,10 @@ fn split_first_token(s: &str) -> (&str, &str) {
     }
 }
 
-/// Best-effort retrieval warm-up: load the shared retriever (the expensive ONNX
-/// load) and embed a dummy string to warm the session. No-op when retrieval is
-/// disabled (the retriever resolves to `None`). Errors ignored.
-pub(crate) async fn warm_retrieval(state: &Arc<AppState>) {
-    let settings = AppSettings::load(&state.config.settings_path);
-    if !settings.retrieval.enabled {
-        return;
-    }
-    // `retriever()` loads + memoizes the ONNX model on first use; `Retriever`
-    // clones cheaply (Arc) so we pull a handle out of the borrow, then embed.
-    let Some(retriever) = state.retriever().cloned() else {
-        return;
-    };
-    match retriever.embed("warm") {
-        Ok(_) => tracing::debug!("retrieval embedder warm-up done"),
-        Err(error) => tracing::debug!("retrieval warm-up failed (ignored): {error}"),
-    }
-
-    // Pre-warm the spawn catalogs (~8k spawnable records) so the first catalog
-    // search resolves instantly instead of embedding them on demand (which would
-    // stall the first spawn ~1 min). Batched + disk-cached, misses only, so this is
-    // a no-op once warmed. The embed text MUST match `catalog_item_vector_text` in
-    // the prompt crate (vectorizableText trimmed, else name) or the cache misses.
-    let Some(cache) = state.embed_cache().cloned() else {
-        return;
-    };
-    let texts: Vec<String> = state
-        .repository
-        .list_action_catalogs()
-        .into_iter()
-        .flat_map(|catalog| catalog.items)
-        .filter(|item| !item.disable)
-        .map(|item| {
-            let vector_text = item.vectorizable_text.trim();
-            if vector_text.is_empty() {
-                item.name.trim().to_string()
-            } else {
-                vector_text.to_string()
-            }
-        })
-        .filter(|text| !text.is_empty())
-        .collect();
-    if texts.is_empty() {
-        return;
-    }
-    let total = texts.len();
-    let warmed = tokio::task::spawn_blocking(move || cache.warm_batch(&retriever, &texts, 64))
-        .await
-        .unwrap_or(0);
-    tracing::info!("catalog embeddings warmed: {warmed} new / {total} total");
-}
+// NOTE: the retrieval warm-up (embedder + reranker + catalog vectors) moved to
+// `crate::warmup::spawn_stack_warmup`, which folds it into the full connect-time
+// stack warm-up (LLM KV prefix, Whisper, TTS first-inference) with one summary
+// log line.
 
 /// Spawns a configured local runtime (koboldcpp / TTS service) detached +
 /// hidden, with its cwd + merged env applied and stdio nulled.

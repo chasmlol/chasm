@@ -46,6 +46,19 @@ fn trace_id_from_headers(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Extracts a non-empty `traceId` from a generate request BODY. The in-process
+/// FNV bridge calls `generate_stream_core` directly (no HTTP headers), so it
+/// carries the game request's trace id in the body instead; without this the
+/// LLM usage/timings capture never correlates to in-game turns.
+fn trace_id_from_body(body: &Value) -> Option<String> {
+    body.get("traceId")
+        .or_else(|| body.get("trace_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 const PLAYER_PARTICIPANT_ID: &str = "player";
 const CONTEXT_MESSAGE_LIMIT: usize = 40;
 
@@ -190,6 +203,9 @@ pub async fn generate_stream_core(
     body: Value,
     trace_id: Option<String>,
 ) -> WebResult<impl futures_util::Stream<Item = String> + Send> {
+    // Header-supplied trace id wins; the in-process bridge (no headers) sends it
+    // in the body so the LLM metrics capture still correlates to game requests.
+    let trace_id = trace_id.or_else(|| trace_id_from_body(&body));
     // Resolve everything that can fail synchronously up front so a hard error
     // is returned as a non-200 (which the helper's `streamApi` surfaces),
     // rather than mid-stream.
@@ -923,6 +939,36 @@ fn prepare_speaker_turn(
         chat_messages,
         injected,
     })
+}
+
+/// Builds the chat-completion message array a REAL first turn of `live_chat_id`
+/// would send — same live chat, same deterministic first-eligible speaker, same
+/// structured/text mode, same persisted history — minus the (unknown) new player
+/// message. Used by the connect-time warm-up to pre-ingest the static prompt
+/// prefix into the LLM server's KV cache: the actual first turn then
+/// fast-forwards over everything up to the player's new line.
+///
+/// Pure read: nothing is persisted and no speaker turn is recorded. Returns
+/// `None` when the live chat doesn't exist yet (fresh install before the first
+/// ever turn) or has no eligible speaker — callers fall back to a generic
+/// warm-up prompt.
+pub(crate) fn warmup_chat_messages(
+    state: &Arc<AppState>,
+    live_chat_id: &str,
+    structured: bool,
+) -> Option<(Vec<Value>, String)> {
+    let body = json!({
+        "responseFormat": if structured { "structured" } else { "text" },
+    });
+    let ctx = resolve_turn_context(state, live_chat_id, &body).ok()?;
+    let input = orchestrator::SelectionInput {
+        force_participant_id: None,
+        force_character_id: None,
+    };
+    let selection = orchestrator::select_live_speaker_candidates(&ctx.live_chat, &input).ok()?;
+    let speaker = selection.speakers.first()?;
+    let plan = prepare_speaker_turn(state, &ctx, speaker).ok()?;
+    Some((plan.chat_messages, plan.speaker_name))
 }
 
 /// Synthesizes a `ParticipantView` when the merged participant list does not
@@ -3047,5 +3093,127 @@ mod tests {
         let view = admin_message_view(2, &assistant);
         assert_eq!(view.role, "assistant");
         assert_eq!(view.speaker_name, "Todd");
+    }
+
+    /// A real [`AppState`] over throwaway temp dirs (retrieval disabled so the
+    /// prompt path never tries to load ONNX models in tests).
+    fn fixture_state(tag: &str) -> Arc<AppState> {
+        let root = std::env::temp_dir().join(format!(
+            "sb-generate-fixture-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let settings_path = root.join("settings.json");
+        let mut settings = AppSettings::load(&settings_path); // defaults (file absent)
+        settings.retrieval.enabled = false;
+        settings.save(&settings_path).unwrap();
+        let config = chasm_core::AppConfig {
+            bind_addr: "127.0.0.1:0".into(),
+            data_root: root.join("data"),
+            workspace_root: root.clone(),
+            settings_path,
+            engines_dir: root.join("engines"),
+            profiles_dir: root.join("profiles"),
+            voices_dir: root.join("voices"),
+            llm_models_dir: root.join("models-llm"),
+            stt_endpoint: "http://127.0.0.1:9/v1/audio/transcriptions".into(),
+            llm_endpoint: "http://127.0.0.1:9".into(),
+            tts_endpoint: "http://127.0.0.1:9".into(),
+        };
+        Arc::new(AppState::new(config))
+    }
+
+    /// Every file under `root` as sorted `(relative path, bytes)` pairs — a full
+    /// content snapshot, so "persists nothing" is byte-for-byte provable.
+    fn dir_snapshot(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, base, out);
+                } else if let Ok(bytes) = std::fs::read(&path) {
+                    let rel = path
+                        .strip_prefix(base)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string();
+                    out.push((rel, bytes));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// The connect-time warm-up's LLM priming is only worth anything if it
+    /// ingests EXACTLY the prefix the real first turn sends. Prove it on a
+    /// disk-backed live chat: `warmup_chat_messages` (a) is a pure read — the
+    /// data root is byte-for-byte unchanged — and (b) equals the real first
+    /// turn's chat-completion array minus the trailing player message, so
+    /// koboldcpp's `cache_prompt` fast-forwards over everything the warm-up
+    /// pre-ingested and turn 1 only pays for the player's new line.
+    #[tokio::test]
+    async fn warmup_prompt_is_the_real_first_turn_prefix_and_persists_nothing() {
+        let state = fixture_state("warmup-prefix");
+        create_live_chat(
+            State(state.clone()),
+            Json(json!({
+                "id": "fnv-goodsprings",
+                "title": "Fallout New Vegas - Goodsprings",
+                "location": "Goodsprings",
+                "participants": [
+                    { "participantId": "player", "type": "player", "name": "Player",
+                      "present": true, "audible": true },
+                    { "participantId": "npc:easy_pete", "type": "npc", "characterId": "Easy Pete",
+                      "name": "Easy Pete", "present": true, "audible": true },
+                ],
+            })),
+        )
+        .await
+        .expect("create live chat");
+
+        // (a) Pure read: same result twice, and NOTHING under the data root moved.
+        let before = dir_snapshot(&state.config.data_root);
+        let (warm_messages, speaker) =
+            warmup_chat_messages(&state, "fnv-goodsprings", true).expect("warmup plan resolves");
+        assert_eq!(speaker, "Easy Pete", "deterministic first-eligible speaker");
+        assert_eq!(
+            dir_snapshot(&state.config.data_root),
+            before,
+            "warmup_chat_messages must persist nothing"
+        );
+
+        // (b) The real first turn: player line persisted first (as the live path
+        // does), then the same deterministic speaker plan.
+        let body = json!({ "message": "Hi there, Pete.", "responseFormat": "structured" });
+        let ctx = resolve_turn_context(&state, "fnv-goodsprings", &body).expect("turn context");
+        persist_player_message_ctx(&state, &ctx).expect("persist player line");
+        let selection = orchestrator::select_live_speaker_candidates(
+            &ctx.live_chat,
+            &orchestrator::SelectionInput {
+                force_participant_id: None,
+                force_character_id: None,
+            },
+        )
+        .expect("speaker selection");
+        let plan = prepare_speaker_turn(&state, &ctx, selection.speakers.first().expect("speaker"))
+            .expect("turn plan");
+
+        // KV-priming property: real array == warm-up array + the player's line.
+        assert_eq!(plan.chat_messages.len(), warm_messages.len() + 1);
+        assert_eq!(
+            plan.chat_messages[..warm_messages.len()],
+            warm_messages[..],
+            "the warm-up prompt must be an exact prefix of the real first turn"
+        );
+        let last = plan.chat_messages.last().expect("player turn present");
+        assert_eq!(last["role"], json!("user"));
+        assert_eq!(last["content"], json!("Hi there, Pete."));
     }
 }

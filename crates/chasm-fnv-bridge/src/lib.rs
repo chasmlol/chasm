@@ -16,6 +16,7 @@ pub mod replay;
 pub mod saves;
 pub mod sink;
 pub mod stt;
+pub mod trace;
 
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
@@ -316,6 +317,19 @@ async fn run_turn(
     let admin = admin::is_admin_request(request);
     let distance_meters = npc::native_distance_meters(request);
 
+    // Per-turn stage trace (Settings → Tracing waterfall). Best-effort and
+    // clock-local to this turn; see `trace.rs`. Makes first-vs-later-turn cost
+    // (cold prefill, TTS first-inference, …) directly visible per request.
+    let trace = trace::TurnTrace::new(root, &request.request_id);
+    trace.stage_with(
+        "helper_turn_start",
+        serde_json::json!({
+            "npc_key": request.npc_key,
+            "want_tts": request.want_tts,
+            "admin": admin,
+        }),
+    );
+
     // Distance gate — skipped for admin (Todd is heard from anywhere).
     if !admin && distance_meters.is_finite() && distance_meters > config.native_max_distance_meters {
         let resp = OutgoingResponse {
@@ -336,10 +350,15 @@ async fn run_turn(
         && (stt::is_native_voice_request(request) || stt::has_audio_sidecar(root, path, request))
     {
         message = stt::recognize_native_speech(config, client, root, path, request).await?;
+        trace.stage_with(
+            "speech_recognition_done",
+            serde_json::json!({ "text_length": message.trim().len() }),
+        );
     }
     let message = message.trim().to_string();
     if message.is_empty() {
         write_placeholder(sink, request)?;
+        trace.stage("final_response_written");
         return Ok(());
     }
 
@@ -376,6 +395,7 @@ async fn run_turn(
     client
         .presence(&config.live_chat_id, &presence_body(config, &participants, &attention))
         .await?;
+    trace.stage("live_chat_ensure_done");
 
     // Stream the turn, synthesizing each speech.delta the moment it arrives so the
     // opener plays while the rest of the line is still generating (matches Node's
@@ -389,6 +409,9 @@ async fn run_turn(
     let mut next_index: u32 = 0;
     let mut turn: Option<Value> = None;
     let mut stream_speaker: Option<npc::ResolvedSpeaker> = None;
+    trace.stage("live_chat_generate_start");
+    let mut first_delta_seen = false;
+    let mut first_audio_seen = false;
     {
         let mut events = std::pin::pin!(client.generate_stream_events(&config.live_chat_id, &gen_body));
         while let Some(event) = events.next().await {
@@ -407,6 +430,16 @@ async fn run_turn(
                         .unwrap_or("")
                         .trim()
                         .to_string();
+                    if !first_delta_seen {
+                        first_delta_seen = true;
+                        // First model output surfaced: everything before this is
+                        // prompt assembly + retrieval + LLM prefill (+ decode of
+                        // the opener chunk) — the cold-start hot spot.
+                        trace.stage_with(
+                            "live_chat_first_delta",
+                            serde_json::json!({ "chars": segment.len() }),
+                        );
+                    }
                     if !segment.is_empty() && request.want_tts {
                         let speaker = stream_speaker
                             .clone()
@@ -423,8 +456,18 @@ async fn run_turn(
                         let body = synth_body(config, &segment, &line.character_name, false);
                         let start = next_index;
                         let mut local: u32 = 0;
+                        trace.stage_with(
+                            "tts_stream_start",
+                            serde_json::json!({ "chunk_chars": segment.len(), "start_index": start }),
+                        );
                         client
                             .synthesize_stream(&body, &mut |chunk| {
+                                if !first_audio_seen {
+                                    first_audio_seen = true;
+                                    // Feeds the existing "TTS first audio" summary
+                                    // metric (tts_stream_start → this).
+                                    trace.stage("tts_first_audio_chunk_received");
+                                }
                                 let index = start + chunk.index.map(|i| i.max(0) as u32).unwrap_or(local);
                                 local += 1;
                                 written.push(sink.audio_chunk(request, &line, &chunk, index, &[])?);
@@ -432,6 +475,10 @@ async fn run_turn(
                             })
                             .await?;
                         next_index = written.iter().map(|w| w.index + 1).max().unwrap_or(next_index);
+                        trace.stage_with(
+                            "tts_synthesize_done",
+                            serde_json::json!({ "chunks_written": written.len() }),
+                        );
                     }
                 }
                 Some("live.error") => {
@@ -446,6 +493,7 @@ async fn run_turn(
             }
         }
     }
+    trace.stage("live_chat_generate_done");
 
     let turn = turn
         .ok_or_else(|| anyhow::anyhow!("Live Chat streaming generation ended without a final turn."))?;
@@ -460,6 +508,7 @@ async fn run_turn(
         };
         sink.reply(request, &resp)?;
         sink.end_of_turn()?;
+        trace.stage("final_response_written");
         info!("{}: live chat selected no NPC response", request.request_id);
         return Ok(());
     }
@@ -535,6 +584,10 @@ async fn run_turn(
     };
     sink.reply(request, &resp)?;
     sink.end_of_turn()?;
+    trace.stage_with(
+        "final_response_written",
+        serde_json::json!({ "audio_chunks": written.len(), "speaker_name": speaker.character_name }),
+    );
     info!(
         "{}: {} -> {:?}",
         request.request_id,
@@ -762,6 +815,10 @@ fn generate_body(
     let scopes = actions::action_book_scopes(config, &request.npc_key, location);
     json!({
         "message": message,
+        // The game request's trace id, so the generate pipeline can correlate the
+        // LLM usage/timings capture (tokens/sec, prompt_ms) to this request's
+        // trace even on the in-process path where no HTTP header exists.
+        "traceId": request.request_id,
         "participantId": config.participant_id,
         "responseFormat": if config.enable_action_books { "structured" } else { "text" },
         "enableActionBooks": config.enable_action_books,
@@ -1141,4 +1198,34 @@ pub async fn admin_selftest(config: &BridgeConfig, message: &str) -> anyhow::Res
     println!("Todd voice TTS: {chunks} chunk(s), {bytes} bytes");
     println!("admin-selftest OK");
     Ok(())
+}
+
+#[cfg(test)]
+mod turn_body_tests {
+    use super::*;
+
+    /// The generate body must carry the game request's id as `traceId`, so the
+    /// generate pipeline can correlate LLM usage/timings to this request's trace
+    /// on the in-process path (no HTTP headers there).
+    #[test]
+    fn generate_body_carries_the_request_trace_id() {
+        let config = default_config();
+        let request = NativeRequest {
+            request_id: "req_45109828_1".to_string(),
+            npc_key: "easy_pete".to_string(),
+            ..Default::default()
+        };
+        let body = generate_body(
+            &config,
+            &request,
+            "Hi there, Pete.",
+            &json!({}),
+            &[],
+            2.0,
+            140.0,
+            "Goodsprings",
+        );
+        assert_eq!(body["traceId"], json!("req_45109828_1"));
+        assert_eq!(body["message"], json!("Hi there, Pete."));
+    }
 }

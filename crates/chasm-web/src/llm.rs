@@ -328,6 +328,56 @@ pub async fn chat_completion_capturing_sampled(
     Ok((content, metrics))
 }
 
+/// Builds the minimal KV-cache-priming request body used by the connect-time
+/// warm-up: the caller's messages verbatim, ONE predicted token, greedy, non-
+/// streaming, with `cache_prompt` on so koboldcpp keeps the ingested prefix in
+/// its slot for the first real turn to fast-forward over.
+fn warmup_request_body(model: Option<&str>, messages: &[Value]) -> Value {
+    let mut body = json!({
+        "messages": messages,
+        "stream": false,
+        "max_tokens": 1,
+        "n_predict": 1,
+        "temperature": 0.0,
+        "cache_prompt": true,
+    });
+    if let Some(model) = model {
+        body["model"] = json!(model);
+    }
+    body
+}
+
+/// One-token, discarded chat completion that pre-ingests `messages` into the
+/// LLM server's prompt (KV) cache. Returns the server's usage/timings metrics
+/// (prompt token count etc.) for the warm-up log line. `timeout` bounds the
+/// whole request — a cold multi-thousand-token prefill can take tens of seconds.
+pub async fn warmup_completion(
+    endpoint: &str,
+    messages: &[Value],
+    timeout: std::time::Duration,
+) -> Result<Option<chasm_core::LlmMetrics>, String> {
+    let client = reqwest::Client::new();
+    let model = first_model_id(&client, endpoint).await;
+    let url = format!("{endpoint}/v1/chat/completions");
+    let response = client
+        .post(&url)
+        .timeout(timeout)
+        .json(&warmup_request_body(model.as_deref(), messages))
+        .send()
+        .await
+        .map_err(|error| format!("llm warmup request failed: {error}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("llm warmup returned {status}: {text}"));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("llm warmup response decode failed: {error}"))?;
+    Ok(chasm_core::LlmMetrics::from_completion_response(&body))
+}
+
 /// Extracts `choices[0].delta.content` from one SSE data payload.
 fn parse_delta(payload: &str) -> Option<String> {
     let value: Value = serde_json::from_str(payload).ok()?;
@@ -392,6 +442,22 @@ mod tests {
         assert_eq!(body["n_ctx"], json!(8192));
         assert_eq!(body["seed"], json!(42));
         assert_eq!(body["stream"], json!(true));
+    }
+
+    #[test]
+    fn warmup_body_is_a_minimal_cache_priming_generation() {
+        let messages = vec![json!({ "role": "system", "content": "You are Easy Pete." })];
+        let body = warmup_request_body(Some("m"), &messages);
+        // One greedy token, non-streaming, prefix kept in the server's KV cache.
+        assert_eq!(body["max_tokens"], json!(1));
+        assert_eq!(body["n_predict"], json!(1));
+        assert_eq!(body["temperature"], json!(0.0));
+        assert_eq!(body["stream"], json!(false));
+        assert_eq!(body["cache_prompt"], json!(true));
+        assert_eq!(body["messages"], json!(messages));
+        assert_eq!(body["model"], json!("m"));
+        // No model id resolved → the key is simply absent (server default).
+        assert!(warmup_request_body(None, &messages).get("model").is_none());
     }
 
     #[test]

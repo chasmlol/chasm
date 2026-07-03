@@ -53,6 +53,7 @@ mod save_sync;
 mod stack_lifecycle;
 mod trace_routes;
 mod ui;
+mod warmup;
 
 pub struct AppState {
     pub config: AppConfig,
@@ -3305,9 +3306,11 @@ async fn stack_start(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
             }
         }
     });
-    // Warm the retriever (embedder + reranker) off the request path.
-    let warm_state = state.clone();
-    tokio::spawn(async move { launcher::warm_retrieval(&warm_state).await });
+    // Warm the whole stack (retriever, LLM prefix, Whisper, TTS first-inference)
+    // off the request path. Permit-guarded, so overlapping Start clicks / a
+    // concurrent game connect never run two warm-ups at once, and the lifecycle
+    // can abort it if the game disconnects mid-warm-up.
+    warmup::spawn_stack_warmup(&state);
     Json(serde_json::json!({ "started": true }))
 }
 
