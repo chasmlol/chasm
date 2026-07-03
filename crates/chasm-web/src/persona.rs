@@ -46,9 +46,11 @@ const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 /// (~10.7 MB) plus the stats snapshot and JSON framing.
 pub(crate) const MAX_BODY_BYTES: usize = 12 * 1024 * 1024;
 
-/// `max_tokens` for the persona generation (a paragraph or two; the prompt
-/// asks for at most 180 words).
-const PERSONA_MAX_TOKENS: i64 = 360;
+/// `max_tokens` for the persona generation. The prompt demands TWO compact
+/// paragraphs (looks, then manner) of at most ~80 words each (~230 tokens
+/// total); this clamp keeps the output bounded even when the model ignores
+/// the instruction.
+const PERSONA_MAX_TOKENS: i64 = 320;
 
 /// One persona generation at a time, process-wide. A capture arriving while a
 /// generation runs is stored; its generation is skipped (the next capture or a
@@ -126,7 +128,7 @@ fn write_json_atomic(path: &Path, value: &Value) -> std::io::Result<()> {
 
 /// The capture fields that constitute the "stats snapshot" (the display
 /// strings the mod extracts — see `mod-source/docs/persona.md`).
-const STAT_KEYS: [&str; 8] = [
+const STAT_KEYS: [&str; 13] = [
     "player_name",
     "level",
     "special",
@@ -135,6 +137,11 @@ const STAT_KEYS: [&str; 8] = [
     "equipped_weapon",
     "equipped_apparel",
     "location",
+    "sex",
+    "race",
+    "hair_color",
+    "hair_style",
+    "eye_color",
 ];
 
 /// Projects the stats snapshot out of a capture/persona body (string/number
@@ -151,7 +158,120 @@ fn stats_of(body: &Value) -> Value {
     Value::Object(map)
 }
 
-/// The human-readable stat sheet embedded in the generation prompt.
+/// Fallout: New Vegas S.P.E.C.I.A.L. attributes: the mod's abbreviation, the
+/// full name, and what the stat measures (per the in-game manual/wiki
+/// definitions), so the model can interpret extremes without game knowledge.
+const SPECIAL_ATTRIBUTES: [(&str, &str, &str); 7] = [
+    ("STR", "Strength", "raw physical power and muscle"),
+    ("PER", "Perception", "senses and environmental awareness"),
+    ("END", "Endurance", "physical fitness and toughness"),
+    ("CHA", "Charisma", "charm and social grace"),
+    ("INT", "Intelligence", "reasoning and wits"),
+    ("AGI", "Agility", "coordination and nimbleness"),
+    ("LCK", "Luck", "plain good fortune"),
+];
+
+/// Qualitative band for a 1-10 S.P.E.C.I.A.L. value.
+fn special_band(value: i64) -> &'static str {
+    match value {
+        i64::MIN..=1 => "abysmal",
+        2..=3 => "very low",
+        4 => "below average",
+        5..=6 => "average",
+        7 => "above average",
+        8 => "high",
+        9 => "exceptional",
+        _ => "peak human",
+    }
+}
+
+/// Qualitative band for a 0-100 skill value — only genuine extremes get one
+/// (`None` otherwise). Low-but-ordinary values are deliberately NOT flagged:
+/// fresh characters sit at 10-30 in most skills, so calling 25 "poor" would
+/// drown the real outliers in noise.
+fn skill_band(value: i64) -> Option<&'static str> {
+    match value {
+        i64::MIN..=10 => Some("dreadful"),
+        70..=84 => Some("highly skilled"),
+        85..=i64::MAX => Some("masterful"),
+        _ => None,
+    }
+}
+
+/// Parses a mod display string of `Label N` pairs (`"STR 9, PER 6, ..."` /
+/// `"Barter 15, Energy Weapons 20, ..."`) into `(label, value)` entries.
+/// Entries whose tail is not an integer are returned with `None` so callers
+/// can pass them through verbatim rather than dropping data.
+fn parse_stat_pairs(text: &str) -> Vec<(String, Option<i64>)> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| match entry.rsplit_once(' ') {
+            Some((label, number)) => match number.trim().parse::<i64>() {
+                Ok(value) => (label.trim().to_string(), Some(value)),
+                Err(_) => (entry.to_string(), None),
+            },
+            None => (entry.to_string(), None),
+        })
+        .collect()
+}
+
+/// Renders the mod's abbreviated SPECIAL string as one natural-language line
+/// per attribute (full name, explicit 1-10 scale, qualitative band, meaning
+/// hint). Unknown labels or unparseable entries pass through verbatim; a
+/// wholly unparseable string falls back to the raw `SPECIAL: ...` line.
+fn special_lines(raw: &str) -> Vec<String> {
+    let pairs = parse_stat_pairs(raw);
+    if pairs.is_empty() || pairs.iter().all(|(_, value)| value.is_none()) {
+        return vec![format!("SPECIAL: {raw}")];
+    }
+    pairs
+        .into_iter()
+        .map(|(label, value)| match value {
+            Some(value) => {
+                let known = SPECIAL_ATTRIBUTES
+                    .iter()
+                    .find(|(abbrev, _, _)| abbrev.eq_ignore_ascii_case(&label));
+                match known {
+                    Some((_, name, meaning)) => format!(
+                        "- {name} {value} of 10 — {band} ({meaning})",
+                        band = special_band(value)
+                    ),
+                    None => format!("- {label} {value} of 10 — {}", special_band(value)),
+                }
+            }
+            None => format!("- {label}"),
+        })
+        .collect()
+}
+
+/// Renders the mod's skills string naturally: the full list with the 0-100
+/// scale made explicit, plus a callout line for the extremes (the only values
+/// the prompt lets the model express).
+fn skills_lines(raw: &str) -> Vec<String> {
+    let pairs = parse_stat_pairs(raw);
+    if pairs.is_empty() || pairs.iter().all(|(_, value)| value.is_none()) {
+        return vec![format!("Skills: {raw}")];
+    }
+    let mut lines = vec![format!("Skills, each rated 0 to 100: {raw}")];
+    let extremes: Vec<String> = pairs
+        .iter()
+        .filter_map(|(label, value)| {
+            let value = (*value)?;
+            let band = skill_band(value)?;
+            Some(format!("{label} {value} of 100 ({band})"))
+        })
+        .collect();
+    if !extremes.is_empty() {
+        lines.push(format!("Notable skills: {}", extremes.join("; ")));
+    }
+    lines
+}
+
+/// The human-readable stat sheet embedded in the generation prompt. SPECIAL
+/// and skills are rendered as natural language (full attribute names, explicit
+/// scales, qualitative bands) so the model never sees bare `STR 9`-style
+/// abbreviations it might misread.
 fn stats_block(stats: &Value) -> String {
     let field = |key: &str| -> String {
         match stats.get(key) {
@@ -161,19 +281,29 @@ fn stats_block(stats: &Value) -> String {
         }
     };
     let mut lines: Vec<String> = Vec::new();
-    for (label, key) in [
-        ("Name", "player_name"),
-        ("Level", "level"),
-        ("SPECIAL", "special"),
-        ("Skills", "skills"),
-        ("Perks", "perks"),
-        ("Equipped weapon", "equipped_weapon"),
-        ("Outfit", "equipped_apparel"),
-    ] {
-        let value = field(key);
-        if !value.is_empty() {
-            lines.push(format!("{label}: {value}"));
-        }
+    let name = field("player_name");
+    if !name.is_empty() {
+        lines.push(format!("Name: {name}"));
+    }
+    let level = field("level");
+    if !level.is_empty() {
+        lines.push(format!("Level: {level}"));
+    }
+    let special = field("special");
+    if !special.is_empty() {
+        lines.push("Attributes (each 1 to 10):".to_string());
+        lines.extend(special_lines(&special));
+    }
+    let skills = field("skills");
+    if !skills.is_empty() {
+        lines.extend(skills_lines(&skills));
+    }
+    // Clothing IS in the sheet (the photo is a face shot, so the outfit must
+    // come from game data); weapon and perks stay out (weapon is scene-specific
+    // and perk names pulled the description in odd directions).
+    let apparel = field("equipped_apparel");
+    if !apparel.is_empty() {
+        lines.push(format!("Wearing (game data): {apparel}"));
     }
     lines.join("\n")
 }
@@ -207,39 +337,52 @@ fn persona_prompt(stats: &Value, with_image: bool) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or("the person");
     let opening = if with_image {
-        "You are looking at a photo of a person. Write a character sketch of them, as if briefing \
-         someone who is about to meet them in person."
+        "You are looking at a close-up photo of a person's face. Write a sketch of their face and \
+         head, as if telling someone how to recognize this person in a crowd."
             .to_string()
     } else {
         format!(
-            "Write a character sketch of {name}, a person someone is about to meet, working only \
-             from the stat sheet below — describe them as a real person standing in front of you."
+            "Write a sketch of the face and presence of {name}, a person someone is about to \
+             meet, working only from the stat sheet below — as if telling someone how to \
+             recognize them in a crowd."
         )
     };
-    let photo_rules = if with_image {
-        "- Describe only the person: build, face, hair, skin, scars and other marks, clothing and \
-         gear, bearing, and the overall impression they give.\n\
+    let rules = if with_image {
+        "- FIRST PARAGRAPH — their looks, purely from the photo: apparent age and sex, face, \
+         complexion, eyes, hair (color and style), facial hair, scars and other marks, and any \
+         headwear (hat, helmet, goggles, mask). Open it with one plain sentence like \
+         \"<name> is a middle-aged man with slicked-back blonde hair and pale blue eyes.\" \
+         Trust ONLY the photo here — no stats, no personality. Do NOT describe clothing below \
+         the neck, their body, build, or hands.\n\
+         - Mention facial hair, scars, or headwear ONLY when actually present — never remark \
+         on their absence (never write \"no visible scars\", \"clean-shaven\", or \
+         \"wears no hat\"). Never describe their expression or what it lacks.\n\
+         - END the first paragraph with what they are wearing, from the \"Wearing\" line of \
+         the stat sheet (the photo does not show their outfit) — phrase it naturally as worn \
+         clothing, not as a list. If the Wearing line names headwear, treat it as worn.\n\
+         - SECOND PARAGRAPH — how they come across: manner, capability, presence, drawn from \
+         the stat sheet. Never quote numbers or stat names. Only extremes deserve expression \
+         (brilliant Intelligence → sharp, appraising; rock-bottom Speech → halting and \
+         wordless; immense Strength → radiates physical power). Say nothing about middling \
+         values.\n\
          - Never describe the background, surroundings, lighting, or framing. Never mention that \
-         this is a photo, screenshot, render, or game.\n"
+         this is a photo, screenshot, render, or game.\n\
+         - Write in third person, present tense. Use their name.\n\
+         - Output ONLY the description: exactly TWO compact paragraphs separated by one blank \
+         line, each at most about 80 words. No headings, no lists, no preamble.\n"
     } else {
-        "- Describe their apparent build, bearing, dress, and the overall impression they give. \
-         Invent no specific facial features; keep physical details to what the stats and gear \
-         imply.\n"
+        "- Describe the impression their face and presence give. Invent no specific facial \
+         features; keep physical details to what the stats imply.\n\
+         - Use the stat sheet, but never quote numbers or stat names. Only extremes deserve \
+         expression; say nothing about middling values.\n\
+         - Write in third person, present tense. Use their name.\n\
+         - Output ONLY the description: exactly ONE compact paragraph, at most about 100 words. \
+         No headings, no lists, no preamble.\n"
     };
     format!(
         "{opening}\n\n\
          Rules:\n\
-         {photo_rules}\
-         - Use the stat sheet to color the description, but never quote numbers or stat names. \
-         Only extremes deserve expression: very high or very low values should visibly shape the \
-         person (immense Strength → visibly hulking; rock-bottom Speech → can barely string a \
-         sentence together; brilliant Intelligence → sharp, appraising eyes). Say nothing about \
-         middling values.\n\
-         - Let notable perks and equipment inform how they carry themselves and what they seem \
-         capable of.\n\
-         - Write in third person, present tense. Use their name.\n\
-         - Output ONLY the description: one or two compact paragraphs, at most 180 words. No \
-         headings, no lists, no preamble.\n\n\
+         {rules}\n\
          Stat sheet:\n{stats}",
         stats = stats_block(stats)
     )
@@ -412,6 +555,11 @@ pub(crate) async fn generate_from_stored_capture(state: &AppState) -> WebResult<
     let mut note = String::new();
     let mut source = "stats_only";
     let mut description: Option<String> = None;
+    // The exact prompt text of the attempt that PRODUCED the description
+    // (persisted with the record so the Persona page can show precisely what
+    // the LLM was asked; the screenshot rides along as an image part when
+    // source == "vision").
+    let mut used_prompt: Option<String> = None;
 
     if !settings.enabled {
         note = "persona generation is disabled in settings".to_string();
@@ -434,6 +582,7 @@ pub(crate) async fn generate_from_stored_capture(state: &AppState) -> WebResult<
                     Ok(text) => {
                         description = Some(text);
                         source = "vision";
+                        used_prompt = Some(prompt.clone());
                         note = "generated from the screenshot via the separate vision endpoint"
                             .to_string();
                     }
@@ -449,6 +598,7 @@ pub(crate) async fn generate_from_stored_capture(state: &AppState) -> WebResult<
                     Ok(text) => {
                         description = Some(text);
                         source = "vision";
+                        used_prompt = Some(prompt.clone());
                         note.push_str("generated from the screenshot via the main LLM endpoint");
                     }
                     Err(error) => {
@@ -468,6 +618,7 @@ pub(crate) async fn generate_from_stored_capture(state: &AppState) -> WebResult<
                 Ok(text) => {
                     description = Some(text);
                     source = "stats_only";
+                    used_prompt = Some(prompt);
                     note.push_str("generated from the stats snapshot (no vision model available)");
                 }
                 Err(error) => {
@@ -505,6 +656,10 @@ pub(crate) async fn generate_from_stored_capture(state: &AppState) -> WebResult<
                 "model_note": note,
                 "image_file": image_file,
                 "stats": stats,
+                // The exact prompt text sent to the LLM for this description
+                // (the screenshot is attached as an image part when source is
+                // "vision" — see persona_messages). Shown on the Persona page.
+                "prompt": used_prompt.unwrap_or_default(),
             })
         }
         None => {
@@ -633,10 +788,13 @@ pub async fn receive_capture(
     let settings = AppSettings::load(&state.config.settings_path).persona;
     let generation = if !settings.enabled {
         "disabled"
-    } else if is_unchanged(&dir, &capture) {
+    } else if !is_save_trigger(&capture) && is_unchanged(&dir, &capture) {
         // Same stats as the stored persona and a description already exists:
-        // skip the LLM (the image can't meaningfully differ — apparel is part
-        // of the snapshot). The fresh image was still stored above.
+        // skip the LLM. Save-driven captures (the mod's whole trigger model,
+        // see docs/persona.md) always regenerate — the player saved, the
+        // screenshot is fresh, and they expect a fresh description even with
+        // identical stats. The unchanged short-circuit only remains for
+        // non-save uploads. The fresh image was still stored above either way.
         "unchanged"
     } else if spawn_generation(state.clone()) {
         "queued"
@@ -649,6 +807,16 @@ pub async fn receive_capture(
         "generation": generation,
         "image": image_status,
     })))
+}
+
+/// True when the capture came from a game save (the mod's trigger vocabulary:
+/// `save` / `quicksave` / `autosave`). Save-driven captures always regenerate,
+/// bypassing [`is_unchanged`].
+fn is_save_trigger(capture: &Value) -> bool {
+    matches!(
+        capture.get("trigger").and_then(Value::as_str),
+        Some("save") | Some("quicksave") | Some("autosave")
+    )
 }
 
 /// True when the stored persona was generated from an IDENTICAL stats snapshot
@@ -679,7 +847,12 @@ mod tests {
             "equipped_weapon": "9mm Pistol",
             "equipped_apparel": "Leather Armor, Goggles",
             "location": "Goodsprings",
-            "trigger": "stats_changed",
+            "sex": "male",
+            "race": "Caucasian Old",
+            "hair_color": "#D6B569",
+            "hair_style": "Wavy",
+            "eye_color": "Blue",
+            "trigger": "quicksave",
         })
     }
 
@@ -687,16 +860,76 @@ mod tests {
     fn prompt_variants_carry_rules_and_stats() {
         let stats = stats_of(&capture_body("Courier"));
         let vision = persona_prompt(&stats, true);
-        assert!(vision.contains("photo of a person"));
+        assert!(vision.contains("close-up photo of a person's face"));
         assert!(vision.contains("Never mention that this is a photo, screenshot, render, or game"));
-        assert!(vision.contains("SPECIAL: STR 9"));
-        assert!(vision.contains("Outfit: Leather Armor, Goggles"));
-        assert!(vision.contains("at most 180 words"));
+        // Natural-language stats: full attribute names + explicit scale +
+        // qualitative band + meaning hint, never bare abbreviations.
+        assert!(vision.contains("Strength 9 of 10 — exceptional (raw physical power and muscle)"));
+        assert!(vision.contains("Charisma 1 of 10 — abysmal (charm and social grace)"));
+        assert!(vision.contains("Intelligence 3 of 10 — very low (reasoning and wits)"));
+        assert!(!vision.contains("STR 9,"), "no raw abbreviations in the rendered attributes");
+        assert!(vision.contains("Wearing (game data): Leather Armor, Goggles"), "outfit drives the clothing sentence");
+        assert!(vision.contains("any headwear"));
+        assert!(!vision.contains("Appearance facts"), "looks must come from the photo alone");
+        assert!(!vision.contains("#D6B569"), "no character-data colors in the prompt");
+        assert!(!vision.contains("Eyes: Blue"), "no character-data eye color in the prompt");
+        assert!(!vision.contains("Perks:"), "perks must stay out of the prompt");
+        assert!(vision.contains("FIRST PARAGRAPH"));
+        assert!(vision.contains("SECOND PARAGRAPH"));
+        assert!(vision.contains("exactly TWO compact paragraphs"));
+        // Exactly one paragraph, ~100 words — the 180-word allowance is gone.
+        assert!(!vision.contains("180 words"));
 
         let stats_only = persona_prompt(&stats, false);
-        assert!(stats_only.contains("Write a character sketch of Courier"));
+        assert!(stats_only.contains("the face and presence of Courier"));
         assert!(!stats_only.contains("photo"));
-        assert!(stats_only.contains("Skills: Barter 15, Guns 45, Speech 4, Unarmed 80"));
+        assert!(stats_only.contains("Skills, each rated 0 to 100: Barter 15, Guns 45, Speech 4, Unarmed 80"));
+        // Only genuine extremes are called out (Barter 15 is ordinary early-game).
+        assert!(stats_only.contains("Notable skills: Speech 4 of 100 (dreadful); Unarmed 80 of 100 (highly skilled)"));
+    }
+
+    #[test]
+    fn special_rendering_is_natural_language_with_fallback() {
+        let lines = special_lines("STR 10, PER 5, CHA 2, LCK 7");
+        assert_eq!(
+            lines,
+            vec![
+                "- Strength 10 of 10 — peak human (raw physical power and muscle)",
+                "- Perception 5 of 10 — average (senses and environmental awareness)",
+                "- Charisma 2 of 10 — very low (charm and social grace)",
+                "- Luck 7 of 10 — above average (plain good fortune)",
+            ]
+        );
+        // Unknown label still renders with the scale; unparseable entry passes through.
+        let lines = special_lines("VIG 8, mystery");
+        assert_eq!(lines, vec!["- VIG 8 of 10 — high", "- mystery"]);
+        // A wholly unparseable string falls back to the raw line.
+        assert_eq!(special_lines("???"), vec!["SPECIAL: ???"]);
+    }
+
+    #[test]
+    fn skills_rendering_calls_out_extremes_only() {
+        let lines = skills_lines("Guns 45, Speech 4, Sneak 30, Unarmed 90");
+        assert_eq!(lines[0], "Skills, each rated 0 to 100: Guns 45, Speech 4, Sneak 30, Unarmed 90");
+        assert_eq!(
+            lines[1],
+            "Notable skills: Speech 4 of 100 (dreadful); Unarmed 90 of 100 (masterful)"
+        );
+        // Middling and ordinary-low values → no extremes line at all.
+        let lines = skills_lines("Guns 45, Sneak 30, Barter 15");
+        assert_eq!(lines.len(), 1);
+        // Garbage falls back to the raw line.
+        assert_eq!(skills_lines("-"), vec!["Skills: -"]);
+    }
+
+    #[test]
+    fn save_triggers_bypass_unchanged_short_circuit() {
+        for trigger in ["save", "quicksave", "autosave"] {
+            assert!(is_save_trigger(&json!({ "trigger": trigger })), "{trigger}");
+        }
+        assert!(!is_save_trigger(&json!({ "trigger": "initial" })));
+        assert!(!is_save_trigger(&json!({ "trigger": "stats_changed" })));
+        assert!(!is_save_trigger(&json!({})));
     }
 
     #[test]

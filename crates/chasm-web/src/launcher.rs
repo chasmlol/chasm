@@ -1072,6 +1072,30 @@ pub(crate) fn koboldcpp_managed_default(
 ///   * args mirror the real koboldcpp config: `--usecublas --model <gguf>
 ///     --gpulayers 999 --contextsize 8192 [--whispermodel <bin>] --port 5001
 ///     --host 127.0.0.1`. cwd = the exe's dir.
+/// Finds a vision projector (`*mmproj*.gguf`) in the LLM models dir for the
+/// selected model. Preference: the candidate sharing the longest common prefix
+/// with the model file's name (case-insensitive) — so `gemma-4-12b-it-mmproj-F16`
+/// pairs with `gemma-4-12b-it-UD-Q4_K_XL` even when several projectors exist.
+fn find_vision_projector(models_dir: &Path, model_gguf: &Path) -> Option<std::path::PathBuf> {
+    let model_name = model_gguf.file_name()?.to_string_lossy().to_lowercase();
+    let mut best: Option<(usize, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(models_dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if !name.ends_with(".gguf") || !name.contains("mmproj") {
+            continue;
+        }
+        let shared = model_name
+            .bytes()
+            .zip(name.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if best.as_ref().map(|(len, _)| shared > *len).unwrap_or(true) {
+            best = Some((shared, entry.path()));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
 fn build_managed_koboldcpp_spec(
     settings: &AppSettings,
     config: &chasm_core::AppConfig,
@@ -1107,6 +1131,16 @@ fn build_managed_koboldcpp_spec(
         "--contextsize".to_string(),
         "8192".to_string(),
     ];
+
+    // Vision projector: when a matching mmproj GGUF sits in the models dir,
+    // attach it so a vision-capable model actually gets its vision tower.
+    // Without --mmproj, koboldcpp reports "vision": false and SILENTLY drops
+    // OpenAI-compat image parts (the persona screenshot among them).
+    if let Some(mmproj) = find_vision_projector(&config.llm_models_dir, &gguf) {
+        tracing::info!("koboldcpp: attaching vision projector {}", mmproj.display());
+        args.push("--mmproj".to_string());
+        args.push(mmproj.display().to_string());
+    }
 
     // Whisper STT is optional: add --whispermodel only when a model is selected AND
     // its .bin is on disk, so STT never blocks the LLM from starting.

@@ -50,6 +50,10 @@ pub(crate) struct UiPersonaView {
     /// Last generation error (kept alongside a previous good description).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_error: Option<String>,
+    /// The exact prompt text sent to the LLM for the current description
+    /// (records generated before prompt persistence existed have none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     /// The stats snapshot the description was generated from (else the latest
     /// received capture's snapshot; `{}` before any capture).
     pub stats: Value,
@@ -120,6 +124,7 @@ fn build_view(state: &AppState) -> UiPersonaView {
         source: stored_ref.and_then(|persona| field(persona, "source")),
         model_note: stored_ref.and_then(|persona| field(persona, "model_note")),
         generation_error: stored_ref.and_then(|persona| field(persona, "generation_error")),
+        prompt: stored_ref.and_then(|persona| field(persona, "prompt")),
         stats,
         has_image: persona::stored_image(&dir).is_some(),
         generating: persona::generation_in_flight(),

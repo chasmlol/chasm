@@ -28,6 +28,9 @@ export interface PersonaViewDto {
   model_note?: string | null;
   /** Last generation error (a previous good description is kept alongside). */
   generation_error?: string | null;
+  /** The exact prompt text sent to the LLM for the current description
+   *  (absent on records generated before prompt persistence existed). */
+  prompt?: string | null;
   /** The stats snapshot used (player_name, level, special, skills, perks,
    *  equipped_weapon, equipped_apparel, location — display strings). */
   stats: Record<string, string | number>;

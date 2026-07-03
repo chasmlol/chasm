@@ -52,9 +52,10 @@ impl Default for AppSettings {
     }
 }
 
-/// Default hard cap on the stored persona description, in characters (a couple
-/// of compact paragraphs; the generation prompt asks for less).
-pub const PERSONA_MAX_CHARS_DEFAULT: u32 = 1_400;
+/// Default hard cap on the stored persona description, in characters. The
+/// generation prompt demands a single ~100-word paragraph (~700 chars); this
+/// is a safety net above that, not the primary length control.
+pub const PERSONA_MAX_CHARS_DEFAULT: u32 = 1400;
 
 /// Player-persona generation settings. The FNV mod uploads a stealth capture
 /// (front screenshot + stats snapshot); chasm-web's persona module turns it
@@ -1354,7 +1355,9 @@ pub fn llm_model_gguf_path(models_dir: &Path, id: &str) -> Option<std::path::Pat
     if let Ok(entries) = fs::read_dir(models_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_lowercase();
-            if name.ends_with(".gguf") && name.contains(&stem) {
+            // A vision projector (mmproj-*.gguf) can legitimately share the
+            // model's name stem — it is NOT the model.
+            if name.ends_with(".gguf") && name.contains(&stem) && !name.contains("mmproj") {
                 return Some(entry.path());
             }
         }

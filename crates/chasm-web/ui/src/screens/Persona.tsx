@@ -19,12 +19,13 @@ import {
 // Persona — the player-persona page.
 //
 // The FNV mod stealth-captures the player (front screenshot + stats snapshot)
-// whenever the build or outfit changes; the backend turns it into a compact
-// third-person description with a vision-capable LLM (stats-only fallback)
-// and injects it into NPC prompts at SillyTavern's persona slot. This page
-// shows the last capture (the actual image), the generated description, when
-// it was generated, the stats snapshot it used, and a Regenerate button (the
-// manual test hook that re-runs generation from the last capture).
+// whenever the game is saved (quicksave or manual save); the backend turns it
+// into a compact third-person description with a vision-capable LLM
+// (stats-only fallback) and injects it into NPC prompts at SillyTavern's
+// persona slot. This page shows the last capture (the actual image), the
+// generated description, when it was generated, the stats snapshot it used,
+// the exact prompt sent to the LLM, and a Regenerate button (the manual test
+// hook that re-runs generation from the last capture).
 // ===========================================================================
 
 /** Display order + labels for the stats snapshot table. */
@@ -90,10 +91,10 @@ export function Persona() {
         title="Persona"
         description={
           <>
-            Who the NPCs think they&apos;re talking to. The mod quietly
-            photographs your character and snapshots your stats when your build
-            or outfit changes; the backend writes a persona description and
-            weaves it into every NPC prompt.
+            Who the NPCs think they&apos;re talking to. Each time you save the
+            game, the mod quietly photographs your character and snapshots your
+            stats; the backend writes a persona description and weaves it into
+            every NPC prompt.
           </>
         }
         actions={
@@ -140,14 +141,14 @@ export function Persona() {
           <EmptyState
             icon={<Camera />}
             title="No capture yet"
-            description="Play with the bridge running: level up, spend skill points, pick a perk, or change your outfit. The mod will quietly capture your character and this page will fill in — no button pressing needed."
+            description="Play with the bridge running and save your game (a quicksave works). The mod will quietly capture your character on save and this page will fill in — no button pressing needed."
           />
         ) : (
           <>
             <div className="grid gap-[var(--gap,14px)] lg:grid-cols-2">
               <Section
                 title="Last capture"
-                description="The most recent stealth screenshot the mod took of your character."
+                description="The most recent face portrait the mod rendered of your character (offscreen — never visible in game)."
               >
                 {view?.has_image ? (
                   <img
@@ -248,6 +249,22 @@ export function Persona() {
                 />
               )}
             </Section>
+
+            {view?.prompt && (
+              <Section
+                title="Generation prompt"
+                description="The exact prompt sent to the LLM for the current description (with the screenshot attached when the source is vision)."
+              >
+                <details className="rounded-xl border border-[var(--border)] bg-[var(--color-ink-850)]">
+                  <summary className="cursor-pointer select-none px-3.5 py-2.5 text-[13px] font-medium text-[var(--muted-foreground)] hover:text-[var(--foreground)]">
+                    Show the prompt
+                  </summary>
+                  <pre className="overflow-x-auto whitespace-pre-wrap break-words border-t border-[var(--border)] px-3.5 py-3 text-[12.5px] leading-relaxed text-[var(--foreground)]">
+                    {view.prompt}
+                  </pre>
+                </details>
+              </Section>
+            )}
           </>
         )}
       </Stack>
