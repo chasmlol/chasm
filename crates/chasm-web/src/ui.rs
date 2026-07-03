@@ -41,6 +41,7 @@ pub(crate) mod config;
 pub(crate) mod gamestate;
 pub(crate) mod globals;
 pub(crate) mod models;
+pub(crate) mod persona;
 pub(crate) mod profiles;
 pub(crate) mod settings;
 
@@ -95,6 +96,11 @@ pub(crate) fn api_router() -> Router<Arc<AppState>> {
         // --- gamestate (latest recorded macro table + the substitution tester) -
         .route("/gamestate", get(gamestate::gamestate_view))
         .route("/gamestate/test", post(gamestate::gamestate_test))
+        // --- persona (the generated player persona: description + screenshot
+        // + stats snapshot; regenerate = the manual test hook) -----------------
+        .route("/persona", get(persona::persona_view))
+        .route("/persona/image", get(persona::persona_image))
+        .route("/persona/regenerate", post(persona::persona_regenerate))
         // --- globals (global scenario template: the production macro surface,
         // replacing the per-character card scenario; + resolved preview) ------
         .route(

@@ -49,6 +49,7 @@ mod generate;
 mod launcher;
 mod llm;
 mod orchestrator;
+mod persona;
 mod save_sync;
 mod stack_lifecycle;
 mod trace_routes;
@@ -508,6 +509,16 @@ pub fn router(config: AppConfig) -> Router {
         // is purely additive. The C++ plugin becomes its HTTP client in a later
         // stage (different repo). See [`game_bridge`].
         .route("/api/game/v1/turn", post(game_bridge::turn))
+        // Player-persona capture upload (stats snapshot + optional stealth
+        // screenshot). Stored profile-aware; generation runs on a background
+        // task and NEVER blocks a turn. See [`persona`]. The route-scoped body
+        // limit raises axum's 2 MB default so a base64 screenshot up to the
+        // handler's documented 8 MB decoded cap actually fits on the wire.
+        .route(
+            "/api/game/v1/persona",
+            post(persona::receive_capture)
+                .layer(axum::extract::DefaultBodyLimit::max(persona::MAX_BODY_BYTES)),
+        )
         // Settings → Updates: reports the running version + the latest GitHub
         // release so the UI can offer a "Download update" link. Always succeeds.
         .route("/api/app/version", get(app_version))

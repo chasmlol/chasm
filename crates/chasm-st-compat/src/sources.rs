@@ -924,6 +924,26 @@ impl LiveChatRepository {
         Ok(Some(book))
     }
 
+    /// Reads the generated player-persona description (the SillyTavern "user
+    /// persona" equivalent) from the active profile's persona store
+    /// (`headless/persona/persona.json`, written by chasm-web's persona
+    /// module). Returns `Ok(None)` when no persona has been generated yet or
+    /// the stored description is empty — prompt assembly then injects nothing,
+    /// mirroring SillyTavern's `{{#if persona}}` story-string slot.
+    pub fn read_player_persona(&self) -> Result<Option<String>> {
+        let path = self.paths().persona_dir().join("persona.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let value: Value = crate::read_json_file(&path)?;
+        Ok(value
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+            .map(str::to_string))
+    }
+
     /// Reads the headless world-state store (`headless/world-state.json`),
     /// returning an empty object when the file is absent. World-state is global
     /// (not per-profile), so it always reads from the legacy data root.

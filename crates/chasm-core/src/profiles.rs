@@ -239,6 +239,23 @@ impl ProfilePaths {
         self.resolve(&["embed-cache"], self.legacy_embed_cache_dir.clone())
     }
 
+    /// Player-persona store dir (the capture image + generated description +
+    /// stats snapshot): `profiles/<id>/headless/persona` when a profile is
+    /// active and its folder exists, else `{data_root}/headless/persona`.
+    ///
+    /// Deliberately NOT the per-subpath [`Self::resolve`] rule the read-only
+    /// content kinds use. Persona is a runtime store the backend WRITES, and
+    /// the subdir does not exist until the first capture — `resolve` would
+    /// route that first write to the legacy root even with a profile active,
+    /// and the store would stick there. It is also a brand-new store (no
+    /// pre-profile data exists in the wild), so there is no legacy content
+    /// worth falling back to. Anchoring on [`Self::content_root`] — the same
+    /// base the live-chats store and save-sync snapshots derive from — keeps
+    /// reads and writes agreeing before and after the first write.
+    pub fn persona_dir(&self) -> PathBuf {
+        self.content_root().join("headless").join("persona")
+    }
+
     /// The "content root" used by code paths that derive several sibling paths
     /// from one base (the live-chat repository, save-sync). When a profile is
     /// active *and* its folder exists, this is `profiles/<id>`; otherwise it is
@@ -311,6 +328,12 @@ mod tests {
 
         // content_root is the profile dir because profiles/<id> exists.
         assert_eq!(paths.content_root(), profiles_dir.join(id));
+        // persona_dir anchors on content_root (write-safe before the subdir
+        // exists), so it is the profile's headless/persona here.
+        assert_eq!(
+            paths.persona_dir(),
+            profiles_dir.join(id).join("headless").join("persona")
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -332,6 +355,10 @@ mod tests {
         assert_eq!(
             paths.live_chats_store(),
             data_root.join("headless").join("live-chats.json")
+        );
+        assert_eq!(
+            paths.persona_dir(),
+            data_root.join("headless").join("persona")
         );
 
         let _ = fs::remove_dir_all(&tmp);

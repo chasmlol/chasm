@@ -686,6 +686,32 @@ fn push_global_scenario(builder: &mut Builder, global_scenario: Option<&str>) {
     }
 }
 
+/// Injects the generated player-persona description (chasm-web's persona
+/// module writes it; [`LiveChatRepository::read_player_persona`] reads it) as
+/// ONE clearly-named additive component — the chasm equivalent of
+/// SillyTavern's user persona in the story string. Callers place it at ST's
+/// default slot: directly after the character scenario, before example
+/// dialogue. No persona generated yet (or empty description) → nothing is
+/// pushed, mirroring ST's `{{#if persona}}`; a read error becomes a note, not
+/// a failure.
+fn push_player_persona(builder: &mut Builder, notes: &mut Vec<String>, repo: &LiveChatRepository) {
+    match repo.read_player_persona() {
+        Ok(Some(persona)) => {
+            builder.push(
+                "system",
+                "player_persona",
+                "Player persona",
+                "system",
+                "included",
+                "",
+                format!("Player persona:\n{persona}"),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => notes.push(format!("Player persona read failed: {error}")),
+    }
+}
+
 /// Normalizes a slug-style key for native-NPC matching: lowercase, non
 /// alphanumeric collapsed to a single space (so `easy_pete` ~ `Easy Pete`),
 /// mirroring the loose `normalizeSlugKey`/`normalizeLookupKey` comparison in
@@ -1205,6 +1231,13 @@ pub fn assemble_prompt_with_retrieval_collect(
             }
         }
         push_global_scenario(&mut builder, global_scenario);
+        // SillyTavern's default story string places the user persona
+        // directly after the scenario slot (…{{scenario}} → {{persona}}),
+        // before example dialogue — match that position exactly. The slot
+        // fires whether or not scenario itself rendered (ST's template
+        // slots are independent `{{#if}}` blocks), so this is unconditional:
+        // a blank/omitted global scenario still gets the persona here.
+        push_player_persona(&mut builder, &mut notes, repo);
         if !card.example_dialogue.is_empty() {
             builder.push(
                 "system",
@@ -1227,8 +1260,19 @@ pub fn assemble_prompt_with_retrieval_collect(
             String::new(),
         );
         // The scenario is global (scene, not persona), so a card-less
-        // participant still gets it, at the same position in the order.
-        push_global_scenario(&mut builder, global_scenario);
+        // participant still gets it, at the same position in the order — but
+        // only when a live turn supplies one (`Some`). The static-panel
+        // placeholder (`None`) is skipped on this card-less path: there are no
+        // Personality/Example anchors to order it against, and the persona
+        // component below keeps its position directly after the character
+        // block (scenario → persona stays the ST story-string order whenever
+        // both render).
+        if global_scenario.is_some() {
+            push_global_scenario(&mut builder, global_scenario);
+        }
+        // The persona describes the PLAYER, so it still injects when the NPC's
+        // card did not resolve (same relative position: end of the card block).
+        push_player_persona(&mut builder, &mut notes, repo);
     }
 
     // --- Activated lore -----------------------------------------------------
@@ -2269,6 +2313,74 @@ mod tests {
         assert_eq!(placeholder.status, "generation-time");
         assert!(placeholder.content.is_empty());
         assert!(index_of(&view, "personality") < index_of(&view, "scenario"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn player_persona_injects_at_st_position_when_present() {
+        // No persona store → no component. With a persona store → ONE
+        // "player_persona" component carrying the description, placed inside
+        // the character block (ST's story-string slot). The no-card path here
+        // exercises the else-branch placement; the exact after-scenario slot
+        // is the same push, gated on key == "scenario".
+        let root = scratch_dir("persona");
+        let repo = LiveChatRepository::new(&root);
+        let speaker = participant("Sunny Smiles", None);
+
+        let view = assemble_prompt(&repo, &speaker, &[]);
+        assert!(
+            !view
+                .components
+                .iter()
+                .any(|component| component.key == "player_persona"),
+            "no persona store → no persona component"
+        );
+
+        let persona_dir = root.join("headless").join("persona");
+        std::fs::create_dir_all(&persona_dir).unwrap();
+        std::fs::write(
+            persona_dir.join("persona.json"),
+            serde_json::json!({
+                "description": "A wiry courier with sun-scarred skin.",
+                "generated_at": "2026-07-02T00:00:00Z",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let view = assemble_prompt(&repo, &speaker, &[]);
+        let persona = view
+            .components
+            .iter()
+            .find(|component| component.key == "player_persona")
+            .expect("persona component injected");
+        assert_eq!(persona.label, "Player persona");
+        assert_eq!(persona.status, "included");
+        assert!(persona
+            .content
+            .contains("A wiry courier with sun-scarred skin."));
+        // Position: directly after the character block (the no-card
+        // "Character" component here), before lore/actions/etc.
+        let character_order = view
+            .components
+            .iter()
+            .find(|component| component.key == "character")
+            .expect("character component present")
+            .order;
+        assert_eq!(persona.order, character_order + 1);
+
+        // Empty description → treated as absent (nothing injected).
+        std::fs::write(
+            persona_dir.join("persona.json"),
+            serde_json::json!({ "description": "   " }).to_string(),
+        )
+        .unwrap();
+        let view = assemble_prompt(&repo, &speaker, &[]);
+        assert!(!view
+            .components
+            .iter()
+            .any(|component| component.key == "player_persona"));
 
         std::fs::remove_dir_all(&root).ok();
     }
