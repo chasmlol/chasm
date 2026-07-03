@@ -1408,12 +1408,13 @@ fn build_managed_llamacpp_spec(
         "on".to_string(),
     ];
 
-    // Vision projector: auto-attach the projector GGUF via --mmproj.
-    if let Some(mmproj) = find_vision_projector(&config.llm_models_dir, &gguf) {
-        tracing::info!("llama-server: attaching vision projector {}", mmproj.display());
-        args.push("--mmproj".to_string());
-        args.push(mmproj.display().to_string());
-    }
+    // NO vision projector. Nothing feeds images to the LLM anymore (the persona
+    // system went data-only; koboldcpp/vision paths are retired), so attaching
+    // an --mmproj GGUF only wasted VRAM AND disabled llama.cpp's --cache-reuse
+    // (a projector forces exact-prefix-only caching). Dropping it reclaims VRAM
+    // and restores partial prefix-cache reuse. `find_vision_projector` is kept
+    // for a future re-introduction of a vision feature.
+    let _ = find_vision_projector;
 
     Some(RuntimeSpec {
         program: exe.display().to_string(),
