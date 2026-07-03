@@ -303,6 +303,8 @@ pub async fn generate_stream_core(
             let mut collected = String::new();
             let mut spoken_len: usize = 0;
             let response_format = plan.structured.then(crate::llm::structured_response_format);
+            trace_generate_stage(trace_id.as_deref(), "gen_llm_request_dispatch");
+            let mut first_token_seen = false;
             match crate::llm::chat_completion_stream(&endpoint, &plan.chat_messages, response_format.as_ref(), trace_id.as_deref(), sampling)
                 .await
             {
@@ -312,6 +314,10 @@ pub async fn generate_stream_core(
                             Ok(token) => {
                                 if token.is_empty() {
                                     continue;
+                                }
+                                if !first_token_seen {
+                                    first_token_seen = true;
+                                    trace_generate_stage(trace_id.as_deref(), "gen_llm_first_token");
                                 }
                                 collected.push_str(&token);
                                 let speech = extracted_speech(plan.structured, &collected);
@@ -1105,14 +1111,37 @@ fn build_chat_messages(
     append_player_message: bool,
     global_scenario: &str,
 ) -> Vec<Value> {
+    // Components whose content CHANGES from turn to turn (retrieval picks,
+    // book activations, live world state). They must NOT ride in the head
+    // system message: any byte changing there invalidates the LLM's cached
+    // prefix and forces re-ingestion of the entire history every turn
+    // (measured: first-token time grows 1.2s -> 2.2s over a few turns). They
+    // are injected at depth 1 instead, like the scenario below, where only the
+    // prompt tail reprocesses.
+    const VOLATILE_KEYS: [&str; 5] = [
+        "lore",
+        "chat_vectors",
+        "quest_books",
+        "action_books",
+        "world_state",
+    ];
+    let included = |component: &&chasm_core::PromptComponentView| {
+        component.group == "system"
+            && component.status == "included"
+            && !component.content.is_empty()
+    };
     let mut system_parts: Vec<String> = assembled
         .components
         .iter()
-        .filter(|component| {
-            component.group == "system"
-                && component.status == "included"
-                && !component.content.is_empty()
-        })
+        .filter(included)
+        .filter(|component| !VOLATILE_KEYS.contains(&component.key.as_str()))
+        .map(|component| component.content.clone())
+        .collect();
+    let mut volatile_parts: Vec<String> = assembled
+        .components
+        .iter()
+        .filter(included)
+        .filter(|component| VOLATILE_KEYS.contains(&component.key.as_str()))
         .map(|component| component.content.clone())
         .collect();
 
@@ -1137,7 +1166,10 @@ fn build_chat_messages(
         // as a system component; only the redundant how-to blocks were removed.
         system_parts.push(chasm_prompt::STRUCTURED_OUTPUT_INSTRUCTION.to_string());
         if has_quest_block {
-            system_parts
+            // Rides with the quest entries in the volatile block: it appears
+            // only on turns where a quest book activated, so in the head
+            // system message it would churn the cached prefix.
+            volatile_parts
                 .push(chasm_prompt::QUEST_BOOK_STRUCTURED_OUTPUT_INSTRUCTION.to_string());
         }
     }
@@ -1174,7 +1206,18 @@ fn build_chat_messages(
     // participant with their name so the model can tell who said what. Only when
     // the history actually contains 2+ distinct NPC speakers (a real group): 1-on-1
     // live chats and admin sessions are left byte-for-byte unchanged.
-    let start = history.len().saturating_sub(CONTEXT_MESSAGE_LIMIT);
+    // The window start advances in BLOCKS, not message-by-message. A start that
+    // slides 2 forward every turn changes the first history message every turn,
+    // which kills the LLM's prefix cache right after the head (measured live:
+    // prompt_ms ~1.2s, ~4900 of 5748 tokens reprocessed per turn — llama.cpp's
+    // --cache-reuse chunk shifting is disabled when --mmproj is loaded, so only
+    // the exact prefix survives). Quantized, the window holds byte-stable for
+    // WINDOW_DROP_BLOCK/2 turns (only appends), then pays one full reprocess.
+    // The window is never SMALLER than CONTEXT_MESSAGE_LIMIT — it runs up to
+    // BLOCK-1 messages larger until the next quantized drop.
+    const WINDOW_DROP_BLOCK: usize = 16;
+    let overflow = history.len().saturating_sub(CONTEXT_MESSAGE_LIMIT);
+    let start = (overflow / WINDOW_DROP_BLOCK) * WINDOW_DROP_BLOCK;
     let window = &history[start..];
     let distinct_npc_speakers = window
         .iter()
@@ -1235,6 +1278,20 @@ fn build_chat_messages(
     // The admin path doesn't persist it, so it still needs the append.
     if append_player_message && !message.is_empty() {
         messages.push(json!({ "role": "user", "content": message }));
+    }
+
+    // Volatile retrieved context (lore, past-chat memory, quest/action book
+    // activations), injected LATE at depth 1 for the same cache-preserving
+    // reason as the scenario below.
+    if !volatile_parts.is_empty() {
+        let volatile_message =
+            json!({ "role": "system", "content": volatile_parts.join("\n\n") });
+        let insert_at = if messages.len() > 1 {
+            messages.len() - 1
+        } else {
+            messages.len()
+        };
+        messages.insert(insert_at, volatile_message);
     }
 
     // GLOBAL scenario, injected LATE (ST-style in-chat injection at depth 1 -
@@ -2988,6 +3045,57 @@ mod tests {
             &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "",
         );
         assert_eq!(plain.len(), 2);
+    }
+
+    #[test]
+    fn volatile_retrieval_components_inject_at_depth_one_not_in_head() {
+        let mut assembled = chasm_core::PromptAssemblyView::default();
+        let component = |key: &str, content: &str| chasm_core::PromptComponentView {
+            order: 0,
+            group: "system".to_string(),
+            key: key.to_string(),
+            label: String::new(),
+            role: "system".to_string(),
+            status: "included".to_string(),
+            note: String::new(),
+            content: content.to_string(),
+            char_count: content.chars().count(),
+        };
+        assembled.components = vec![
+            component("character", "You are Sunny Smiles."),
+            component("lore", "Activated lore:\nGeckos roam the hills."),
+            component("chat_vectors", "Relevant past chat context:\nDoc patched you up."),
+        ];
+        let history = vec![
+            MessageView {
+                role: "player".to_string(),
+                content: "hello".to_string(),
+                ..Default::default()
+            },
+            MessageView {
+                role: "assistant".to_string(),
+                content: "hi there".to_string(),
+                ..Default::default()
+            },
+        ];
+        let messages = build_chat_messages(
+            &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "",
+        );
+        // Head system message: stable card only — retrieval picks must NOT be
+        // there or every turn's differing picks would invalidate the LLM's
+        // cached prefix and force full-history reprocessing.
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], "system");
+        let head = messages[0]["content"].as_str().unwrap();
+        assert!(head.contains("Sunny Smiles"));
+        assert!(!head.contains("Geckos"));
+        assert!(!head.contains("Doc patched"));
+        // Volatile block rides at depth 1: after history, before the newest line.
+        assert_eq!(messages[2]["role"], "system");
+        let volatile = messages[2]["content"].as_str().unwrap();
+        assert!(volatile.contains("Geckos roam the hills."));
+        assert!(volatile.contains("Doc patched you up."));
+        assert_eq!(messages[3]["content"], "hi there");
     }
 
     #[test]

@@ -639,20 +639,23 @@ pub fn search_with_query_vec(
     //     irrelevant, positive for relevant) -> sigmoid gives clean 0..1
     //     separation (irrelevant ~0.0, relevant ~0.8+).
     //   * Cosine fallback (reranker disabled): scores are ALREADY cosine
-    //     similarities, and BGE cosines have a high baseline — measured on real
-    //     game data (prefixed queries): unrelated text sits ~0.30-0.50 while
-    //     genuinely relevant passages sit ~0.55-0.80. Passing that through raw
-    //     made min_score=0.2 a no-op (everything kept, every book dumped its
-    //     full top-K). Linearly remap that observed band so 0.35 cosine -> 0.0
-    //     and 0.85 cosine -> 1.0: the default min_score 0.2 then corresponds to
-    //     ~0.45 cosine, which is where junk and signal actually separate.
+    //     similarities, and BGE cosines have a high baseline. Measured on real
+    //     game data (prefixed queries): clearly IRRELEVANT entries (world lore
+    //     for "How's it going?", idle gestures for unrelated questions) sit at
+    //     cosine ~0.45-0.52, while genuinely relevant passages (the Doc
+    //     Mitchell answer for the doctor question, Powder Gangers for the
+    //     convicts question) sit ~0.55-0.80 — a real gap around ~0.52. Remap
+    //     0.45 -> 0.0 and 0.80 -> 1.0 so the default min_score 0.2 lands at
+    //     ~0.52 cosine, INSIDE that gap: junk cut, real hits kept. (An earlier
+    //     0.35..0.85 remap put min_score 0.2 at 0.45 cosine — below the junk
+    //     band, so smalltalk turns still injected world lore + gesture spam.)
     // Without this split, the no-reranker path silently over-injects everything.
     let has_reranker = retriever.has_reranker();
     let normalize = |x: f32| {
         if has_reranker {
             1.0 / (1.0 + (-x).exp())
         } else {
-            ((x - 0.35) / 0.5).clamp(0.0, 1.0)
+            ((x - 0.45) / 0.35).clamp(0.0, 1.0)
         }
     };
     let mut reranked: Vec<(String, f32)> = scored

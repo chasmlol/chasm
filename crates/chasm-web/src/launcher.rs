@@ -1441,6 +1441,10 @@ fn build_managed_llamacpp_spec(
         "0".to_string(),
         // Use the GGUF's own chat template.
         "--jinja".to_string(),
+        // Explicit flash attention: measured ~8% generation speedup on the
+        // 5090 vs leaving it to auto.
+        "-fa".to_string(),
+        "on".to_string(),
     ];
 
     // Vision projector: same auto-attach as the koboldcpp spec (llama-server

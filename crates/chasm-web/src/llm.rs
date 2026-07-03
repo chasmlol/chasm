@@ -12,19 +12,45 @@ use tokio::sync::mpsc;
 
 /// First model id advertised by `{endpoint}/v1/models`, when reachable. The
 /// helper resolves the loaded model the same way before generating.
+/// Shared HTTP client: one connection pool for every LLM call. A fresh
+/// `Client::new()` per turn threw away the pooled localhost connection, adding
+/// a TCP handshake to the hot path.
+pub(crate) fn http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
 async fn first_model_id(client: &reqwest::Client, endpoint: &str) -> Option<String> {
+    // The loaded model only changes when the managed runtime restarts (which
+    // changes nothing about the id llama.cpp reports for the same GGUF, and a
+    // model SWAP goes through settings + full restart anyway). Cache per
+    // endpoint: this lookup used to be an extra HTTP round-trip on EVERY turn
+    // before the completion request could even be sent.
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some(hit) = map.get(endpoint) {
+            return Some(hit.clone());
+        }
+    }
     let url = format!("{endpoint}/v1/models");
     let response = client.get(url).send().await.ok()?;
     if !response.status().is_success() {
         return None;
     }
     let body: Value = response.json().await.ok()?;
-    body.get("data")
+    let id = body
+        .get("data")
         .and_then(Value::as_array)
         .and_then(|items| items.first())
         .and_then(|item| item.get("id"))
         .and_then(Value::as_str)
-        .map(str::to_string)
+        .map(str::to_string)?;
+    if let Ok(mut map) = cache.lock() {
+        map.insert(endpoint.to_string(), id.clone());
+    }
+    Some(id)
 }
 
 /// The structured-output JSON schema (verbatim shape of SillyTavern's
@@ -205,7 +231,7 @@ pub async fn chat_completion_stream(
     trace_id: Option<&str>,
     sampling: Sampling,
 ) -> Result<mpsc::Receiver<Result<String, String>>, String> {
-    let client = reqwest::Client::new();
+    let client = http_client().clone();
     let model = first_model_id(&client, endpoint).await;
     let url = format!("{endpoint}/v1/chat/completions");
     let mut body =
@@ -213,6 +239,18 @@ pub async fn chat_completion_stream(
     // Ask llama.cpp to include the final `usage`/`timings` chunk in the stream so
     // we can capture tokens/sec without a second request.
     body["stream_options"] = json!({ "include_usage": true });
+    // Env-gated (CHASM_LLM_DUMP=1) dump of the EXACT request body, for offline
+    // replay when hunting prompt-cache misses / latency.
+    if std::env::var_os("CHASM_LLM_DUMP").is_some() {
+        if let Some(dir) = std::env::var_os("TEMP") {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let path = std::path::Path::new(&dir).join(format!("chasm-llm-body-{stamp}.json"));
+            let _ = std::fs::write(path, serde_json::to_vec_pretty(&body).unwrap_or_default());
+        }
+    }
     let response = client
         .post(&url)
         .json(&body)
@@ -291,7 +329,7 @@ pub async fn chat_completion_capturing_sampled(
     response_format: Option<&Value>,
     sampling: Sampling,
 ) -> Result<(String, Option<chasm_core::LlmMetrics>), String> {
-    let client = reqwest::Client::new();
+    let client = http_client().clone();
     let model = first_model_id(&client, endpoint).await;
     let url = format!("{endpoint}/v1/chat/completions");
     let response = client
@@ -356,7 +394,7 @@ pub async fn warmup_completion(
     messages: &[Value],
     timeout: std::time::Duration,
 ) -> Result<Option<chasm_core::LlmMetrics>, String> {
-    let client = reqwest::Client::new();
+    let client = http_client().clone();
     let model = first_model_id(&client, endpoint).await;
     let url = format!("{endpoint}/v1/chat/completions");
     let response = client

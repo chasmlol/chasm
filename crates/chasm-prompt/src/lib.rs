@@ -1727,11 +1727,19 @@ pub fn assemble_prompt_with_retrieval_collect(
                 })
                 .map(|(index, entry)| (index.to_string(), action_vector_text(entry))),
         );
+        // The vector merge is capped WELL below ACTION_LIMIT: it exists to
+        // catch indirect phrasing the keyword path missed, and the cross-
+        // encoder kept 0-3 such entries per turn on real data. The cosine
+        // path passes far more borderline gestures (measured ~6.7KB of action
+        // entries per turn), which both bloats the per-turn reprocessed tail
+        // and buries the genuinely apt actions. Keyword/constant activations
+        // are untouched — they still fill up to ACTION_LIMIT.
+        const ACTION_VECTOR_LIMIT: usize = 4;
         for id in retrieve_ids(
             ctx,
             &action_activation,
             &candidates,
-            ACTION_LIMIT,
+            ACTION_VECTOR_LIMIT,
             ctx.action_min_score,
         ) {
             if let Ok(index) = id.parse::<usize>() {

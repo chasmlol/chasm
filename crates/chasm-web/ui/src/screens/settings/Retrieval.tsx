@@ -40,6 +40,49 @@ function toCard(dto: ModelDto): ModelCard {
   };
 }
 
+function SliderRow({
+  label,
+  help,
+  value,
+  onChange,
+}: {
+  label: string;
+  help?: string;
+  value: number;
+  onChange: (v: number) => void;
+}) {
+  const v = Number.isFinite(value) ? value : 0;
+  return (
+    <FormRow
+      label={label}
+      help={help}
+      control={
+        <span className="flex w-56 items-center gap-3">
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.01}
+            value={v}
+            onChange={(e) => onChange(Number(e.target.value))}
+            className="h-1.5 flex-1 cursor-pointer appearance-none rounded-full bg-[var(--color-ink-700)] accent-[var(--color-accent)]"
+            aria-label={label}
+          />
+          <Field
+            type="number"
+            className="w-[4.5rem] text-right"
+            value={v}
+            step={0.01}
+            min={0}
+            max={1}
+            onChange={(e) => onChange(Number(e.target.value))}
+          />
+        </span>
+      }
+    />
+  );
+}
+
 function NumberRow({
   label,
   help,
@@ -160,6 +203,34 @@ export function Retrieval() {
         onDownload={(id) => download.mutate(id)}
       />
 
+      {form && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Cutoff</CardTitle>
+            <CardDescription>
+              How closely an entry must match the player&apos;s words before
+              it&apos;s injected into the prompt. Higher = stricter (less junk,
+              but loose phrasings may stop matching). Applies on the next turn —
+              no restart needed.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-5">
+            <SliderRow
+              label="Lore, quest & memory cutoff"
+              help="Semantic hits below this score are dropped."
+              value={form.min_score}
+              onChange={(v) => set("min_score", v)}
+            />
+            <SliderRow
+              label="Action cutoff"
+              help="Separate floor for vector-matched actions (terse commands score lower)."
+              value={form.action_min_score}
+              onChange={(v) => set("action_min_score", v)}
+            />
+          </CardContent>
+        </Card>
+      )}
+
       <ModelPicker
         title="Reranker"
         description="Re-scores the top candidates for better precision. Download one, then enable it and pick its tier below."
@@ -275,24 +346,6 @@ export function Retrieval() {
                 step={1}
                 min={1}
                 max={500}
-              />
-              <NumberRow
-                label="Min score"
-                help="Minimum score for a lore / quest / chat-memory hit (0–1)."
-                value={form.min_score}
-                onChange={(v) => set("min_score", v)}
-                step={0.01}
-                min={0}
-                max={1}
-              />
-              <NumberRow
-                label="Action min score"
-                help="Separate, lower floor for action hits (terse commands score lower)."
-                value={form.action_min_score}
-                onChange={(v) => set("action_min_score", v)}
-                step={0.01}
-                min={0}
-                max={1}
               />
               <NumberRow
                 label="Chat-memory limit"
