@@ -56,6 +56,14 @@ const ENGINES: EngineSpec[] = [
     blurb:
       "The managed local text-to-speech engine. Synthesizes NPC voices and streams the audio to the game.",
   },
+  {
+    key: "acestep",
+    title: "ACE-Step music engine",
+    domain: "music",
+    id: "acestep",
+    blurb:
+      "The managed local music-generation engine (ACE-Step, DiT mode) on its own port (:5004). Powers the play-a-song action — an NPC writes and performs a song. Large install (~10 GB); loads lazily and frees VRAM when idle.",
+  },
 ];
 
 function statusFor(installed: boolean, installing: boolean): {

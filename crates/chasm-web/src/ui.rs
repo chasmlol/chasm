@@ -83,6 +83,7 @@ pub(crate) fn api_router() -> Router<Arc<AppState>> {
         // GET `/settings/<any>` (interface included) all hit the read handler.
         .route("/settings/:category", get(settings::get_settings))
         .route("/settings/interface/save", post(settings::save_interface))
+        .route("/settings/music/save", post(settings::save_music))
         // --- books (Characters / Lore / Quest / Action; STUB) ----------------
         .route("/books/:kind", get(books::list_book))
         .route("/books/:kind/:id", post(books::save_book))

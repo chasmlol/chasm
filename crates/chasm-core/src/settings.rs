@@ -28,6 +28,8 @@ pub struct AppSettings {
     pub llm: LlmSettings,
     pub tts: TtsSettings,
     pub stt: SttSettings,
+    /// Music generation (the Music settings page + the "play a song" NPC action).
+    pub music: MusicSettings,
     pub retrieval: RetrievalSettings,
     /// Managed local-runtime selection (the Runtimes settings page). Serde
     /// default so older settings files keep loading (empty → the managed
@@ -62,6 +64,7 @@ impl Default for AppSettings {
             llm: LlmSettings::default(),
             tts: TtsSettings::default(),
             stt: SttSettings::default(),
+            music: MusicSettings::default(),
             retrieval: RetrievalSettings::default(),
             runtime: RuntimeSettings::default(),
             launcher: LauncherSettings::default(),
@@ -629,6 +632,125 @@ impl Default for TtsSettings {
             default_voice: String::new(),
             audio_tags: AudioTagsSettings::default(),
             tuning: TtsTuningSettings::default(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Music generation reference data (ACE-Step, DiT mode only)
+// ---------------------------------------------------------------------------
+
+/// The engine id of the ACE-Step music server's managed venv under
+/// `engines/<id>` (mirrors [`PARAKEET_ENGINE_ID`] / the TTS engines'
+/// `engines/faster-qwen3-tts`). ACE-Step is the only music engine for now.
+pub const ACESTEP_ENGINE_ID: &str = "acestep";
+
+/// The GitHub repo + pinned tag the install script clones ACE-Step 1.5 from.
+/// Pinned for reproducibility. ACE-Step ships as a git checkout (uv/pyproject),
+/// not a PyPI package, so the venv installs the checkout's deps (torch 2.7.1+cu128
+/// on win32 → Blackwell/sm_120 ready).
+pub const ACESTEP_GIT_REPO: &str = "https://github.com/ace-step/ACE-Step-1.5.git";
+pub const ACESTEP_GIT_TAG: &str = "v0.1.8";
+
+/// The HuggingFace weights bundle the install prefetches (DiT turbo + VAE + text
+/// encoder + the 5Hz LM). DiT-only generation never loads the LM, but the bundle
+/// download is a single snapshot (matches the qwen3-tts prefetch shape).
+pub const ACESTEP_MODEL_REPO: &str = "ACE-Step/Ace-Step1.5";
+
+/// The DiT checkpoint config ACE-Step's `initialize_service(config_path=…)` loads.
+/// `acestep-v15-turbo` is the distilled 8-step DiT — the fast default and the only
+/// pipeline mode exposed (DiT mode only, no LM/thinking).
+pub const ACESTEP_DIT_CONFIG: &str = "acestep-v15-turbo";
+
+/// The single music engine option offered in the Music settings picker (id, label).
+pub const MUSIC_ENGINES: &[(&str, &str)] = &[("acestep", "ACE-Step (DiT)")];
+
+/// The action id of the "play a song (guitar)" action. Shipped in the FNV action
+/// book (mod side) and matched here to trigger the async song job when the model
+/// chooses it during a turn. Keep in sync with the action book entry's `actionId`.
+pub const PLAY_SONG_ACTION_ID: &str = "npc.play_song_guitar";
+
+/// The action id of the "rap" variant — same song pipeline, but the lyrics/style
+/// lean hip-hop and the in-game performance uses a vocal (mic) idle instead of the
+/// guitar. Keep in sync with the action book entry's `actionId`.
+pub const PLAY_RAP_ACTION_ID: &str = "npc.play_song_rap";
+
+/// The base style tags for the rap action (the folk/acoustic default would fight a
+/// rap, so the rap variant swaps in a hip-hop base). The LLM appends the character's
+/// vocal descriptors + per-song flavour on top.
+pub const MUSIC_RAP_STYLE_TAGS: &str = "hip hop, rap, boom bap beat, rhythmic vocals";
+
+/// Default base style tags for generated songs — merged ahead of any per-song tags
+/// the character/model adds. Comma-separated genre/instrument/mood descriptors, the
+/// format ACE-Step's `caption` field expects. Deliberately carries NO vocal/gender
+/// terms: the singing VOICE is described per-character by the song prompt (so Sunny
+/// sings as a woman and Pete as a gruff old man), not hard-coded here.
+pub const MUSIC_STYLE_TAGS_DEFAULT: &str =
+    "acoustic guitar, folk, campfire, warm";
+
+/// Max song length (seconds) clamp. ACE-Step accepts 10–600s; we cap the UI/default
+/// well under that so a shared-GPU generation stays quick and the WAV stays small.
+pub const MUSIC_MAX_SECONDS_MIN: u32 = 20;
+pub const MUSIC_MAX_SECONDS_MAX: u32 = 180;
+pub const MUSIC_MAX_SECONDS_DEFAULT: u32 = 75;
+
+/// Clamps a requested max song length to the documented range.
+pub fn normalize_music_max_seconds(value: u32) -> u32 {
+    value.clamp(MUSIC_MAX_SECONDS_MIN, MUSIC_MAX_SECONDS_MAX)
+}
+
+/// Normalizes a saved/posted music engine id to a known value. Empty/unknown ⇒
+/// `""` (none selected), mirroring [`normalize_local_engine`]. There is exactly
+/// one engine for now (ACE-Step), but the picker shape matches TTS/STT so adding
+/// more later is uniform.
+pub fn normalize_music_engine(engine: &str) -> String {
+    let candidate = engine.trim();
+    if MUSIC_ENGINES.iter().any(|(value, _)| *value == candidate) {
+        candidate.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Music-generation settings (the Music settings page). Powers the "play a song"
+/// NPC action: an in-character song is written by the LLM and performed in-game via
+/// the local ACE-Step engine. `#[serde(default)]` so older settings files (no
+/// `music` key) load fine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MusicSettings {
+    /// Master switch. When off, the "play a song" action is not offered/executed and
+    /// no music engine is started.
+    pub enabled: bool,
+    /// Selected music engine id. Only `"acestep"` for now; empty = none selected
+    /// (normalized via [`normalize_music_engine`]).
+    pub engine: String,
+    /// Base style tags merged into every song's ACE-Step `caption` (comma-separated
+    /// genre/instrument/mood descriptors). Per-song tags from the character/model are
+    /// appended after these.
+    pub style_tags: String,
+    /// Max generated song length in seconds. Bounds both the lyrics length hint and
+    /// the ACE-Step `duration`. Clamped via [`normalize_music_max_seconds`].
+    pub max_seconds: u32,
+    /// When on, the performing NPC's own voice clip (`voices/<name>/reference.wav`,
+    /// the same clip TTS uses) is passed to ACE-Step as a style/timbre reference, so
+    /// the song leans toward how that character sounds. Falls back gracefully to no
+    /// reference when the clip is missing.
+    pub match_npc_voice: bool,
+}
+
+impl Default for MusicSettings {
+    fn default() -> Self {
+        Self {
+            // Off by default: the engine is a multi-GB install the user opts into
+            // from Settings → Runtimes, like the other managed engines.
+            enabled: false,
+            // No default engine until installed/selected (parity with TTS/STT).
+            engine: String::new(),
+            style_tags: MUSIC_STYLE_TAGS_DEFAULT.to_string(),
+            max_seconds: MUSIC_MAX_SECONDS_DEFAULT,
+            // On by default — each NPC sings in a voice guided by their own clip.
+            match_npc_voice: true,
         }
     }
 }
@@ -2536,6 +2658,7 @@ pub const SETTINGS_NAV: &[(&str, &str)] = &[
     ("llm", "LLM"),
     ("tts", "TTS"),
     ("stt", "STT"),
+    ("music", "Music"),
     ("retrieval", "Retrieval"),
     ("game", "Bridge"),
     ("tracing", "Tracing"),
@@ -2546,7 +2669,7 @@ pub const SETTINGS_NAV: &[(&str, &str)] = &[
 pub const SETTINGS_NAV_GROUPS: &[(&str, &[&str])] = &[
     ("Appearance", &["interface"]),
     ("Content", &["profiles"]),
-    ("AI", &["llm", "tts", "stt", "retrieval"]),
+    ("AI", &["llm", "tts", "stt", "music", "retrieval"]),
     ("System", &["game", "tracing"]),
 ];
 

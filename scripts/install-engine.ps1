@@ -159,6 +159,42 @@ try {
                 if ($LASTEXITCODE -ne 0) { Log "[warn] torchaudio $tag reinstall failed; resampling may fall back to CPU torch import errors" }
             }
         }
+        'acestep' {
+            # ACE-Step 1.5 music generation (DiT mode). Unlike the pip-package
+            # engines, ACE-Step ships as a git checkout with a uv/pyproject lock
+            # (its torch is pinned to 2.7.1+cu128 on Windows from the pytorch-cu128
+            # index — Blackwell/sm_120 ready, so NO Install-TorchCuda swap here; the
+            # pinned build is correct and swapping it would break torchcodec/torchao
+            # version matching). We clone the pinned tag and `uv sync` its locked
+            # deps INTO our engine venv (UV_PROJECT_ENVIRONMENT), which is how
+            # upstream installs. fastapi/uvicorn (the server deps) are already in
+            # ACE-Step's dependencies.
+            $repo = 'https://github.com/ace-step/ACE-Step-1.5.git'
+            $tag = 'v0.1.8'
+            $clone = Join-Path $dir 'ACE-Step-1.5'
+            if (-not (Test-Path (Join-Path $clone '.git'))) {
+                Remove-Item $clone -Recurse -Force -ErrorAction SilentlyContinue
+                Log "[acestep] cloning $repo @ $tag"
+                & git clone --depth 1 --branch $tag $repo $clone *>> $log
+                if ($LASTEXITCODE -ne 0) { throw "git clone ACE-Step ($tag) failed (exit $LASTEXITCODE); is git on PATH?" }
+            } else {
+                Log "[acestep] reusing existing checkout at $clone"
+            }
+            # uv sync manages the venv at UV_PROJECT_ENVIRONMENT — point it at the
+            # venv this script already created so $py stays consistent with the
+            # other engines. --no-dev skips the (empty) dev group.
+            $env:UV_PROJECT_ENVIRONMENT = $venv
+            Push-Location $clone
+            & $script:uv sync --no-dev *>> $log
+            $syncExit = $LASTEXITCODE
+            Pop-Location
+            if ($syncExit -ne 0) { throw "uv sync ACE-Step failed (exit $syncExit)" }
+            # Verify the pinned CUDA torch actually runs a kernel on this GPU
+            # (Blackwell reports is_available()=True even with a bad wheel).
+            if (-not (Test-TorchGpu $py)) {
+                Log "[acestep][warn] pinned torch failed a real GPU op; music gen may fall back to CPU (slow). Check CUDA 12.8+ driver for Blackwell."
+            }
+        }
         default { throw "unknown engine: $Engine" }
     }
 
@@ -193,6 +229,20 @@ try {
             Log "[model] prefetch nvidia/parakeet-tdt-0.6b-v3 (.nemo)"
             & $py -c "from huggingface_hub import hf_hub_download; hf_hub_download('nvidia/parakeet-tdt-0.6b-v3', 'parakeet-tdt-0.6b-v3.nemo')" *>> $log
             if ($LASTEXITCODE -ne 0) { throw "model prefetch failed for Parakeet (exit $LASTEXITCODE)" }
+        }
+        'acestep' {
+            # ACE-Step's own downloader fetches the full Ace-Step1.5 bundle (DiT
+            # turbo + VAE + text encoder + the 5Hz LM) into our managed weights dir
+            # (ACESTEP_CHECKPOINTS_DIR), so "installed" means the DiT mode is ready
+            # to generate offline. DiT-only never loads the bundled LM into VRAM;
+            # it's just resident on disk. The `acestep` package is importable
+            # because `uv sync` installed the checkout (editable root package).
+            $ckpt = Join-Path $dir 'checkpoints'
+            New-Item -ItemType Directory -Force -Path $ckpt | Out-Null
+            $env:ACESTEP_CHECKPOINTS_DIR = $ckpt
+            Log "[model] prefetch ACE-Step/Ace-Step1.5 bundle -> $ckpt"
+            & $py -c "import os; from acestep.model_downloader import download_main_model; ok,msg=download_main_model(checkpoints_dir=os.environ['ACESTEP_CHECKPOINTS_DIR']); print(msg); raise SystemExit(0 if ok else 1)" *>> $log
+            if ($LASTEXITCODE -ne 0) { throw "model prefetch failed for ACE-Step (exit $LASTEXITCODE)" }
         }
     }
 

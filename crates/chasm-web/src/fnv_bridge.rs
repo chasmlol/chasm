@@ -63,6 +63,10 @@ pub async fn spawn_in_process(state: Arc<AppState>) {
     // resolves instead of failing with "no mapped NPC".
     enrich_config_from_profile(&mut config, &state);
 
+    // Music generation is in-process only; surface the live setting to the bridge
+    // loop so the play-a-song action only starts a job when the user enabled it.
+    config.music_enabled = settings.music.enabled;
+
     // Ensure every rendezvous root exists before the loop attaches its file watcher,
     // so the plugin's heartbeat/request writes land where chasm reads them. Both
     // sides compute this same absolute path (%LOCALAPPDATA%\chasm\bridge by default).
@@ -224,6 +228,12 @@ impl ChasmClient for InProcessChasmClient {
                 yield serde_json::from_str::<Value>(trimmed)?;
             }
         })
+    }
+
+    fn start_song_job(&self, job: chasm_fnv_bridge::chasm::SongJob) {
+        // Fire-and-forget: spawn the lyrics -> ACE-Step -> store -> deliver pipeline
+        // so the turn is never blocked. Failures are logged inside the job.
+        crate::music::spawn_song_job(self.state.clone(), job);
     }
 
     async fn synthesize_stream(

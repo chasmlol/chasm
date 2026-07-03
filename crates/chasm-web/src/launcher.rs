@@ -672,6 +672,175 @@ pub(crate) fn apply_selected_tts_engine(state: &Arc<AppState>) {
 }
 
 // ---------------------------------------------------------------------------
+// ACE-Step music engine (dedicated DiT-mode song server on its own port)
+// ---------------------------------------------------------------------------
+
+/// Default ACE-Step music server authority. Its own port (5004) so a multi-second
+/// song render never blocks the LLM (5001) / TTS (5002) / STT (5003).
+const DEFAULT_MUSIC_ADDR: &str = "127.0.0.1:5004";
+
+/// The music server's reachability authority (`host:port`), from the default
+/// endpoint (or `CHASM_ACESTEP_ENDPOINT`).
+fn music_addr() -> String {
+    std::env::var("CHASM_ACESTEP_ENDPOINT")
+        .ok()
+        .as_deref()
+        .and_then(authority_from_url)
+        .unwrap_or_else(|| DEFAULT_MUSIC_ADDR.to_string())
+}
+
+/// Whether the ACE-Step music engine is installed: the managed
+/// `engines/acestep` venv python, the server script, and the cloned ACE-Step
+/// checkout (its code + config) all exist. Cheap fs checks, safe per request.
+pub(crate) fn acestep_installed(config: &chasm_core::AppConfig) -> bool {
+    let dir = config.engines_dir.join(chasm_core::ACESTEP_ENGINE_ID);
+    let python = dir.join(".venv").join("Scripts").join("python.exe");
+    let script = config
+        .workspace_root
+        .join("scripts")
+        .join("acestep_music_server.py");
+    let checkout = dir.join("ACE-Step-1.5");
+    python.exists() && script.exists() && checkout.exists()
+}
+
+/// Whether the ACE-Step music server is reachable right now (for status pills).
+pub(crate) fn acestep_running(_state: &Arc<AppState>) -> bool {
+    tcp_reachable(&music_addr())
+}
+
+/// Builds the ACE-Step music server [`RuntimeSpec`]: the `engines/acestep` venv
+/// python running `scripts/acestep_music_server.py` on the music port, with the
+/// ACE-Step checkout as the project root and the managed weights dir exported.
+/// Mirrors [`build_parakeet_spec`]. Returns `None` when the venv/script/checkout
+/// is missing (engine not installed).
+fn build_acestep_spec(state: &Arc<AppState>, port: u16) -> Option<RuntimeSpec> {
+    let dir = state.config.engines_dir.join(chasm_core::ACESTEP_ENGINE_ID);
+    let python = dir.join(".venv").join("Scripts").join("python.exe");
+    if !python.exists() {
+        return None;
+    }
+    let script = state
+        .config
+        .workspace_root
+        .join("scripts")
+        .join("acestep_music_server.py");
+    if !script.exists() {
+        return None;
+    }
+    let checkout = dir.join("ACE-Step-1.5");
+    if !checkout.exists() {
+        return None;
+    }
+    let checkpoints = dir.join("checkpoints");
+    Some(RuntimeSpec {
+        program: python.display().to_string(),
+        args: vec![
+            script.display().to_string(),
+            "--host".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            port.to_string(),
+            "--project-root".to_string(),
+            checkout.display().to_string(),
+            "--config-path".to_string(),
+            chasm_core::ACESTEP_DIT_CONFIG.to_string(),
+            // Pre-load the model in the background at startup so the FIRST in-game
+            // song doesn't wait ~12s for the DiT to load.
+            "--warmup".to_string(),
+            // Keep it warm across a play session's gaps (20 min) before the idle
+            // reaper frees the VRAM — so most songs skip the reload, but an idle
+            // engine still releases the GPU eventually (shared with the game/LLM/TTS).
+            "--idle-timeout".to_string(),
+            "1200".to_string(),
+        ],
+        cwd: Some(state.config.workspace_root.display().to_string()),
+        // The server reads these too (env or flags); set them so the checkpoints
+        // resolve to the managed dir regardless of cwd. HF_HOME is inherited.
+        env: vec![
+            (
+                "ACESTEP_PROJECT_ROOT".to_string(),
+                checkout.display().to_string(),
+            ),
+            (
+                "ACESTEP_CHECKPOINTS_DIR".to_string(),
+                checkpoints.display().to_string(),
+            ),
+        ],
+    })
+}
+
+/// Kills every running ACE-Step music server by command-line match (mirrors
+/// [`kill_parakeet_servers`]), so disabling music / stopping the stack fully
+/// unloads its model from VRAM. Best-effort; a no-op when nothing matches.
+#[cfg(windows)]
+fn kill_acestep_servers() {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" | \
+             Where-Object { $_.CommandLine -like '*acestep_music_server.py*' } | \
+             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+#[cfg(not(windows))]
+fn kill_acestep_servers() {}
+
+/// Whether the ACE-Step music server should be running: music generation is
+/// enabled AND an engine is selected AND it's installed. The only music engine is
+/// ACE-Step, so a non-empty normalized engine id + installed is sufficient.
+pub(crate) fn music_enabled_and_installed(
+    settings: &AppSettings,
+    config: &chasm_core::AppConfig,
+) -> bool {
+    settings.music.enabled
+        && !chasm_core::normalize_music_engine(&settings.music.engine).is_empty()
+        && acestep_installed(config)
+}
+
+/// Starts the ACE-Step music server if music is enabled + installed and it isn't
+/// already up. Best-effort + blocking; called from the stack start and on a Music
+/// settings save. The server loads its model lazily (on first song), so spawning
+/// it is cheap and holds no VRAM until a song is actually requested.
+pub(crate) fn start_music_engine(state: &Arc<AppState>) {
+    let settings = AppSettings::load(&state.config.settings_path);
+    if !settings.music.enabled {
+        return;
+    }
+    let addr = music_addr();
+    if tcp_reachable(&addr) {
+        tracing::debug!("music: ACE-Step already up on {addr}; not spawning");
+        return;
+    }
+    match build_acestep_spec(state, port_from_addr(&addr)) {
+        Some(spec) => match spawn_runtime(&spec) {
+            Ok(()) => tracing::info!("music: spawned ACE-Step server on {addr} (lazy model load)"),
+            Err(error) => tracing::warn!("music: could not spawn ACE-Step server: {error}"),
+        },
+        None => tracing::info!(
+            "music enabled but the ACE-Step engine is not installed (Settings -> Runtimes); \
+             the play-a-song action will error until it is"
+        ),
+    }
+}
+
+/// Stops the ACE-Step music server (kills it + frees its port), so disabling music
+/// or tearing down the stack frees its VRAM. Best-effort + blocking.
+pub(crate) fn stop_music_engine(_state: &Arc<AppState>) {
+    kill_acestep_servers();
+    let addr = music_addr();
+    if tcp_reachable(&addr) {
+        crate::kill_process_on_port(port_from_addr(&addr));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Connection-driven AI stack lifecycle (start the whole stack when the game
 // connects, tear it down when it leaves). See [`crate::stack_lifecycle`].
 // ---------------------------------------------------------------------------
@@ -777,6 +946,26 @@ pub(crate) fn start_ai_stack(state: &Arc<AppState>) {
     } else {
         tracing::info!("AI stack: STT provider is {stt_provider} API; not starting local Parakeet");
     }
+
+    // --- Music (ACE-Step) — only when enabled + installed. Spawned lazily-loading:
+    // the server process comes up but holds no VRAM until a song is requested, so
+    // starting it with the stack is cheap and the play-a-song action is ready. ---
+    if settings.music.enabled {
+        let music_addr_s = music_addr();
+        if tcp_reachable(&music_addr_s) {
+            tracing::debug!("AI stack: music engine already up on {music_addr_s}; not spawning");
+        } else if let Some(spec) = build_acestep_spec(state, port_from_addr(&music_addr_s)) {
+            match spawn_runtime(&spec) {
+                Ok(()) => tracing::info!("AI stack: spawned ACE-Step music server on {music_addr_s}"),
+                Err(error) => tracing::warn!("AI stack: could not spawn ACE-Step music server: {error}"),
+            }
+        } else {
+            tracing::info!(
+                "AI stack: music enabled but the ACE-Step engine is not installed \
+                 (Settings -> Runtimes); play-a-song will error until it is"
+            );
+        }
+    }
 }
 
 /// Tears the FULL AI stack down: kills the llama.cpp LLM server, the Parakeet STT
@@ -813,7 +1002,15 @@ pub(crate) fn stop_ai_stack(state: &Arc<AppState>) {
     if tcp_reachable(&stt_addr) {
         crate::kill_process_on_port(port_from_addr(&stt_addr));
     }
-    tracing::info!("AI stack: stopped (LLM runtime + TTS + Parakeet killed)");
+
+    // Music (ACE-Step): by server command-line match, then free its port.
+    kill_acestep_servers();
+    let music_addr_s = music_addr();
+    if tcp_reachable(&music_addr_s) {
+        crate::kill_process_on_port(port_from_addr(&music_addr_s));
+    }
+
+    tracing::info!("AI stack: stopped (LLM runtime + TTS + Parakeet + music killed)");
 }
 
 /// Stringifies a JSON arg value: strings verbatim, numbers/bools via `to_string`,

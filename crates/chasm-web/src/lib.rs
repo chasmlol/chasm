@@ -48,6 +48,7 @@ mod generate;
 mod launcher;
 mod llm;
 mod llm_api;
+mod music;
 mod orchestrator;
 mod persona;
 mod save_sync;
@@ -2060,6 +2061,34 @@ pub(crate) fn parakeet_engine_status(state: &AppState) -> String {
     .to_string()
 }
 
+/// Install status of the ACE-Step music engine's `engines/acestep` dir, using the
+/// same markers [`parakeet_engine_status`] reads (`.installing` / `.failed` /
+/// `.installed`, stalled-marker backstop included). The `.installed` marker is only
+/// trusted when the venv + checkout actually resolve (belt and suspenders). Note the
+/// ACE-Step install is heavier (git clone + uv sync + multi-GB weights), so the
+/// stalled-marker backstop's generous window matters here.
+pub(crate) fn acestep_engine_status(state: &AppState) -> String {
+    let dir = state
+        .config
+        .engines_dir
+        .join(chasm_core::ACESTEP_ENGINE_ID);
+    flip_marker_if_stale(
+        &dir.join(".installing"),
+        &dir.join(".failed"),
+        &[dir.join("install.log")],
+    );
+    if dir.join(".installing").exists() {
+        "installing"
+    } else if dir.join(".failed").exists() {
+        "failed"
+    } else if launcher::acestep_installed(&state.config) {
+        "installed"
+    } else {
+        "not_installed"
+    }
+    .to_string()
+}
+
 /// Kicks off a local-engine install: writes an `.installing` marker and spawns
 /// the detached install script (which writes `.installed`/`.failed` on finish).
 /// Returns `false` for an unknown engine; a no-op (already installed/installing)
@@ -2070,7 +2099,8 @@ pub(crate) fn start_engine_install(state: &AppState, id: &str) -> std::io::Resul
     let known = TTS_LOCAL_ENGINES
         .iter()
         .any(|(engine_id, _)| engine_id == &id)
-        || id == chasm_core::PARAKEET_ENGINE_ID;
+        || id == chasm_core::PARAKEET_ENGINE_ID
+        || id == chasm_core::ACESTEP_ENGINE_ID;
     if !known {
         return Ok(false);
     }
@@ -3004,6 +3034,10 @@ struct StackStatusResponse {
     llm: &'static str,
     stt: &'static str,
     tts: &'static str,
+    /// Music generation (ACE-Step). "ok" when the server answers, "busy" while the
+    /// engine is installing, "idle" when down/disabled, and omitted-as-idle when
+    /// music is turned off. Only present so the sidebar can show a Music light.
+    music: &'static str,
     embedder: &'static str,
     reranker: &'static str,
 }
@@ -3059,11 +3093,21 @@ async fn stack_status(State(state): State<Arc<AppState>>) -> Json<StackStatusRes
         flag(api_key_set(&settings.tts.api, &tts_provider))
     };
 
+    // --- Music (ACE-Step) — only meaningful when enabled ---
+    let music_light = if settings.music.enabled {
+        let up = launcher::acestep_running(&state);
+        let busy = acestep_engine_status(&state) == "installing";
+        up_or_busy(up, busy)
+    } else {
+        "idle"
+    };
+
     let retriever = state.retriever_loaded();
     Json(StackStatusResponse {
         llm: llm_light,
         stt: stt_light,
         tts: tts_light,
+        music: music_light,
         embedder: flag(retriever.is_some()),
         reranker: flag(retriever.map(|r| r.has_reranker()).unwrap_or(false)),
     })

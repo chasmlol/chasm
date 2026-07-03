@@ -30,6 +30,29 @@ pub struct AudioChunk {
     pub caption_max_chars: Option<i64>,
 }
 
+/// A queued "play a song" job, handed to the client when the play-a-song action
+/// fires during a turn. The client runs it FIRE-AND-FORGET (lyrics via the
+/// character's prompt stack -> ACE-Step -> store -> deliver to the mod) so the turn
+/// pipeline is never blocked; a failure is logged, never surfaced to the turn.
+/// `bridge_roots` is where the delivery (`control/songs/<id>.json`) is written for
+/// the mod to pick up — the same roots the bridge writes its other control files to.
+#[derive(Debug, Clone)]
+pub struct SongJob {
+    pub request_id: String,
+    pub live_chat_id: String,
+    pub character_id: String,
+    pub character_name: String,
+    pub npc_key: String,
+    pub npc_name: String,
+    /// The player's triggering words (what the song should be about).
+    pub user_message: String,
+    /// Genre steer for the song: `""` for the default (sung, guitar) song, or
+    /// `"rap"` for the rap variant. Selects the base style tags + tweaks the lyric
+    /// prompt so the same pipeline produces a rap instead of a folk song.
+    pub style_hint: String,
+    pub bridge_roots: Vec<std::path::PathBuf>,
+}
+
 /// The seam between the FNV bridge and chasm. `HttpChasmClient` backs the
 /// standalone bin (reqwest → :7341); an in-process impl backs the folded-in build.
 /// `&dyn ChasmClient` is threaded through the bridge so either can be swapped in.
@@ -55,6 +78,13 @@ pub trait ChasmClient: Send + Sync {
         body: &Value,
         on_chunk: &mut (dyn FnMut(AudioChunk) -> anyhow::Result<()> + Send),
     ) -> anyhow::Result<usize>;
+
+    /// Kick off an async song-generation job (the play-a-song action). Fire-and-
+    /// forget: returns immediately so the turn is never blocked; the client spawns
+    /// the lyrics -> ACE-Step -> store -> deliver work and logs any failure.
+    /// Default: a no-op — music generation runs only in the in-process build
+    /// (chasm-web), not the standalone HTTP bin / test mocks.
+    fn start_song_job(&self, _job: SongJob) {}
 }
 
 pub struct HttpChasmClient {

@@ -568,6 +568,43 @@ async fn run_turn(
         }
     }
 
+    // Play-a-song action: if any triggered line chose the play-a-song action, kick
+    // off the async song job (lyrics -> ACE-Step -> deliver) IN ADDITION to the
+    // guitar-start action already queued above (that runs the idle via its trusted
+    // GECK script). Fire-and-forget so the turn completes normally; the song is
+    // delivered later via the control/songs queue. Only when music is configured.
+    if config.music_enabled {
+        if let Some((line, gm)) = lines.iter().zip(line_gms.iter()).find(|(_, gm)| {
+            gm.should_trigger
+                && (gm.action_id == chasm_core::PLAY_SONG_ACTION_ID
+                    || gm.action_id == chasm_core::PLAY_RAP_ACTION_ID)
+        }) {
+            let is_rap = gm.action_id == chasm_core::PLAY_RAP_ACTION_ID;
+            let job = crate::chasm::SongJob {
+                request_id: request.request_id.clone(),
+                live_chat_id: config.live_chat_id.clone(),
+                character_id: line.character_id.clone(),
+                character_name: line.character_name.clone(),
+                npc_key: first_non_empty([line.native_npc_key.clone(), request.npc_key.clone()]),
+                npc_name: first_non_empty([
+                    line.native_npc_name.clone(),
+                    line.character_name.clone(),
+                    request.npc_name.clone(),
+                ]),
+                user_message: message.clone(),
+                style_hint: if is_rap { "rap".to_string() } else { String::new() },
+                bridge_roots: config.native_bridge_roots.clone(),
+            };
+            info!(
+                "{}: {} action -> starting song job for {}",
+                request.request_id,
+                if is_rap { "rap" } else { "play-a-song" },
+                line.character_name
+            );
+            client.start_song_job(job);
+        }
+    }
+
     let audio = written.first();
     let speaker = &lines[0];
     let resp = OutgoingResponse {

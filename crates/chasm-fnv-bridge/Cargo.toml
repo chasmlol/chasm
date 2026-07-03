@@ -29,9 +29,7 @@ tokio = { workspace = true, features = ["time", "sync"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 urlencoding.workspace = true
-
-[dev-dependencies]
-# Round-trips the TurnTrace JSONL through the same parser the Tracing settings
-# page uses (`chasm_core::parse_trace_jsonl`), so the stage-name grouping the UI
-# relies on is asserted at the source.
+# Shared constants/types (e.g. `chasm_core::PLAY_SONG_ACTION_ID` for the play-a-song
+# action, and the trace parser the tests round-trip). No cycle: chasm-core has no
+# dependency on this crate.
 chasm-core = { path = "../chasm-core" }

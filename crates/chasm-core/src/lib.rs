@@ -50,6 +50,12 @@ pub const DEFAULT_TTS_ENDPOINT: &str = "http://127.0.0.1:5002";
 pub const DEFAULT_PARAKEET_STT_ENDPOINT: &str =
     "http://127.0.0.1:5003/v1/audio/transcriptions";
 
+/// Default endpoint of the ACE-Step music-generation service (its own process +
+/// port so a multi-second song render never queues behind an LLM/STT/TTS call).
+/// POST lyrics + style tags + duration -> WAV. Env-overridable via
+/// `CHASM_ACESTEP_ENDPOINT`.
+pub const DEFAULT_ACESTEP_ENDPOINT: &str = "http://127.0.0.1:5004/v1/music";
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub bind_addr: String,

@@ -16,6 +16,7 @@ import {
   AudioLines,
   Mic,
   Megaphone,
+  Music,
   Database,
   Server,
   Cable,
@@ -116,6 +117,7 @@ export const NAV_GROUPS: NavGroup[] = [
       { key: "llm", label: "LLM", path: "settings/llm", icon: Cpu },
       { key: "tts", label: "TTS", path: "settings/tts", icon: AudioLines },
       { key: "stt", label: "STT", path: "settings/stt", icon: Mic },
+      { key: "music", label: "Music", path: "settings/music", icon: Music },
       {
         key: "stt-boost",
         label: "Word Boosting",

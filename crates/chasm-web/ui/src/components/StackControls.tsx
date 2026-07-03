@@ -13,12 +13,21 @@ import { cn } from "@/lib/utils";
 // (the managed local engines when selected) and warms the retriever; the lights
 // flip to green as each becomes reachable.
 
+// Core services that drive the "Start models" button + "All models running" state.
 const MODELS: { key: keyof StackStatus; label: string }[] = [
   { key: "llm", label: "LLM" },
   { key: "stt", label: "STT" },
   { key: "tts", label: "TTS" },
   { key: "embedder", label: "Embedder" },
   { key: "reranker", label: "Reranker" },
+];
+
+// Every light shown in the grid. Music is optional (off by default), so it's
+// displayed but kept OUT of the button's allOn/anyBusy logic below — a user who
+// doesn't use music generation still sees "All models running".
+const LIGHTS: { key: keyof StackStatus; label: string }[] = [
+  ...MODELS,
+  { key: "music", label: "Music" },
 ];
 
 // "ok" = up (green) · "busy" = coming up / runtime downloading (amber) · idle (gray).
@@ -103,7 +112,7 @@ export function StackControls() {
       </button>
 
       <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 rounded-lg border border-[var(--border)] bg-[var(--color-ink-850)] px-3 py-2.5">
-        {MODELS.map((m) => (
+        {LIGHTS.map((m) => (
           <ModelLight key={m.key} label={m.label} tone={toneOf(m.key)} />
         ))}
       </div>

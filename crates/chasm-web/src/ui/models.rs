@@ -375,6 +375,61 @@ fn runtime_settings(state: &Arc<AppState>) -> UiModelSettings {
 }
 
 // ---------------------------------------------------------------------------
+// Music (ACE-Step engine picker)
+// ---------------------------------------------------------------------------
+
+/// Builds the Music catalog: a single card for the managed ACE-Step engine — the
+/// only music engine — with install/run state (same marker source as the Parakeet
+/// card). The card is "selected" when music is enabled + the engine is chosen, so
+/// the Runtimes + Music pages show whether song generation is ready.
+fn music_settings(state: &Arc<AppState>) -> UiModelSettings {
+    let settings = AppSettings::load(&state.config.settings_path);
+    let selected = chasm_core::normalize_music_engine(&settings.music.engine);
+    let engine_selected = settings.music.enabled && !selected.is_empty();
+
+    let status = crate::acestep_engine_status(state);
+    let installed = status == "installed";
+    let pill = if engine_selected && installed {
+        if crate::launcher::acestep_running(state) {
+            UiModelStatus { tone: "ok", label: "Running".to_string() }
+        } else {
+            UiModelStatus { tone: "ok", label: "Active".to_string() }
+        }
+    } else {
+        match status.as_str() {
+            "installed" => UiModelStatus { tone: "ok", label: "Ready".to_string() },
+            "installing" => UiModelStatus { tone: "busy", label: "Installing…".to_string() },
+            "failed" => UiModelStatus { tone: "error", label: "Install failed".to_string() },
+            _ => UiModelStatus { tone: "idle", label: "Available".to_string() },
+        }
+    };
+
+    let models = vec![UiModel {
+        id: chasm_core::ACESTEP_ENGINE_ID.to_string(),
+        name: "ACE-Step (DiT)".to_string(),
+        description: Some(
+            "Local music generation (ACE-Step 1.5, DiT mode) on its own server \
+             (:5004). Writes an in-character song and performs it in-game. Loads \
+             lazily and frees VRAM when idle."
+                .to_string(),
+        ),
+        installed,
+        recommended: true,
+        meta: vec![
+            UiModelMeta { label: "Size".to_string(), value: "~10 GB".to_string() },
+            UiModelMeta { label: "Port".to_string(), value: "5004".to_string() },
+        ],
+        status: Some(pill),
+    }];
+
+    UiModelSettings {
+        models,
+        selected_id: engine_selected.then(|| chasm_core::ACESTEP_ENGINE_ID.to_string()),
+        folder: Some(state.config.engines_dir.display().to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Routing handlers
 // ---------------------------------------------------------------------------
 
@@ -394,6 +449,7 @@ fn build_models(state: &Arc<AppState>, domain: &str) -> UiModelSettings {
         "retrieval" => retrieval_settings(state),
         "tts" => tts_settings(state),
         "runtime" => runtime_settings(state),
+        "music" => music_settings(state),
         _ => UiModelSettings::empty(),
     }
 }
@@ -485,6 +541,26 @@ fn apply_select(state: &Arc<AppState>, domain: &str, id: &str) {
             // switch. Selection is a no-op (the card is informational; installing
             // it happens via the download endpoint).
         }
+        "music" => {
+            // The only music card is ACE-Step; selecting it enables music + sets
+            // the engine, then starts the server (lazy model load) if installed.
+            if chasm_core::normalize_music_engine(id).is_empty() {
+                return;
+            }
+            let was_running = settings.music.enabled
+                && !chasm_core::normalize_music_engine(&settings.music.engine).is_empty();
+            settings.music.enabled = true;
+            settings.music.engine = chasm_core::normalize_music_engine(id);
+            if settings.save(&state.config.settings_path).is_err() {
+                return;
+            }
+            if !was_running {
+                let state = Arc::clone(state);
+                tokio::task::spawn_blocking(move || {
+                    crate::launcher::start_music_engine(&state);
+                });
+            }
+        }
         _ => {}
     }
 }
@@ -525,6 +601,14 @@ pub(crate) async fn download_model(
             "runtime" => {
                 if id == chasm_core::LLM_RUNTIME_LLAMACPP {
                     crate::ensure_llamacpp(&state);
+                }
+            }
+            "music" => {
+                // Installs the ACE-Step engine venv + clone + prefetches weights
+                // (heavy: git clone + uv sync + ~10 GB). Same install shape as the
+                // other engines via install-engine.ps1.
+                if id == chasm_core::ACESTEP_ENGINE_ID {
+                    let _ = crate::start_engine_install(&state, chasm_core::ACESTEP_ENGINE_ID);
                 }
             }
             _ => {}

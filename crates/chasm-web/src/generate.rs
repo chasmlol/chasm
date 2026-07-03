@@ -1013,6 +1013,48 @@ pub(crate) fn warmup_chat_messages(
     Some((plan.chat_messages, plan.speaker_name))
 }
 
+/// Builds the base chat-completion messages for a SONG generation: the FULL
+/// character prompt stack (card, persona, relationships, memories, lore, history,
+/// scenario) for `force_character_id`, assembled through the exact same turn
+/// machinery a normal reply uses — in TEXT mode (no structured-output instruction),
+/// with `user_message` as the pending player turn. The caller (`crate::music`)
+/// appends a dedicated SONG system message so the character writes lyrics in voice.
+///
+/// Returns `(messages, speaker_name)`, or `None` when the live chat / speaker can't
+/// be resolved. Pure read: nothing is persisted (mirrors [`warmup_chat_messages`]).
+pub(crate) fn song_base_messages(
+    state: &Arc<AppState>,
+    live_chat_id: &str,
+    force_character_id: Option<&str>,
+    user_message: &str,
+) -> Option<(Vec<Value>, String)> {
+    let body = json!({
+        "message": user_message,
+        "responseFormat": "text",
+        "forceCharacterId": force_character_id.unwrap_or(""),
+    });
+    let ctx = resolve_turn_context(state, live_chat_id, &body).ok()?;
+    let input = orchestrator::SelectionInput {
+        force_participant_id: None,
+        force_character_id: force_character_id
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
+    };
+    let selection = orchestrator::select_live_speaker_candidates(&ctx.live_chat, &input).ok()?;
+    // Prefer the forced character; else the first eligible speaker.
+    let speaker = force_character_id
+        .filter(|id| !id.is_empty())
+        .and_then(|id| {
+            selection
+                .speakers
+                .iter()
+                .find(|s| s.participant.character_id == id)
+        })
+        .or_else(|| selection.speakers.first())?;
+    let plan = prepare_speaker_turn(state, &ctx, speaker).ok()?;
+    Some((plan.chat_messages, plan.speaker_name))
+}
+
 /// Synthesizes a `ParticipantView` when the merged participant list does not
 /// contain the selected speaker (defensive; normally the speaker is present).
 fn fallback_participant_view(

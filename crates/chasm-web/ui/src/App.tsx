@@ -22,6 +22,7 @@ import { Llm } from "@/screens/settings/Llm";
 import { Tts } from "@/screens/settings/Tts";
 import { Stt } from "@/screens/settings/Stt";
 import { SttBoost } from "@/screens/settings/SttBoost";
+import { Music } from "@/screens/settings/Music";
 import { Retrieval } from "@/screens/settings/Retrieval";
 import { Runtimes } from "@/screens/settings/Runtimes";
 import { Bridge } from "@/screens/settings/Bridge";
@@ -72,6 +73,7 @@ export function App() {
             <Route path="tts" element={<Tts />} />
             <Route path="stt" element={<Stt />} />
             <Route path="stt-boost" element={<SttBoost />} />
+            <Route path="music" element={<Music />} />
             <Route path="retrieval" element={<Retrieval />} />
             <Route path="runtimes" element={<Runtimes />} />
             <Route path="bridge" element={<Bridge />} />

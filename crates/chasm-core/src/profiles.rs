@@ -173,6 +173,19 @@ impl ProfilePaths {
         )
     }
 
+    /// Generated-song store dir: `profiles/<id>/headless/music` or
+    /// `{data_root}/headless/music`. Unlike the read-only book dirs (which fall back
+    /// to legacy only when the profile subdir already EXISTS), this is a WRITE
+    /// target, so it returns the profile-scoped path whenever a profile is active
+    /// even before the dir exists — the caller creates it and songs live with their
+    /// profile. (See the dual-root fallback note on [`Self::resolve`].)
+    pub fn music_dir(&self) -> PathBuf {
+        match self.profile_dir.as_ref() {
+            Some(profile_dir) => profile_dir.join("headless").join("music"),
+            None => self.data_root.join("headless").join("music"),
+        }
+    }
+
     /// Action catalogs dir (the full spawnable-record lists referenced by scoped
     /// catalogs): `profiles/<id>/headless/action-catalogs` or
     /// `{data_root}/headless/action-catalogs`.

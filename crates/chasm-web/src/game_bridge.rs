@@ -449,6 +449,7 @@ mod tests {
             tts: Value::Object(Map::new()),
             speech_recognition: Value::Object(Map::new()),
             speech_recognition_timeout_ms: 45_000,
+            music_enabled: false,
         }
     }
 

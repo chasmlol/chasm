@@ -79,6 +79,12 @@ pub struct BridgeConfig {
     /// `speechRecognition` object spread into every `/speech/recognize` body.
     pub speech_recognition: Value,
     pub speech_recognition_timeout_ms: u64,
+
+    /// Whether music generation (the play-a-song action) is enabled. Set from
+    /// `AppSettings.music.enabled` by the in-process bridge; the standalone HTTP
+    /// bin leaves it `false` (music runs only in-process). When false, the song
+    /// job is never started even if the action fires.
+    pub music_enabled: bool,
 }
 
 impl BridgeConfig {
@@ -259,6 +265,9 @@ fn build_config(raw: RawConfig) -> BridgeConfig {
             .speech_recognition_timeout_ms
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_API_STT_TIMEOUT_MS),
+        // Off unless the in-process bridge turns it on from AppSettings.music.enabled
+        // (the standalone bin has no music engine).
+        music_enabled: false,
     }
 }
 
@@ -292,5 +301,6 @@ pub(crate) fn load_test_config() -> BridgeConfig {
         tts: Value::Object(Map::new()),
         speech_recognition: Value::Object(Map::new()),
         speech_recognition_timeout_ms: DEFAULT_API_STT_TIMEOUT_MS,
+        music_enabled: false,
     }
 }

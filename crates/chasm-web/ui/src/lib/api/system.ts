@@ -54,12 +54,35 @@ export interface InterfacePanel {
   show_prompt_panel: boolean;
 }
 
+/** Mirrors `MusicPanelView` (crates/chasm-web/src/ui/settings.rs). */
+export interface MusicPanel {
+  enabled: boolean;
+  engine: string;
+  style_tags: string;
+  max_seconds: number;
+  max_seconds_min: number;
+  max_seconds_max: number;
+  match_npc_voice: boolean;
+  engines: [string, string][];
+  engine_status: string;
+  engine_running: boolean;
+}
+
 /** The subset of `SettingsPageView` the React Settings shell consumes. */
 export interface SettingsPage {
   category: string;
   nav_groups: SettingsNavGroup[];
   settings_path: string;
   interface: InterfacePanel;
+  music: MusicPanel;
+}
+
+/** The editable Music settings posted back to the save endpoint. */
+export interface MusicForm {
+  enabled: boolean;
+  style_tags: string;
+  max_seconds: number;
+  match_npc_voice: boolean;
 }
 
 /** The editable Interface settings posted back to the save endpoint. */
@@ -218,6 +241,7 @@ export interface StackStatus {
   llm: string;
   stt: string;
   tts: string;
+  music: string;
   embedder: string;
   reranker: string;
 }
@@ -299,6 +323,8 @@ export const systemApi = {
     getJson<SettingsPage>(`${UI_API}/settings/${category}`),
   saveInterface: (form: InterfaceForm) =>
     postJson<SettingsPage>(`${UI_API}/settings/interface/save`, form),
+  saveMusic: (form: MusicForm) =>
+    postJson<SettingsPage>(`${UI_API}/settings/music/save`, form),
   /** Shared with the backend/desktop shell; NOT under /api/ui. */
   connectionStatus: () => getJson<ConnectionStatus>(`/connection/status`),
   /** Per-service model lights. NOT under /api/ui; top-level router. */
