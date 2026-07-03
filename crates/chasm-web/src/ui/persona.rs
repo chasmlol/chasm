@@ -15,11 +15,13 @@
 
 use std::sync::Arc;
 
+use std::fs;
+
 use axum::{extract::State, Json};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::{persona, AppState, WebResult};
+use crate::{persona, AppState, WebError, WebResult};
 
 /// `GET /api/ui/v1/persona` response.
 #[derive(Serialize)]
@@ -53,6 +55,10 @@ pub(crate) struct UiPersonaView {
     pub generating: bool,
     /// True when a capture exists (Regenerate is meaningful).
     pub has_capture: bool,
+    /// The user's custom addition — a free-text paragraph appended to the
+    /// persona at injection, persisted separately so it survives regeneration.
+    /// Empty string when the user has never set one.
+    pub custom_note: String,
 }
 
 /// Pulls a trimmed non-empty string field out of a JSON object.
@@ -126,6 +132,7 @@ fn build_view(state: &AppState) -> UiPersonaView {
         stats,
         generating: persona::generation_in_flight(),
         has_capture: capture.is_some(),
+        custom_note: persona::read_custom_note(&dir),
     }
 }
 
@@ -145,5 +152,27 @@ pub(crate) async fn persona_regenerate(
     State(state): State<Arc<AppState>>,
 ) -> WebResult<Json<UiPersonaView>> {
     persona::generate_from_stored_capture(&state).await?;
+    Ok(Json(build_view(&state)))
+}
+
+/// `POST /api/ui/v1/persona/custom` body — the user's custom addition.
+#[derive(Deserialize)]
+pub(crate) struct SetCustomNote {
+    /// The free-text paragraph to append to the persona (stored trimmed; an
+    /// empty/whitespace value clears the addition).
+    pub note: String,
+}
+
+/// `POST /api/ui/v1/persona/custom` — persists the user's custom addition to
+/// its own file in the persona store (SEPARATE from the generated description,
+/// so it survives regeneration) and returns the refreshed view. Read per turn
+/// by prompt assembly, so it applies on the next NPC turn with no restart.
+pub(crate) async fn persona_set_custom(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SetCustomNote>,
+) -> WebResult<Json<UiPersonaView>> {
+    let dir = persona::persona_dir(&state);
+    fs::create_dir_all(&dir).map_err(WebError::from)?;
+    persona::write_custom_note(&dir, &body.note).map_err(WebError::from)?;
     Ok(Json(build_view(&state)))
 }

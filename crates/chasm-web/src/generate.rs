@@ -1100,6 +1100,19 @@ fn build_scene_roster(
     )
 }
 
+/// Directive wrapper for the player persona when it is injected at depth 1
+/// (right before the newest player line). SillyTavern's default drops the
+/// persona in the story-string head as passive description; buried 2000+ tokens
+/// up-prompt it reads as background flavor and the NPC barely reacts to who is
+/// actually in front of them. Re-framing it as an instruction AND moving it
+/// next to the live turn is what makes the persona actually shape the reply
+/// (measured: a friendly NPC goes from ignoring a "repulsive/helpless" persona
+/// to visibly recoiling from it).
+const PLAYER_PERSONA_DEPTH1_PREFIX: &str =
+    "You are now face to face with the person described below. React to their appearance, \
+     manner, and bearing exactly as your character honestly would — let your genuine \
+     impression of them shape your tone and what you say.";
+
 fn build_chat_messages(
     assembled: &chasm_core::PromptAssemblyView,
     history: &[MessageView],
@@ -1132,13 +1145,37 @@ fn build_chat_messages(
             && component.status == "included"
             && !component.content.is_empty()
     };
+    // The player persona is pulled OUT of the head and re-injected at depth 1
+    // (see persona_reminder below): it only changes on a game save, so unlike
+    // the truly per-turn VOLATILE_KEYS this costs no per-turn cache churn, and
+    // sitting next to the live turn is what gives it real weight in the reply.
     let mut system_parts: Vec<String> = assembled
         .components
         .iter()
         .filter(included)
         .filter(|component| !VOLATILE_KEYS.contains(&component.key.as_str()))
+        .filter(|component| component.key != "player_persona")
         .map(|component| component.content.clone())
         .collect();
+    // The persona, wrapped as a depth-1 directive. `None` (nothing injected)
+    // when no persona is present — byte-identical prompt for personaless turns.
+    let persona_reminder: Option<String> = assembled
+        .components
+        .iter()
+        .find(|component| {
+            component.key == "player_persona"
+                && component.status == "included"
+                && !component.content.is_empty()
+        })
+        .map(|component| {
+            // The head component carries a "Player persona:\n" label; drop it so
+            // the directive wrapper reads cleanly, then re-attach the body.
+            let body = component
+                .content
+                .strip_prefix("Player persona:\n")
+                .unwrap_or(&component.content);
+            format!("{PLAYER_PERSONA_DEPTH1_PREFIX}\n\n{body}")
+        });
     let mut volatile_parts: Vec<String> = assembled
         .components
         .iter()
@@ -1310,6 +1347,19 @@ fn build_chat_messages(
             messages.len()
         };
         messages.insert(insert_at, scenario_message);
+    }
+
+    // Player persona LAST, so it lands closest to the newest player line — the
+    // most salient position, which is the whole point of moving it out of the
+    // head. Same depth-1 insertion as the scenario/volatile blocks above.
+    if let Some(persona_reminder) = persona_reminder {
+        let persona_message = json!({ "role": "system", "content": persona_reminder });
+        let insert_at = if messages.len() > 1 {
+            messages.len() - 1
+        } else {
+            messages.len()
+        };
+        messages.insert(insert_at, persona_message);
     }
 
     messages
@@ -3106,6 +3156,90 @@ mod tests {
         assert!(volatile.contains("Doc patched you up."));
         assert!(!volatile.contains("gecko hunt"));
         assert_eq!(messages[3]["content"], "hi there");
+    }
+
+    #[test]
+    fn player_persona_injects_at_depth_one_not_in_head() {
+        let mut assembled = chasm_core::PromptAssemblyView::default();
+        let component = |key: &str, content: &str| chasm_core::PromptComponentView {
+            order: 0,
+            group: "system".to_string(),
+            key: key.to_string(),
+            label: String::new(),
+            role: "system".to_string(),
+            status: "included".to_string(),
+            note: String::new(),
+            content: content.to_string(),
+            char_count: content.chars().count(),
+        };
+        assembled.components = vec![
+            component("character", "You are Sunny Smiles."),
+            component(
+                "player_persona",
+                "Player persona:\nCourier is socially repulsive and utterly helpless.",
+            ),
+        ];
+        let history = vec![
+            MessageView {
+                role: "player".to_string(),
+                content: "hello".to_string(),
+                ..Default::default()
+            },
+            MessageView {
+                role: "assistant".to_string(),
+                content: "hi there".to_string(),
+                ..Default::default()
+            },
+        ];
+        let messages = build_chat_messages(
+            &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "",
+        );
+        // Head holds the card but NOT the persona — the persona moved to depth 1.
+        let head = messages[0]["content"].as_str().unwrap();
+        assert!(head.contains("Sunny Smiles"));
+        assert!(!head.contains("socially repulsive"), "persona must leave the head");
+        // Persona rides at depth 1 (last system message before the newest line),
+        // wrapped as a directive, with the "Player persona:" label stripped.
+        let depth1 = messages[messages.len() - 2]["content"].as_str().unwrap();
+        assert!(depth1.starts_with("You are now face to face"));
+        assert!(depth1.contains("Courier is socially repulsive and utterly helpless."));
+        assert!(!depth1.contains("Player persona:"), "the raw label is stripped");
+        // The newest player line stays last.
+        assert_eq!(messages[messages.len() - 1]["content"], "hi there");
+    }
+
+    #[test]
+    fn no_persona_component_leaves_prompt_untouched() {
+        // A turn with no player_persona component injects no depth-1 persona
+        // block at all (byte-identical to before the feature).
+        let mut assembled = chasm_core::PromptAssemblyView::default();
+        assembled.components = vec![chasm_core::PromptComponentView {
+            order: 0,
+            group: "system".to_string(),
+            key: "character".to_string(),
+            label: String::new(),
+            role: "system".to_string(),
+            status: "included".to_string(),
+            note: String::new(),
+            content: "You are Sunny Smiles.".to_string(),
+            char_count: 21,
+        }];
+        let history = vec![MessageView {
+            role: "assistant".to_string(),
+            content: "hi there".to_string(),
+            ..Default::default()
+        }];
+        let messages = build_chat_messages(
+            &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "",
+        );
+        // Just the head system message + the one history line: no persona block.
+        assert_eq!(messages.len(), 2);
+        for message in &messages {
+            assert!(!message["content"]
+                .as_str()
+                .unwrap()
+                .contains("face to face"));
+        }
     }
 
     #[test]

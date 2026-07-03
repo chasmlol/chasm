@@ -80,6 +80,35 @@ pub(crate) fn persona_path(dir: &Path) -> PathBuf {
     dir.join("persona.json")
 }
 
+/// Path of the user's custom persona addition — a free-text paragraph the user
+/// authors on the Persona page. Stored SEPARATELY from `persona.json` so it
+/// survives the description regeneration that runs on every game save; prompt
+/// assembly appends it as a final paragraph (see `read_player_persona` in
+/// `chasm-st-compat`). Shape: `{ "note": "..." }`.
+pub(crate) fn custom_note_path(dir: &Path) -> PathBuf {
+    dir.join("custom-note.json")
+}
+
+/// Reads the user's custom addition (trimmed); empty string when absent, blank,
+/// or unparseable — the injection path then behaves exactly as if there were no
+/// addition at all.
+pub(crate) fn read_custom_note(dir: &Path) -> String {
+    read_json(&custom_note_path(dir))
+        .as_ref()
+        .and_then(|value| value.get("note"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// Persists the user's custom addition (atomically). The stored text is
+/// trimmed; an empty result writes `{ "note": "" }` so the file still exists and
+/// the UI reads back exactly what injection will use.
+pub(crate) fn write_custom_note(dir: &Path, note: &str) -> std::io::Result<()> {
+    write_json_atomic(&custom_note_path(dir), &json!({ "note": note.trim() }))
+}
+
 /// Deletes screenshots left behind by the retired portrait feature so old
 /// stores converge on the data-only layout. Best-effort.
 fn remove_stale_images(dir: &Path) {
@@ -1039,6 +1068,52 @@ mod tests {
         let persona = json!({ "description": "", "stats": stats_of(&capture) });
         write_json_atomic(&persona_path(&dir), &persona).unwrap();
         assert!(!is_unchanged(&dir, &capture));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn custom_note_survives_description_regeneration() {
+        let dir = std::env::temp_dir().join(format!(
+            "chasm-persona-note-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Absent → empty (injection sees nothing).
+        assert_eq!(read_custom_note(&dir), "");
+
+        // User saves a custom addition (leading/trailing space trimmed).
+        write_custom_note(&dir, "  The Courier owes Benny a bullet.  ").unwrap();
+        assert_eq!(read_custom_note(&dir), "The Courier owes Benny a bullet.");
+
+        // Simulate a persona regeneration: persona.json is rewritten from
+        // scratch (as generate_from_stored_capture does on every save). The
+        // custom note lives in its OWN file and must be untouched.
+        write_json_atomic(
+            &persona_path(&dir),
+            &json!({ "description": "A first generated description.", "stats": {} }),
+        )
+        .unwrap();
+        assert_eq!(read_custom_note(&dir), "The Courier owes Benny a bullet.");
+        write_json_atomic(
+            &persona_path(&dir),
+            &json!({ "description": "A totally rewritten description.", "stats": {} }),
+        )
+        .unwrap();
+        assert_eq!(
+            read_custom_note(&dir),
+            "The Courier owes Benny a bullet.",
+            "custom note must survive regeneration"
+        );
+
+        // Saving an empty/whitespace note clears it back to nothing.
+        write_custom_note(&dir, "   ").unwrap();
+        assert_eq!(read_custom_note(&dir), "");
 
         fs::remove_dir_all(&dir).ok();
     }

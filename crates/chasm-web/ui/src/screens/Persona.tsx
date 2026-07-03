@@ -1,7 +1,9 @@
+import { useEffect, useState } from "react";
 import { useQuery, useQueryClient, useMutation } from "@tanstack/react-query";
-import { RefreshCw, UserRound } from "lucide-react";
+import { RefreshCw, UserRound, Save } from "lucide-react";
 
 import { personaApi } from "@/lib/api";
+import type { PersonaViewDto } from "@/lib/api/persona";
 import { Button } from "@/components/ui/button";
 import {
   EmptyState,
@@ -11,6 +13,7 @@ import {
   Stack,
   StatusPill,
   Table,
+  TextArea,
   Td,
   Th,
 } from "@/components/ui/page";
@@ -76,6 +79,23 @@ export function Persona() {
   });
 
   const view = query.data;
+
+  // The custom addition — an editable draft, seeded from the saved value and
+  // re-seeded whenever the SERVER value changes (a save here, or an external
+  // edit). A background refetch returning the same value leaves the draft (and
+  // any in-progress typing) untouched, since the effect keys on the value.
+  const savedNote = view?.custom_note ?? "";
+  const [noteDraft, setNoteDraft] = useState(savedNote);
+  useEffect(() => {
+    setNoteDraft(savedNote);
+  }, [savedNote]);
+  const noteDirty = noteDraft !== savedNote;
+
+  const saveNote = useMutation({
+    mutationFn: (note: string) => personaApi.setCustomNote(note),
+    onSuccess: (data: PersonaViewDto) =>
+      queryClient.setQueryData(["persona", "view"], data),
+  });
   const hasAnything = Boolean(view && (view.has_capture || view.description));
   const statRows = STAT_ROWS.map(({ key, label }) => ({
     key,
@@ -132,6 +152,50 @@ export function Persona() {
           <p className="text-[13px] text-[var(--color-danger)]">
             Regenerate failed: {(regenerate.error as Error).message}
           </p>
+        )}
+
+        {!query.isLoading && (
+          <Section
+            title="Custom addition"
+            description="Added as an extra paragraph to your persona — survives regeneration."
+          >
+            <div className="flex flex-col gap-2.5">
+              <TextArea
+                rows={4}
+                value={noteDraft}
+                onChange={(event) => setNoteDraft(event.target.value)}
+                placeholder="e.g. The Courier still owes Benny a bullet, and never forgets a face."
+              />
+              <div className="flex items-center gap-2.5">
+                <Button
+                  onClick={() => saveNote.mutate(noteDraft)}
+                  disabled={!noteDirty || saveNote.isPending}
+                  title={
+                    noteDirty
+                      ? "Save the custom addition"
+                      : "Nothing to save — the addition is unchanged"
+                  }
+                >
+                  <Save
+                    className={saveNote.isPending ? "animate-pulse" : undefined}
+                  />
+                  {saveNote.isPending ? "Saving…" : "Save"}
+                </Button>
+                {saveNote.isError ? (
+                  <span className="text-[12px] text-[var(--color-danger)]">
+                    Save failed: {(saveNote.error as Error).message}
+                  </span>
+                ) : (
+                  !noteDirty &&
+                  saveNote.isSuccess && (
+                    <span className="text-[12px] text-[var(--color-success,var(--muted-foreground))]">
+                      Saved — applies on the next turn.
+                    </span>
+                  )
+                )}
+              </div>
+            </div>
+          </Section>
         )}
 
         {query.isLoading ? (

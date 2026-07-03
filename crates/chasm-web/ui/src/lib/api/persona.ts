@@ -37,6 +37,10 @@ export interface PersonaViewDto {
   generating: boolean;
   /** True when a capture exists (Regenerate is meaningful). */
   has_capture: boolean;
+  /** The user's custom addition — a free-text paragraph appended to the
+   *  persona at injection, persisted separately so it survives regeneration.
+   *  Empty string when never set. */
+  custom_note: string;
 }
 
 export const personaApi = {
@@ -44,4 +48,8 @@ export const personaApi = {
   view: () => getJson<PersonaViewDto>(`${UI_API}/persona`),
   /** Re-run generation from the last received capture (the test hook). */
   regenerate: () => postJson<PersonaViewDto>(`${UI_API}/persona/regenerate`, {}),
+  /** Persist the custom addition (an empty string clears it). Survives
+   *  regeneration; applies on the next NPC turn with no restart. */
+  setCustomNote: (note: string) =>
+    postJson<PersonaViewDto>(`${UI_API}/persona/custom`, { note }),
 };

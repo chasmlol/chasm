@@ -924,24 +924,56 @@ impl LiveChatRepository {
         Ok(Some(book))
     }
 
-    /// Reads the generated player-persona description (the SillyTavern "user
+    /// Reads the player persona for prompt injection (the SillyTavern "user
     /// persona" equivalent) from the active profile's persona store
-    /// (`headless/persona/persona.json`, written by chasm-web's persona
-    /// module). Returns `Ok(None)` when no persona has been generated yet or
-    /// the stored description is empty — prompt assembly then injects nothing,
-    /// mirroring SillyTavern's `{{#if persona}}` story-string slot.
+    /// (`headless/persona/`, written by chasm-web's persona module).
+    ///
+    /// Two independently-stored parts are combined here:
+    ///   * the LLM-generated description (`persona.json` `description`), which is
+    ///     rewritten on every game save, and
+    ///   * the user's custom addition (`custom-note.json` `note`), a free-text
+    ///     paragraph authored on the Persona page that must SURVIVE that
+    ///     regeneration — hence its separate file.
+    ///
+    /// When a custom addition is present it is appended as a final paragraph
+    /// (one blank line between). With no addition the result is byte-identical
+    /// to the description alone; with an addition but no description yet, the
+    /// addition is injected on its own. `Ok(None)` (inject nothing, mirroring
+    /// SillyTavern's `{{#if persona}}`) only when BOTH are empty.
     pub fn read_player_persona(&self) -> Result<Option<String>> {
-        let path = self.paths().persona_dir().join("persona.json");
-        if !path.exists() {
-            return Ok(None);
-        }
-        let value: Value = crate::read_json_file(&path)?;
-        Ok(value
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|description| !description.is_empty())
-            .map(str::to_string))
+        let dir = self.paths().persona_dir();
+
+        let description = {
+            let path = dir.join("persona.json");
+            if path.exists() {
+                let value: Value = crate::read_json_file(&path)?;
+                value
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|description| !description.is_empty())
+                    .map(str::to_string)
+            } else {
+                None
+            }
+        };
+
+        let custom_note = {
+            let path = dir.join("custom-note.json");
+            if path.exists() {
+                let value: Value = crate::read_json_file(&path)?;
+                value
+                    .get("note")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|note| !note.is_empty())
+                    .map(str::to_string)
+            } else {
+                None
+            }
+        };
+
+        Ok(combine_persona(description.as_deref(), custom_note.as_deref()))
     }
 
     /// Reads the headless world-state store (`headless/world-state.json`),
@@ -985,5 +1017,122 @@ impl LiveChatRepository {
             out.push(map(raw));
         }
         Ok(out)
+    }
+}
+
+/// Combines the generated persona description with the user's custom addition
+/// into the single block prompt assembly injects. Both inputs are the already
+/// trimmed, non-empty parts (or `None`). The addition is a final paragraph
+/// separated by one blank line; with no addition the output is the description
+/// verbatim, so an empty custom note yields byte-identical injection to before
+/// the feature existed. `None` only when both parts are absent.
+fn combine_persona(description: Option<&str>, custom_note: Option<&str>) -> Option<String> {
+    match (description, custom_note) {
+        (Some(description), Some(note)) => Some(format!("{description}\n\n{note}")),
+        (Some(description), None) => Some(description.to_string()),
+        (None, Some(note)) => Some(note.to_string()),
+        (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod persona_tests {
+    use super::{combine_persona, LiveChatRepository};
+    use std::fs;
+
+    fn temp_repo(tag: &str) -> (std::path::PathBuf, LiveChatRepository) {
+        let root = std::env::temp_dir().join(format!(
+            "chasm-persona-inject-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let repo = LiveChatRepository::new(&root);
+        (root, repo)
+    }
+
+    /// The REAL injection path (`read_player_persona`) reading both on-disk
+    /// files: description + custom note combine; the note survives a rewritten
+    /// description; and with no note the output is byte-identical to before.
+    #[test]
+    fn read_player_persona_combines_files_and_note_survives_regeneration() {
+        let (root, repo) = temp_repo("combine");
+        let dir = repo.paths().persona_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let persona = dir.join("persona.json");
+        let note = dir.join("custom-note.json");
+
+        // No files at all → nothing injected.
+        assert_eq!(repo.read_player_persona().unwrap(), None);
+
+        // Description only → exactly the description (byte-identical to before
+        // the feature: no trailing blank paragraph).
+        fs::write(&persona, r#"{"description":"A tall courier."}"#).unwrap();
+        assert_eq!(
+            repo.read_player_persona().unwrap(),
+            Some("A tall courier.".to_string())
+        );
+
+        // Add a custom note → appended as a final paragraph.
+        fs::write(&note, r#"{"note":"Owes Benny a bullet."}"#).unwrap();
+        assert_eq!(
+            repo.read_player_persona().unwrap(),
+            Some("A tall courier.\n\nOwes Benny a bullet.".to_string())
+        );
+
+        // Regenerate the description (rewrite persona.json) → note survives.
+        fs::write(&persona, r#"{"description":"A weathered wanderer."}"#).unwrap();
+        assert_eq!(
+            repo.read_player_persona().unwrap(),
+            Some("A weathered wanderer.\n\nOwes Benny a bullet.".to_string())
+        );
+
+        // Note before any generated description → note injects on its own.
+        fs::write(&persona, r#"{"description":""}"#).unwrap();
+        assert_eq!(
+            repo.read_player_persona().unwrap(),
+            Some("Owes Benny a bullet.".to_string())
+        );
+
+        // Clear the note → back to byte-identical description-only behaviour.
+        fs::write(&persona, r#"{"description":"A tall courier."}"#).unwrap();
+        fs::write(&note, r#"{"note":"   "}"#).unwrap();
+        assert_eq!(
+            repo.read_player_persona().unwrap(),
+            Some("A tall courier.".to_string())
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn empty_custom_note_is_byte_identical_to_description() {
+        // No addition → exactly the description, and no persona at all → None.
+        assert_eq!(
+            combine_persona(Some("A tall courier."), None),
+            Some("A tall courier.".to_string())
+        );
+        assert_eq!(combine_persona(None, None), None);
+    }
+
+    #[test]
+    fn custom_note_is_appended_as_a_final_paragraph() {
+        assert_eq!(
+            combine_persona(Some("A tall courier."), Some("Owes Benny a bullet.")),
+            Some("A tall courier.\n\nOwes Benny a bullet.".to_string()),
+            "one blank line separates the appended paragraph"
+        );
+    }
+
+    #[test]
+    fn custom_note_alone_injects_when_no_description_yet() {
+        assert_eq!(
+            combine_persona(None, Some("Owes Benny a bullet.")),
+            Some("Owes Benny a bullet.".to_string())
+        );
     }
 }

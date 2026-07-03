@@ -128,6 +128,7 @@ pub(crate) fn api_router() -> Router<Arc<AppState>> {
         // + stats snapshot; regenerate = the manual test hook) -----------------
         .route("/persona", get(persona::persona_view))
         .route("/persona/regenerate", post(persona::persona_regenerate))
+        .route("/persona/custom", post(persona::persona_set_custom))
         // --- globals (global scenario template: the production macro surface,
         // replacing the per-character card scenario; + resolved preview) ------
         .route(
