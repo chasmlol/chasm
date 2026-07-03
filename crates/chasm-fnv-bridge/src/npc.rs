@@ -833,7 +833,12 @@ fn strip_png(s: &str) -> String {
 // ===========================================================================
 
 const COMPANION_REGISTRY_HEADER: &str = "CHASM_COMPANION_REGISTRY_V1";
-const COMPANION_POOL_SIZE: usize = 8;
+// MUST match the NVSE plugin's `kCompanionPoolSize` (main.cpp). The plugin pool
+// was expanded to 64; this side was left at 8, so companions in slots 8..64 were
+// never read from the registry and chasm rejected talking to them with
+// "No mapped NPC within 10 meters" (worked only after a chasm restart mapped
+// their card statically). Keep these two constants in lockstep.
+const COMPANION_POOL_SIZE: usize = 64;
 
 /// Claimed companions from the plugin registry as map entries
 /// (`npc_key -> {characterId, characterName}`). Empty on any parse problem.
