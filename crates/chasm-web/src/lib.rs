@@ -560,7 +560,39 @@ pub fn shutdown_ai_stack(config: AppConfig) {
     launcher::stop_ai_stack(&state);
 }
 
+/// Prepends app-local CUDA runtime dirs to PATH so ONNX Runtime's CUDA
+/// execution provider (GPU retrieval: embedder + reranker) can load its
+/// dependency DLLs (cublas, cuDNN 9, cufft). Without them on PATH, ort
+/// SILENTLY falls back to CPU even when `retrieval.execution = "gpu"`.
+/// Two well-known locations, no user PATH surgery required:
+///   * `<llm models dir>/../cuda` — a drop-in folder the user (or a future
+///     installer) can fill with the CUDA runtime DLLs.
+///   * the managed llama.cpp runtime dir — its CUDA build ships cudart/cublas,
+///     which covers part of the set for free.
+/// Missing dirs are skipped; CPU fallback behavior is unchanged.
+fn bootstrap_cuda_path(config: &AppConfig) {
+    let mut extra: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(models_root) = config.llm_models_dir.parent() {
+        extra.push(models_root.join("cuda"));
+        extra.push(models_root.join("llamacpp"));
+    }
+    let existing: Vec<_> = extra.into_iter().filter(|dir| dir.is_dir()).collect();
+    if existing.is_empty() {
+        return;
+    }
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let mut parts: Vec<std::path::PathBuf> = existing.clone();
+    parts.extend(std::env::split_paths(&current));
+    if let Ok(joined) = std::env::join_paths(parts) {
+        for dir in &existing {
+            info!("CUDA runtime dir on PATH: {}", dir.display());
+        }
+        std::env::set_var("PATH", joined);
+    }
+}
+
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
+    bootstrap_cuda_path(&config);
     let addr: SocketAddr = config.bind_addr.parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(
