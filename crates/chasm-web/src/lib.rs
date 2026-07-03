@@ -917,6 +917,21 @@ async fn speech_synthesize(
     })))
 }
 
+/// The caption text to attach to a streamed audio chunk. Only the FIRST chunk of a
+/// synthesized line carries the text; every later chunk carries EMPTY. The FNV plugin
+/// relies on this contract: it anchors a NEW on-screen caption to each non-empty-text
+/// chunk (one per sentence, since the bridge synthesizes one line per `speech.delta`
+/// sentence) and treats empty-text chunks as a continuation of the current caption.
+/// Sending the text on every chunk would make the plugin re-anchor duplicate captions,
+/// so keep this exactly one-non-empty-per-line.
+fn caption_for_chunk(index: usize, text: &str) -> &str {
+    if index == 0 {
+        text
+    } else {
+        ""
+    }
+}
+
 /// One `audio.chunk` NDJSON line: a base64 WAV slice the helper writes to disk and
 /// the FNV plugin gaplessly plays. `text` (the line subtitle) is set on the first
 /// chunk and empty after, so the plugin shows it once and reuses it.
@@ -1074,7 +1089,7 @@ pub(crate) fn speech_synthesize_stream_core(
                 let mut slice: Vec<u8> = buf.drain(..target).collect();
                 apply_pcm_gain(&mut slice, volume);
                 let wav = pcm16_to_wav(&slice, TTS_SAMPLE_RATE, 1, 16);
-                yield audio_chunk_line(index, &wav, if index == 0 { &text } else { "" }, caption_max_chars);
+                yield audio_chunk_line(index, &wav, caption_for_chunk(index, &text), caption_max_chars);
                 index += 1;
                 cur_slice_ms = (cur_slice_ms * 2).min(max_slice_ms);
             }
@@ -3558,6 +3573,33 @@ mod filters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caption_is_carried_only_on_first_chunk_of_a_line() {
+        // The FNV plugin anchors a caption to each non-empty-text chunk (one per
+        // sentence) and treats empty-text chunks as continuations. So exactly the first
+        // chunk of a synthesized line carries the text; every later slice is empty.
+        let line = "Back so soon, wanderer?";
+        assert_eq!(caption_for_chunk(0, line), line);
+        assert_eq!(caption_for_chunk(1, line), "");
+        assert_eq!(caption_for_chunk(2, line), "");
+        assert_eq!(caption_for_chunk(7, line), "");
+    }
+
+    #[test]
+    fn audio_chunk_line_matches_the_first_chunk_only_caption_contract() {
+        // End-to-end at the NDJSON seam: a two-slice line emits the caption on slice 0
+        // and empty on slice 1, so the plugin gets exactly one non-empty caption to
+        // anchor for this sentence.
+        let wav = [0u8; 4];
+        let first = audio_chunk_line(0, &wav, caption_for_chunk(0, "Hello there."), 80);
+        let second = audio_chunk_line(1, &wav, caption_for_chunk(1, "Hello there."), 80);
+        let first: serde_json::Value = serde_json::from_str(first.trim()).unwrap();
+        let second: serde_json::Value = serde_json::from_str(second.trim()).unwrap();
+        assert_eq!(first["text"], "Hello there.");
+        assert_eq!(second["text"], "");
+        assert_eq!(first["captionMaxChars"], 80);
+    }
 
     #[test]
     fn pcm_gain_scales_and_clamps_and_is_noop_at_unity() {
