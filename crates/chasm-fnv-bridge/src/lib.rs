@@ -572,8 +572,15 @@ async fn run_turn(
     // off the async song job (lyrics -> ACE-Step -> deliver) IN ADDITION to the
     // guitar-start action already queued above (that runs the idle via its trusted
     // GECK script). Fire-and-forget so the turn completes normally; the song is
-    // delivered later via the control/songs queue. Only when music is configured.
-    if config.music_enabled {
+    // delivered later via the control/songs queue.
+    //
+    // Do NOT gate on `config.music_enabled` here: the file-bridge loop captures
+    // that ONCE at startup, so a user who boots with music off then enables it
+    // mid-session would never get a song (the action fires, the guitar plays, but
+    // the job is silently suppressed). `run_song_job` (in-process) reloads settings
+    // and bails if music is disabled, so the live setting is the real authority;
+    // in the standalone build `start_song_job` is a no-op anyway.
+    {
         if let Some((line, gm)) = lines.iter().zip(line_gms.iter()).find(|(_, gm)| {
             gm.should_trigger
                 && (gm.action_id == chasm_core::PLAY_SONG_ACTION_ID
