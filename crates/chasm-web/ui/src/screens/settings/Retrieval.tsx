@@ -13,6 +13,7 @@ import {
   ToggleRow,
 } from "@/components/ui/settings-page";
 import { ModelPicker, type ModelCard } from "@/components/ModelPicker";
+import { ModelPlacement } from "@/components/ModelPlacement";
 import {
   Card,
   CardContent,
@@ -130,10 +131,8 @@ export function Retrieval() {
     queryFn: () => configApi.get("retrieval"),
   });
 
-  const select = useMutation({
-    mutationFn: (id: string) => modelsApi.select("retrieval", id),
-    onSuccess: (fresh) => qc.setQueryData(["models", "retrieval"], fresh),
-  });
+  // The reranker keeps the one-click download; the embedder is placed manually
+  // (ModelPlacement), so no select mutation is needed here anymore.
   const download = useMutation({
     mutationFn: (id: string) => modelsApi.download("retrieval", id),
     onSuccess: (fresh) => qc.setQueryData(["models", "retrieval"], fresh),
@@ -164,11 +163,12 @@ export function Retrieval() {
   ) => setForm((f) => (f ? { ...f, [key]: value } : f));
 
   // Split the retrieval catalog into its two kinds (the backend tags each card's
-  // meta with Kind: Embedder / Reranker). You need one of each.
+  // meta with Kind: Embedder / Reranker). You need one of each. The embedder is
+  // placed manually (ModelPlacement); the reranker keeps the one-click download.
   const allModels = query.data?.models ?? [];
   const kindOf = (m: ModelDto) =>
     m.meta?.find((x) => x.label === "Kind")?.value;
-  const embedders = allModels.filter((m) => kindOf(m) === "Embedder").map(toCard);
+  const embedders = allModels.filter((m) => kindOf(m) === "Embedder");
   const rerankers = allModels.filter((m) => kindOf(m) === "Reranker").map(toCard);
 
   return (
@@ -190,17 +190,15 @@ export function Retrieval() {
           : undefined
       }
     >
-      <ModelPicker
+      <ModelPlacement
         title="Embedder"
-        description="Turns text into vectors for semantic search. Download one and select it."
+        description="Turns text into vectors for semantic search. Download one and drop its .onnx into the folder below."
+        domain="retrieval"
+        folderKind="embed"
         models={embedders}
-        selectedId={query.data?.selected_id}
-        folder={query.data?.folder ? { path: query.data.folder } : undefined}
+        folder={query.data?.folder}
         isLoading={query.isLoading}
         isError={query.isError}
-        downloadingId={download.isPending ? download.variables : null}
-        onSelect={(id) => select.mutate(id)}
-        onDownload={(id) => download.mutate(id)}
       />
 
       {form && (

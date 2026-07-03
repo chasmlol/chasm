@@ -44,14 +44,16 @@ chasm is, unapologetically, built on ideas from [SillyTavern](https://github.com
 
 Everything runs locally out of the box:
 
-| Component | Engine | Notes |
-| --- | --- | --- |
-| **LLM** | koboldcpp (OpenAI-compatible local server) | Download a GGUF from Settings → LLM; small models recommended on low-end hardware. |
-| **TTS** | faster-qwen3-tts / PocketTTS (streaming) | Voice-cloned per character; install + pick either in Settings → TTS. Both stream on `:5002`. |
-| **STT** | Whisper (via koboldcpp) | Local microphone transcription; download the Whisper model in Settings → STT. Served by koboldcpp on the same `:5001` port as the LLM. |
-| **Retrieval** | ONNX embeddings + reranker | Two-stage lore/memory retrieval, CPU-friendly. |
+Each capability picks a **provider** — the managed local runtime (default, fully offline) or a hosted API:
 
-Nothing is pre-selected — you download and choose each model (LLM, TTS, STT) from the control panel, so you only ever pull the ones you want.
+| Component | Local (managed) | Hosted APIs | Notes |
+| --- | --- | --- | --- |
+| **LLM** | llama.cpp `llama-server` (OpenAI-compatible, `:5001`) | OpenAI, Anthropic, Google Gemini, OpenRouter, any OpenAI-compatible base URL | Pick which placed GGUF is active in Settings → LLM (guided browser download + drag-drop to add more), or set an API key. |
+| **TTS** | faster-qwen3-tts (streaming, `:5002`) | ElevenLabs, Cartesia, Inworld | Voice-cloned per character — locally, OR through the hosted provider's cloning API (all three support it). |
+| **STT** | Parakeet TDT 0.6B v3 (dedicated GPU server, `:5003`) | OpenAI, Groq, Deepgram, AssemblyAI, OpenRouter | Local microphone transcription with no LLM contention, or a hosted API key. |
+| **Retrieval** | ONNX embeddings + reranker | — | Two-stage lore/memory retrieval, CPU-friendly. Place the embedder ONNX from Settings → Retrieval. |
+
+Local runtimes/engines auto-install with one click on Settings → Runtimes; **model files** are placed manually (a guided flow opens the model's download page, shows the exact folder, and accepts a drag-drop / chosen file). Or skip local entirely and point any capability at a hosted API.
 
 Speed is a first-class goal, not an afterthought:
 

@@ -143,10 +143,9 @@ pub(crate) async fn gamestate_test(
     // turns use — no retrieval, no cards, no live-chat writes, no action books.
     // Settings load fresh per request, so model/sampling tweaks apply without a
     // restart.
-    let endpoint = state.config.llm_endpoint.clone();
-    let sampling = crate::llm::Sampling::from_settings(
-        &AppSettings::load(&state.config.settings_path).llm.sampling,
-    );
+    let gs_settings = AppSettings::load(&state.config.settings_path);
+    let sampling = crate::llm::Sampling::from_settings(&gs_settings.llm.sampling);
+    let target = crate::llm::LlmTarget::resolve(&gs_settings, &state.config);
     let messages = vec![
         json!({ "role": "system", "content": resolved_prompt }),
         json!({ "role": "user", "content": user_message }),
@@ -155,7 +154,7 @@ pub(crate) async fn gamestate_test(
     // 500 away the substitution proof: return the resolved prompt with the
     // error in `note` so the page always shows what the macros resolved to.
     let (reply, note) =
-        match crate::llm::chat_completion_capturing_sampled(&endpoint, &messages, None, sampling)
+        match crate::llm::chat_completion_capturing_sampled(&target, &messages, None, sampling)
             .await
         {
             Ok((reply, _metrics)) => (reply, note),

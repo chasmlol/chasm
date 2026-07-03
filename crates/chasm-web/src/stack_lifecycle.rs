@@ -1,5 +1,6 @@
 //! Connection-driven AI stack lifecycle. chasm is a passive backend, so it keys
-//! the local AI stack (koboldcpp for LLM + Whisper STT, plus the TTS server) off
+//! the local AI stack (llama.cpp for the LLM, the Parakeet STT server, plus the
+//! TTS server) off
 //! the in-game plugin's heartbeat: when the game's bridge connects, chasm starts
 //! the stack; when it leaves, chasm tears the whole stack down. Game opens →
 //! stack up; game closes → stack down.
@@ -39,7 +40,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const STOP_GRACE_SECS: f64 = 10.0;
 
 /// Lifecycle phase, surfaced on `GET /connection/status` and the rail indicator.
-/// `Starting` covers the ~12s (koboldcpp) to ~45s (TTS model load) warm-up after a
+/// `Starting` covers the ~12s (llama.cpp) to ~45s (TTS model load) warm-up after a
 /// connect; `Stopping` is the brief teardown window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {

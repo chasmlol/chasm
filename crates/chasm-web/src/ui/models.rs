@@ -10,7 +10,7 @@
 //! reimplementing registries / downloads / swaps:
 //!   * llm      → `LLM_MODELS` + `llm_models_panel_view` / `selected_llm_model_id`
 //!                (status via `crate::llm_model_statuses`); download via
-//!                `crate::start_llm_download` (+ `ensure_koboldcpp`); select via
+//!                `crate::start_llm_download` (+ `ensure_llamacpp`); select via
 //!                `launcher::apply_selected_llm_model`.
 //!   * stt      → `crate::build_whisper_models` (WHISPER_MODELS + vram_gb fit);
 //!                download via `crate::start_whisper_download`; select via
@@ -34,8 +34,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use chasm_core::{
     engine_status_label, llm_models_panel_view, normalize_embedder_tier, normalize_local_engine,
-    retrieval_panel_view, selected_llm_model_id, stt_panel_view, whisper_model_by_id, AppSettings,
-    LlmModelView, RetrievalModelView, TTS_LOCAL_ENGINES, WhisperModelView,
+    retrieval_panel_view, selected_llm_model_id, AppSettings, LlmModelView, RetrievalModelView,
+    TTS_LOCAL_ENGINES,
 };
 
 use crate::AppState;
@@ -130,6 +130,9 @@ fn llm_settings(state: &AppState) -> UiModelSettings {
     let models = panel
         .models
         .into_iter()
+        // Curated recommended list: drop the small E2B / E4B Gemma variants — the
+        // LLM page now recommends the larger, higher-quality models (12B and up).
+        .filter(|m: &LlmModelView| m.id != "gemma-4-e2b" && m.id != "gemma-4-e4b")
         .map(|m: LlmModelView| {
             let status = download_status_pill(&m.status, m.status_label, m.selected);
             UiModel {
@@ -158,43 +161,18 @@ fn llm_settings(state: &AppState) -> UiModelSettings {
 // STT (Whisper)
 // ---------------------------------------------------------------------------
 
-/// Builds the STT catalog from the Whisper registry (`WHISPER_MODELS`, vram_gb
-/// fit) via the same `build_whisper_models` + `stt_panel_view` the Askama page
-/// uses, so the recommended badge / fit hint / active selection all match.
+/// Builds the STT "local model" catalog: a single card for the managed Parakeet
+/// engine — the only managed local STT (hosted-API STT is configured through the
+/// providers surface, not this picker). The card's status reflects the engine
+/// install/run state so the LLM/STT pages can show whether local STT is ready.
 fn stt_settings(state: &Arc<AppState>) -> UiModelSettings {
     let settings = AppSettings::load(&state.config.settings_path);
     let provider = chasm_core::normalize_stt_provider(&settings.stt.provider);
-    let parakeet_selected = provider == chasm_core::STT_PARAKEET_PROVIDER;
-    let (whisper_models, host) = crate::build_whisper_models(&settings, &state.system_info);
-    let panel = stt_panel_view(&settings.stt, whisper_models, host);
-    let selected_file = panel.model.clone();
+    let local_selected = provider == chasm_core::PROVIDER_LOCAL;
 
-    let mut models: Vec<UiModel> = panel
-        .models
-        .into_iter()
-        .map(|m: WhisperModelView| {
-            // When Parakeet is the active provider, no whisper card is "Active"
-            // even though a whisper model stays selected (it's the fallback).
-            let selected = m.selected && !parakeet_selected;
-            let status = download_status_pill(&m.status, m.status_label, selected);
-            UiModel {
-                description: Some(m.fit_hint),
-                installed: m.downloaded,
-                recommended: m.recommended,
-                meta: vec![UiModelMeta { label: "Size".to_string(), value: m.size_label }],
-                status: Some(status),
-                id: m.id,
-                name: m.name,
-            }
-        })
-        .collect();
-
-    // The Parakeet engine card, BELOW the whisper model choices. Selecting it
-    // switches the provider (the whisper model selection is preserved so
-    // switching back is one click).
     let parakeet_status = crate::parakeet_engine_status(state);
     let parakeet_installed = parakeet_status == "installed";
-    let parakeet_pill = if parakeet_selected && parakeet_installed {
+    let parakeet_pill = if local_selected && parakeet_installed {
         if crate::launcher::parakeet_running(state) {
             UiModelStatus { tone: "ok", label: "Running".to_string() }
         } else {
@@ -208,46 +186,27 @@ fn stt_settings(state: &Arc<AppState>) -> UiModelSettings {
             _ => UiModelStatus { tone: "idle", label: "Available".to_string() },
         }
     };
-    models.push(UiModel {
+    let models = vec![UiModel {
         id: chasm_core::STT_PARAKEET_PICKER_ID.to_string(),
         name: "Parakeet TDT 0.6B v3".to_string(),
         description: Some(
             "NVIDIA Parakeet on its own local server (GPU) — voice input never \
-             waits for the LLM. Works with any LLM runtime."
+             waits for the LLM. The only managed local STT engine."
                 .to_string(),
         ),
         installed: parakeet_installed,
-        recommended: false,
+        recommended: true,
         meta: vec![
             UiModelMeta { label: "Size".to_string(), value: "~2.4 GB".to_string() },
             UiModelMeta { label: "Port".to_string(), value: "5003".to_string() },
         ],
         status: Some(parakeet_pill),
-    });
-
-    // The picker's selected id: the Parakeet card when that provider is active,
-    // else the registry id of the active whisper `.bin` file.
-    let selected_id = if parakeet_selected {
-        Some(chasm_core::STT_PARAKEET_PICKER_ID.to_string())
-    } else {
-        whisper_model_by_id(&selected_file)
-            .map(|m| m.id.to_string())
-            .or_else(|| {
-                chasm_core::WHISPER_MODELS
-                    .iter()
-                    .find(|m| m.file == selected_file)
-                    .map(|m| m.id.to_string())
-            })
-    };
+    }];
 
     UiModelSettings {
         models,
-        selected_id,
-        folder: Some(
-            crate::launcher::whisper_models_dir(&settings)
-                .display()
-                .to_string(),
-        ),
+        selected_id: local_selected.then(|| chasm_core::STT_PARAKEET_PICKER_ID.to_string()),
+        folder: Some(state.config.engines_dir.display().to_string()),
     }
 }
 
@@ -357,80 +316,55 @@ fn tts_settings(state: &Arc<AppState>) -> UiModelSettings {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime (LLM runtime picker: koboldcpp / llama.cpp)
+// Runtime (LLM runtime picker: the managed llama.cpp runtime)
 // ---------------------------------------------------------------------------
 
-/// Builds the Runtimes catalog: one card per managed LLM runtime
-/// (`LLM_RUNTIMES`), with install state from the resolved exe / download
-/// markers. The selected card is the persisted `runtime.llm_runtime`
-/// (default koboldcpp). Rendered by the Settings → Runtimes screen through the
-/// same `<ModelPicker>` as the other domains.
+/// Builds the Runtimes catalog: the single managed LLM runtime, llama.cpp
+/// `llama-server`, with install state from the resolved exe / download markers.
+/// This is the one-click auto-install card the Runtimes page keeps (only MODEL
+/// FILES moved to guided manual placement). Rendered through the same
+/// `<ModelPicker>` as the other domains.
 fn runtime_settings(state: &Arc<AppState>) -> UiModelSettings {
-    let settings = AppSettings::load(&state.config.settings_path);
-    let selected = chasm_core::normalize_llm_runtime(&settings.runtime.llm_runtime);
-    let running = crate::launcher::koboldcpp_running(state); // :5001 reachable (either runtime)
-
-    let models = chasm_core::LLM_RUNTIMES
-        .iter()
-        .map(|(id, label)| {
-            let (status, description, meta) = match *id {
-                chasm_core::LLM_RUNTIME_LLAMACPP => (
-                    crate::launcher::llamacpp_status(&state.config),
-                    "llama-server: multiple prompt-cache slots, so group-scene \
-                     speaker swaps skip the full prompt reprocess. No Whisper — \
-                     voice input needs the Parakeet STT engine."
-                        .to_string(),
-                    vec![
-                        UiModelMeta { label: "Slots".to_string(), value: "2 × 8k ctx".to_string() },
-                        UiModelMeta { label: "STT".to_string(), value: "Parakeet only".to_string() },
-                    ],
-                ),
-                _ => (
-                    crate::launcher::koboldcpp_status(&settings, &state.config),
-                    "The default runtime: LLM + Whisper STT in one process. \
-                     Single KV slot (group-scene speaker swaps reprocess the prompt)."
-                        .to_string(),
-                    vec![
-                        UiModelMeta { label: "Slots".to_string(), value: "1 × 8k ctx".to_string() },
-                        UiModelMeta { label: "STT".to_string(), value: "Whisper + Parakeet".to_string() },
-                    ],
-                ),
-            };
-            let installed = status == crate::launcher::KoboldcppStatus::Installed;
-            let is_selected = *id == selected;
-            let pill = if is_selected && installed && running {
-                UiModelStatus { tone: "ok", label: "Running".to_string() }
-            } else {
-                match status {
-                    crate::launcher::KoboldcppStatus::Installed if is_selected => {
-                        UiModelStatus { tone: "ok", label: "Selected".to_string() }
-                    }
-                    crate::launcher::KoboldcppStatus::Installed => {
-                        UiModelStatus { tone: "ok", label: "Installed".to_string() }
-                    }
-                    crate::launcher::KoboldcppStatus::Downloading => {
-                        UiModelStatus { tone: "busy", label: "Downloading…".to_string() }
-                    }
-                    crate::launcher::KoboldcppStatus::Missing => {
-                        UiModelStatus { tone: "idle", label: "Not installed".to_string() }
-                    }
-                }
-            };
-            UiModel {
-                id: (*id).to_string(),
-                name: (*label).to_string(),
-                description: Some(description),
-                installed,
-                recommended: *id == chasm_core::LLM_RUNTIME_DEFAULT,
-                meta,
-                status: Some(pill),
+    let status = crate::launcher::llamacpp_status(&state.config);
+    let installed = status == crate::launcher::RuntimeStatus::Installed;
+    let running = installed && crate::launcher::llm_runtime_running(state);
+    let pill = if running {
+        UiModelStatus { tone: "ok", label: "Running".to_string() }
+    } else {
+        match status {
+            crate::launcher::RuntimeStatus::Installed => {
+                UiModelStatus { tone: "ok", label: "Installed".to_string() }
             }
-        })
-        .collect();
+            crate::launcher::RuntimeStatus::Downloading => {
+                UiModelStatus { tone: "busy", label: "Downloading…".to_string() }
+            }
+            crate::launcher::RuntimeStatus::Missing => {
+                UiModelStatus { tone: "idle", label: "Not installed".to_string() }
+            }
+        }
+    };
+
+    let models = vec![UiModel {
+        id: chasm_core::LLM_RUNTIME_LLAMACPP.to_string(),
+        name: "llama.cpp (llama-server)".to_string(),
+        description: Some(
+            "The managed local LLM runtime (OpenAI-compatible on :5001), with \
+             multiple prompt-cache slots so group-scene speaker swaps skip the \
+             full prompt reprocess. Auto-downloads with one click."
+                .to_string(),
+        ),
+        installed,
+        recommended: true,
+        meta: vec![
+            UiModelMeta { label: "Slots".to_string(), value: "2 × 8k ctx".to_string() },
+            UiModelMeta { label: "STT".to_string(), value: "Parakeet".to_string() },
+        ],
+        status: Some(pill),
+    }];
 
     UiModelSettings {
         models,
-        selected_id: Some(selected),
+        selected_id: Some(chasm_core::LLM_RUNTIME_LLAMACPP.to_string()),
         folder: Some(
             crate::launcher::llamacpp_managed_default(&state.config)
                 .parent()
@@ -503,46 +437,20 @@ fn apply_select(state: &Arc<AppState>, domain: &str, id: &str) {
             }
         }
         "stt" => {
-            let prev_provider = chasm_core::normalize_stt_provider(&settings.stt.provider);
-            if id == chasm_core::STT_PARAKEET_PICKER_ID {
-                // Parakeet card: switch the PROVIDER; the whisper model selection
-                // is preserved so switching back is one click.
-                settings.stt.provider = chasm_core::STT_PARAKEET_PROVIDER.to_string();
-                if settings.save(&state.config.settings_path).is_err() {
-                    return;
-                }
-                let state = Arc::clone(state);
-                tokio::task::spawn_blocking(move || {
-                    // Spawns the Parakeet server (or logs "not installed").
-                    crate::launcher::apply_selected_stt_provider(&state);
-                });
+            // The only local STT card is Parakeet; selecting it sets the provider
+            // to the managed-local option and spawns the server.
+            if id != chasm_core::STT_PARAKEET_PICKER_ID {
                 return;
             }
-            // A whisper card: persist the model's `.bin` file (the value
-            // `stt.model` stores, like apply_stt_form) AND make whisper the
-            // provider again if Parakeet was active.
-            let Some(model) = whisper_model_by_id(id) else {
-                return;
-            };
-            let prev = chasm_core::stt_effective_model(&settings.stt);
-            settings.stt.provider = chasm_core::STT_DEFAULT_PROVIDER.to_string();
-            settings.stt.model = model.file.to_string();
+            let prev = chasm_core::normalize_stt_provider(&settings.stt.provider);
+            settings.stt.provider = chasm_core::PROVIDER_LOCAL.to_string();
             if settings.save(&state.config.settings_path).is_err() {
                 return;
             }
-            let new = chasm_core::stt_effective_model(&settings.stt);
-            let provider_changed = prev_provider != chasm_core::STT_DEFAULT_PROVIDER;
-            if new != prev || provider_changed {
+            if prev != chasm_core::PROVIDER_LOCAL {
                 let state = Arc::clone(state);
-                let file = new.clone();
                 tokio::task::spawn_blocking(move || {
-                    if provider_changed {
-                        // Back to whisper: stop the Parakeet server (frees VRAM).
-                        crate::launcher::apply_selected_stt_provider(&state);
-                    }
-                    if !file.is_empty() {
-                        crate::launcher::apply_selected_whisper_model(&state, &file);
-                    }
+                    crate::launcher::apply_selected_stt_provider(&state);
                 });
             }
         }
@@ -557,7 +465,7 @@ fn apply_select(state: &Arc<AppState>, domain: &str, id: &str) {
             settings.retrieval.embedder_tier = normalize_embedder_tier(model.tier);
             let _ = settings.save(&state.config.settings_path);
             // The retriever loads lazily on the next turn that needs it; no live
-            // kill/respawn (unlike koboldcpp/TTS, the embedder is in-process).
+            // kill/respawn (unlike the LLM runtime/TTS, the embedder is in-process).
         }
         "tts" => {
             let prev = normalize_local_engine(&settings.tts.local_engine);
@@ -573,23 +481,9 @@ fn apply_select(state: &Arc<AppState>, domain: &str, id: &str) {
             }
         }
         "runtime" => {
-            // Only accept a known runtime id; persist normalized. On change,
-            // swap the process serving :5001 (kill both engines + respawn the
-            // selected one on the same model).
-            if !chasm_core::LLM_RUNTIMES.iter().any(|(value, _)| *value == id) {
-                return;
-            }
-            let prev = chasm_core::normalize_llm_runtime(&settings.runtime.llm_runtime);
-            settings.runtime.llm_runtime = chasm_core::normalize_llm_runtime(id);
-            if settings.save(&state.config.settings_path).is_err() {
-                return;
-            }
-            if settings.runtime.llm_runtime != prev {
-                let state = Arc::clone(state);
-                tokio::task::spawn_blocking(move || {
-                    crate::launcher::apply_selected_llm_runtime(&state);
-                });
-            }
+            // llama.cpp is the only managed LLM runtime — there is nothing to
+            // switch. Selection is a no-op (the card is informational; installing
+            // it happens via the download endpoint).
         }
         _ => {}
     }
@@ -608,18 +502,18 @@ pub(crate) async fn download_model(
     if !id.is_empty() {
         match domain.as_str() {
             "llm" => {
+                // LLM MODELS are now placed manually (guided browser-download +
+                // drag-drop); this legacy path just ensures the managed runtime is
+                // present. The React LLM page no longer exposes a model download.
                 let _ = crate::start_llm_download(&state, &id);
-                // One download also pulls the koboldcpp runtime if absent.
-                crate::ensure_koboldcpp(&state);
+                crate::ensure_llamacpp(&state);
             }
             "stt" => {
+                // The Parakeet card installs the engine venv + prefetches the
+                // .nemo (same install shape as the TTS engines). This is the only
+                // managed local STT.
                 if id == chasm_core::STT_PARAKEET_PICKER_ID {
-                    // The Parakeet card installs the engine venv + prefetches the
-                    // .nemo (same install shape as the TTS engines).
                     let _ = crate::start_engine_install(&state, chasm_core::PARAKEET_ENGINE_ID);
-                } else {
-                    let _ = crate::start_whisper_download(&state, &id);
-                    crate::ensure_koboldcpp(&state);
                 }
             }
             "retrieval" => {
@@ -628,11 +522,11 @@ pub(crate) async fn download_model(
             "tts" => {
                 let _ = crate::start_engine_install(&state, &id);
             }
-            "runtime" => match id.as_str() {
-                chasm_core::LLM_RUNTIME_LLAMACPP => crate::ensure_llamacpp(&state),
-                chasm_core::LLM_RUNTIME_DEFAULT => crate::ensure_koboldcpp(&state),
-                _ => {}
-            },
+            "runtime" => {
+                if id == chasm_core::LLM_RUNTIME_LLAMACPP {
+                    crate::ensure_llamacpp(&state);
+                }
+            }
             _ => {}
         }
     }

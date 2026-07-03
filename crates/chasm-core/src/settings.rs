@@ -5,10 +5,15 @@
 //! Settings persist to a small JSON file; nothing here is wired to an actual
 //! TTS/LLM/STT engine yet.
 
-use std::{collections::HashMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs,
+    path::Path,
+};
 
 use serde::{Deserialize, Serialize};
 
+use crate::providers::ApiProviderConfig;
 use crate::system_info::{recommended_index, GpuFit, SystemInfo};
 
 // ---------------------------------------------------------------------------
@@ -25,7 +30,8 @@ pub struct AppSettings {
     pub stt: SttSettings,
     pub retrieval: RetrievalSettings,
     /// Managed local-runtime selection (the Runtimes settings page). Serde
-    /// default so older settings files keep loading (empty → koboldcpp).
+    /// default so older settings files keep loading (empty → the managed
+    /// llama.cpp runtime).
     pub runtime: RuntimeSettings,
     /// Game launcher (Mod Organizer 2 + headless FNV launch) overrides.
     pub launcher: LauncherSettings,
@@ -37,6 +43,12 @@ pub struct AppSettings {
     /// Player-persona generation (the mod's stealth capture → vision/stats LLM
     /// description shown on the Persona page and injected into NPC prompts).
     pub persona: PersonaSettings,
+    /// Cross-capability API keys, keyed by provider id (e.g. `openrouter`,
+    /// `openai`, `groq`). One account = one key, so a key entered for the LLM
+    /// carries over to STT/TTS that share the same provider. A per-capability
+    /// `api[provider].api_key` still overrides this when set. Secret; never logged.
+    #[serde(default)]
+    pub api_keys: BTreeMap<String, String>,
 }
 
 impl Default for AppSettings {
@@ -52,6 +64,7 @@ impl Default for AppSettings {
             tracing: TracingSettings::default(),
             interface: InterfaceSettings::default(),
             persona: PersonaSettings::default(),
+            api_keys: BTreeMap::new(),
         }
     }
 }
@@ -191,56 +204,42 @@ pub struct LauncherSettings {
     pub nexus_api_key: String,
 }
 
-/// Managed local-runtime selection (the Settings → Runtimes screen). Separate
-/// from [`LlmSettings`] (which picks the MODEL) so the runtime that serves the
-/// model can change independently.
+/// Managed local-runtime settings (the Settings → Runtimes screen).
 ///
-/// `#[serde(default)]` + an empty-string default so older settings files (no
-/// `runtime` key) load fine and keep behaving exactly as before (empty
-/// normalizes to koboldcpp — the historical runtime).
+/// llama.cpp (`llama-server`) is now the ONLY managed local LLM runtime, so there
+/// is no runtime picker any more — this struct is retained (empty) so the
+/// `runtime` settings key keeps (de)serializing and future managed-runtime knobs
+/// have a home. An older settings file's `runtime.llm_runtime` value is simply
+/// ignored on load (serde is not `deny_unknown_fields`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct RuntimeSettings {
-    /// Selected managed LLM runtime value (matches [`LLM_RUNTIMES`]):
-    /// `"koboldcpp"` (default) or `"llamacpp"`. Empty/unknown → koboldcpp.
-    pub llm_runtime: String,
-}
+pub struct RuntimeSettings {}
 
-/// The default managed LLM runtime — koboldcpp, which also hosts Whisper STT.
-pub const LLM_RUNTIME_DEFAULT: &str = "koboldcpp";
-
-/// The llama.cpp runtime value: `llama-server` serving the same OpenAI-compatible
-/// chat API on the same port, with MULTIPLE prompt-cache slots (`--parallel`) so
-/// group-scene speaker swaps keep per-speaker KV caches instead of paying a full
-/// prompt reprocess on every swap (koboldcpp has a single KV slot). llama-server
-/// has NO Whisper: with this runtime, voice input needs the Parakeet STT provider.
+/// The one managed local LLM runtime: llama.cpp `llama-server` (OpenAI-compatible
+/// chat API on :5001, multiple prompt-cache slots). Kept as a stable id for the
+/// Runtimes install card + the desktop shell's runtime-ensure path.
 pub const LLM_RUNTIME_LLAMACPP: &str = "llamacpp";
-
-/// Available managed LLM runtimes (value, label).
-pub const LLM_RUNTIMES: &[(&str, &str)] = &[
-    (LLM_RUNTIME_DEFAULT, "KoboldCpp"),
-    (LLM_RUNTIME_LLAMACPP, "llama.cpp (llama-server)"),
-];
-
-/// Normalizes a saved/posted LLM runtime to a known value, defaulting to
-/// koboldcpp for empty/unknown values (so existing installs are unaffected).
-pub fn normalize_llm_runtime(runtime: &str) -> String {
-    let candidate = runtime.trim();
-    if LLM_RUNTIMES.iter().any(|(value, _)| *value == candidate) {
-        candidate.to_string()
-    } else {
-        LLM_RUNTIME_DEFAULT.to_string()
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmSettings {
+    /// Selected LLM provider: `"local"` (managed llama.cpp, default) or a hosted
+    /// API id from [`crate::LLM_API_PROVIDERS`] (`openai` / `anthropic` / `gemini`
+    /// / `openrouter` / `openai_compat`). Normalized via
+    /// [`crate::normalize_llm_provider`].
     pub provider: String,
+    /// Selected LOCAL model id (an [`LlmModel::id`], e.g. `"gemma-4-12b"`). Only
+    /// used when `provider == "local"`.
     pub model: String,
-    /// Per-request generation sampling sent to the local llama.cpp
-    /// (OpenAI-compatible) server on every NPC / admin turn. Defaults match the
-    /// previous hard-coded behaviour so nothing changes until the user tweaks.
+    /// Per-provider hosted-API credentials/config, keyed by provider id. Only the
+    /// active provider's entry is consulted at request time. API keys here are
+    /// secrets — never logged.
+    #[serde(default)]
+    pub api: BTreeMap<String, ApiProviderConfig>,
+    /// Per-request generation sampling sent to the LLM (OpenAI-compatible shape)
+    /// on every NPC / admin turn. Defaults match the previous hard-coded
+    /// behaviour so nothing changes until the user tweaks. Applies to the local
+    /// runtime and the OpenAI-compatible hosted providers.
     pub sampling: LlmSamplingSettings,
     /// Live chat orchestrator: when off, the first eligible NPC always speaks
     /// (no director LLM call). When on, multi-NPC scenes get one director call.
@@ -382,8 +381,9 @@ Rules:
 impl Default for LlmSettings {
     fn default() -> Self {
         Self {
-            provider: String::new(),
+            provider: crate::PROVIDER_LOCAL.to_string(),
             model: String::new(),
+            api: BTreeMap::new(),
             sampling: LlmSamplingSettings::default(),
             orchestrator_enabled: ORCHESTRATOR_DEFAULT_ENABLED,
             orchestrator_max_speakers: ORCHESTRATOR_DEFAULT_MAX_SPEAKERS,
@@ -396,19 +396,21 @@ impl Default for LlmSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SttSettings {
-    /// Selected STT provider value (matches [`STT_PROVIDERS`]). Only `whisper`
-    /// (koboldcpp's local Whisper) is available.
+    /// Selected STT provider: `"local"` (the managed Parakeet engine, default) or
+    /// a hosted API id from [`crate::STT_API_PROVIDERS`] (`openai` / `groq` /
+    /// `deepgram` / `assemblyai`). Normalized via [`crate::normalize_stt_provider`]
+    /// (legacy `"whisper"` / `"parakeet"` → `"local"`).
     pub provider: String,
-    /// Transcription model sent to koboldcpp — the GGML `.bin` filename of the
-    /// active Whisper model (a [`WhisperModel::file`] value). Blank/legacy values
-    /// fall back to [`STT_WHISPER_DEFAULT_MODEL`].
-    pub model: String,
-    /// Optional default language hint (e.g. `en`). Empty = auto.
+    /// Per-provider hosted-API credentials/config, keyed by provider id. API keys
+    /// are secrets — never logged.
+    #[serde(default)]
+    pub api: BTreeMap<String, ApiProviderConfig>,
+    /// Optional default language hint (e.g. `en`). Empty = auto. Applies to every
+    /// provider that accepts a language hint.
     pub language: String,
     /// Optional default transcription prompt — a biasing hint forwarded as the
-    /// OpenAI `prompt` multipart field when a request doesn't supply its own.
-    /// Wired in `speech_recognize`: it reaches koboldcpp's Whisper request form,
-    /// so it genuinely affects decoding. Empty = none.
+    /// `prompt` field to providers that accept one (Parakeet / OpenAI / Groq).
+    /// Empty = none.
     pub prompt: String,
     /// Default request timeout in ms for a transcription call, used when the
     /// request body omits `timeoutMs`. Wired as the actual reqwest timeout on the
@@ -419,10 +421,8 @@ pub struct SttSettings {
 impl Default for SttSettings {
     fn default() -> Self {
         Self {
-            provider: STT_DEFAULT_PROVIDER.to_string(),
-            // No default Whisper model: the user must download + pick one (see
-            // `stt_effective_model`). Empty = "none selected".
-            model: String::new(),
+            provider: crate::PROVIDER_LOCAL.to_string(),
+            api: BTreeMap::new(),
             language: String::new(),
             prompt: String::new(),
             timeout_ms: STT_TIMEOUT_MS_DEFAULT,
@@ -509,11 +509,28 @@ impl Default for RetrievalSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TtsSettings {
-    /// `"local"` or `"api"`.
+    /// Selected TTS provider: `"local"` (a managed local engine, default) or a
+    /// hosted API id from [`crate::TTS_API_PROVIDERS`] (`elevenlabs` / `openai` /
+    /// `cartesia`). Normalized via [`crate::normalize_tts_provider`]. Supersedes
+    /// the legacy `mode` + `api_provider` pair (still read for migration).
+    ///
+    /// Field-level `#[serde(default)]` (empty string) so a PRE-REWORK file — one
+    /// with `mode`/`api_provider` but no `provider` key — deserializes this as
+    /// blank, letting [`AppSettings::migrate`] derive the provider from the legacy
+    /// pair. (A file with no `tts` key at all falls back to the struct default,
+    /// `PROVIDER_LOCAL`, via the container `#[serde(default)]`.)
+    #[serde(default)]
+    pub provider: String,
+    /// Per-provider hosted-API credentials/config, keyed by provider id. API keys
+    /// are secrets — never logged.
+    #[serde(default)]
+    pub api: BTreeMap<String, ApiProviderConfig>,
+    /// Legacy `"local"` / `"api"` mode selector. Retained for migration + the
+    /// audio-tags profile; routing now uses [`Self::provider`].
     pub mode: String,
-    /// Selected local engine value (e.g. `"pockettts"`).
+    /// Selected local engine value (e.g. `"faster-qwen3-tts"`).
     pub local_engine: String,
-    /// Selected API provider value (matches [`TTS_API_PROVIDERS`]).
+    /// Legacy API provider value (used by the audio-tags profile list).
     pub api_provider: String,
     /// MAX size (ms of audio) of a streamed TTS chunk. The backend ramps slices (a
     /// small first slice for fast first-audio, doubling up to this cap) so the plugin
@@ -548,6 +565,8 @@ pub struct TtsSettings {
 impl Default for TtsSettings {
     fn default() -> Self {
         Self {
+            provider: crate::PROVIDER_LOCAL.to_string(),
+            api: BTreeMap::new(),
             mode: "local".to_string(),
             // No default engine: the user must pick + install one (see
             // `normalize_local_engine`). Empty = "none selected".
@@ -714,10 +733,74 @@ impl Default for AudioTagsSettings {
 
 impl AppSettings {
     /// Loads settings from `path`, falling back to defaults if missing/invalid.
+    /// A successfully-parsed value is run through [`Self::migrate`] so pre-rework
+    /// settings files (legacy koboldcpp runtime + whisper/parakeet STT + legacy
+    /// TTS mode) land in the new provider shape; the default-on-error path already
+    /// produces
+    /// new-shape defaults, so it needs no migration.
     pub fn load(path: &Path) -> Self {
-        fs::read_to_string(path)
+        match fs::read_to_string(path)
             .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
+            .and_then(|text| serde_json::from_str::<Self>(&text).ok())
+        {
+            Some(mut settings) => {
+                settings.migrate();
+                settings
+            }
+            None => Self::default(),
+        }
+    }
+
+    /// Migrates a just-loaded settings value from the pre-rework shape (legacy
+    /// koboldcpp LLM runtime + koboldcpp/whisper or parakeet STT + legacy TTS
+    /// mode) to the new provider shape. Idempotent (safe to run on already-new
+    /// files).
+    fn migrate(&mut self) {
+        self.llm.provider = crate::normalize_llm_provider(&self.llm.provider);
+        self.stt.provider = crate::normalize_stt_provider(&self.stt.provider);
+        // TTS: derive the new provider from the legacy mode + api_provider when the
+        // new `provider` is blank; else normalize what's there.
+        if self.tts.provider.trim().is_empty() {
+            let legacy = if self.tts.mode.eq_ignore_ascii_case("api") {
+                match self.tts.api_provider.trim().to_ascii_lowercase().as_str() {
+                    "elevenlabs" => "elevenlabs",
+                    "openai" => "openai",
+                    "cartesia" => "cartesia",
+                    _ => crate::PROVIDER_LOCAL,
+                }
+            } else {
+                crate::PROVIDER_LOCAL
+            };
+            self.tts.provider = legacy.to_string();
+        }
+        self.tts.provider = crate::normalize_tts_provider(&self.tts.provider);
+
+        // Promote any per-capability API keys into the shared cross-capability
+        // store, so a key entered before this feature carries over. First one wins;
+        // never clobbers an existing shared key.
+        let maps = [&self.llm.api, &self.stt.api, &self.tts.api];
+        for map in maps {
+            for (provider, cfg) in map {
+                let key = cfg.api_key.trim();
+                if !key.is_empty() && !self.api_keys.contains_key(provider) {
+                    self.api_keys.insert(provider.clone(), key.to_string());
+                }
+            }
+        }
+    }
+
+    /// The effective API key for `provider`: the per-capability config's own key
+    /// when set, else the shared cross-capability key. This is what makes a key
+    /// entered for one capability (e.g. OpenRouter in the LLM page) carry over to
+    /// the others that share the provider (STT/TTS).
+    pub fn provider_key(&self, cap_cfg: Option<&ApiProviderConfig>, provider: &str) -> String {
+        let own = cap_cfg.map(|c| c.api_key.trim()).unwrap_or("");
+        if !own.is_empty() {
+            return own.to_string();
+        }
+        self.api_keys
+            .get(provider)
+            .map(|k| k.trim().to_string())
             .unwrap_or_default()
     }
 
@@ -850,174 +933,19 @@ const DEFAULT_MAX_TAGS_PER_REPLY: u8 = 2;
 // STT reference data
 // ---------------------------------------------------------------------------
 
-/// The default STT provider: the local koboldcpp Whisper server
-/// (OpenAI-compatible `/v1/audio/transcriptions`). Nothing changes for an
-/// existing install unless the user explicitly selects Parakeet.
-pub const STT_DEFAULT_PROVIDER: &str = "whisper";
-
-/// Default Whisper transcription model — the GGML `.bin` filename koboldcpp
-/// loads via `--whispermodel`. This is the OpenAI `model` field on the request
-/// AND the on-disk filename probed under the Whisper models dir; the picker keeps
-/// the two in sync. Matches the current `whisper-small-q5_1.bin` build.
-pub const STT_WHISPER_DEFAULT_MODEL: &str = WHISPER_MODELS[2].file; // small (q5_1)
-
-/// The Parakeet STT provider value — a dedicated local ASR server (NVIDIA
-/// Parakeet TDT 0.6B v3 via nano-parakeet on CUDA) serving the same
-/// OpenAI-compatible `/v1/audio/transcriptions` on its own port, so voice input
-/// never queues behind an LLM generation in koboldcpp's single slot.
-pub const STT_PARAKEET_PROVIDER: &str = "parakeet";
-
 /// The HuggingFace repo the Parakeet server loads (nano-parakeet downloads the
 /// `.nemo` from here into the HF cache on install/first run).
 pub const PARAKEET_HF_REPO: &str = "nvidia/parakeet-tdt-0.6b-v3";
 
 /// The engine id of the Parakeet server's managed venv under `engines/<id>`
-/// (mirrors the TTS engines' `engines/pockettts` / `engines/faster-qwen3-tts`).
+/// (mirrors the TTS engines' `engines/faster-qwen3-tts`). Parakeet is now the
+/// ONLY managed local STT (the legacy koboldcpp-hosted Whisper engine has been
+/// removed).
 pub const PARAKEET_ENGINE_ID: &str = "parakeet";
 
-/// The picker id of the Parakeet card on the STT settings screen (listed below
-/// the Whisper models).
+/// The picker id of the Parakeet card on the STT settings screen — the single
+/// managed-local ("local") STT option.
 pub const STT_PARAKEET_PICKER_ID: &str = "parakeet";
-
-/// Available STT providers (value, label): the local koboldcpp Whisper server
-/// (default) and the dedicated local Parakeet server.
-pub const STT_PROVIDERS: &[(&str, &str)] = &[
-    ("whisper", "Whisper (koboldcpp, local)"),
-    (
-        STT_PARAKEET_PROVIDER,
-        "Parakeet TDT 0.6B v3 (dedicated local server)",
-    ),
-];
-
-/// Normalizes a saved/posted STT provider to a known value (`whisper` /
-/// `parakeet`), defaulting to Whisper for empty/unknown values (e.g. legacy
-/// `sillytavern`).
-pub fn normalize_stt_provider(provider: &str) -> String {
-    let candidate = provider.trim();
-    if STT_PROVIDERS.iter().any(|(value, _)| *value == candidate) {
-        candidate.to_string()
-    } else {
-        STT_DEFAULT_PROVIDER.to_string()
-    }
-}
-
-/// The effective transcription model: the saved Whisper `.bin` filename, or `""`
-/// when nothing valid is selected. There is NO default model for a public release —
-/// the user must download + pick one — so empty/stale values resolve to "none
-/// selected" (empty), never a silent fallback. A saved Parakeet model name
-/// (`nvidia/parakeet-…`) from an older settings file is treated as stale and
-/// dropped, so the picker never shows a model koboldcpp can't load.
-pub fn stt_effective_model(stt: &SttSettings) -> String {
-    let model = stt.model.trim();
-    if model.is_empty() || model.starts_with("nvidia/") || model.contains("parakeet") {
-        String::new()
-    } else {
-        model.to_string()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Whisper model registry (downloadable GGML .bin builds for koboldcpp)
-// ---------------------------------------------------------------------------
-
-/// One downloadable Whisper model — a GGML `.bin` build koboldcpp loads via
-/// `--whispermodel`. Download state is detected at runtime from the Whisper
-/// models directory (the `file` present / a `.downloading` marker). Mirrors
-/// [`LlmModel`] but the on-disk filename IS the OpenAI `model` value (koboldcpp
-/// keys whisper off the loaded file, not a HF repo id).
-#[derive(Debug, Clone, Copy)]
-pub struct WhisperModel {
-    /// Stable id used in routes/markers (e.g. `large-v3-turbo`).
-    pub id: &'static str,
-    /// Display name (e.g. `Large v3 Turbo`).
-    pub name: &'static str,
-    /// The GGML `.bin` filename — both the download target and the `model` field
-    /// sent on each transcription request.
-    pub file: &'static str,
-    /// Approximate on-disk / VRAM footprint in GB (drives the recommended badge).
-    pub size_gb: f64,
-    /// Approximate VRAM/RAM the model needs at inference (whisper.cpp f16), in GB.
-    /// Whisper runs the same on GPU or CPU, so one number covers both. Feeds the
-    /// onboarding hardware-fit recommendation.
-    pub vram_gb: f64,
-}
-
-/// The HuggingFace repo every Whisper GGML build is pulled from.
-pub const WHISPER_REPO: &str = "ggerganov/whisper.cpp";
-
-/// The standard Whisper models offered in the STT picker, smallest → largest.
-/// Filenames are the exact GGML builds in `ggerganov/whisper.cpp` (`main`). The
-/// quantized small build (`whisper-small-q5_1.bin`) is the current default; the
-/// rest are the canonical full-precision builds. `large-v3-turbo` is the speed
-/// pick (distilled large, near-large accuracy at a fraction of the cost).
-pub const WHISPER_MODELS: &[WhisperModel] = &[
-    WhisperModel {
-        id: "tiny",
-        name: "Tiny",
-        file: "ggml-tiny.bin",
-        size_gb: 0.08,
-        vram_gb: 0.3,
-    },
-    WhisperModel {
-        id: "base",
-        name: "Base",
-        file: "ggml-base.bin",
-        size_gb: 0.15,
-        vram_gb: 0.4,
-    },
-    WhisperModel {
-        id: "small",
-        name: "Small (q5_1, current)",
-        file: "whisper-small-q5_1.bin",
-        size_gb: 0.2,
-        vram_gb: 0.9,
-    },
-    WhisperModel {
-        id: "medium",
-        name: "Medium",
-        file: "ggml-medium.bin",
-        size_gb: 1.5,
-        vram_gb: 2.1,
-    },
-    WhisperModel {
-        id: "large-v3",
-        name: "Large v3",
-        file: "ggml-large-v3.bin",
-        size_gb: 3.1,
-        vram_gb: 3.9,
-    },
-    WhisperModel {
-        id: "large-v3-turbo",
-        name: "Large v3 Turbo",
-        file: "ggml-large-v3-turbo.bin",
-        size_gb: 1.6,
-        vram_gb: 1.8,
-    },
-];
-
-/// Resolves a Whisper model by its registry id.
-pub fn whisper_model_by_id(id: &str) -> Option<&'static WhisperModel> {
-    WHISPER_MODELS.iter().find(|model| model.id == id)
-}
-
-/// Resolves the Whisper model whose `.bin` filename matches `file` (the saved
-/// `model` value), so the picker can highlight the active model's radio.
-pub fn whisper_model_by_file(file: &str) -> Option<&'static WhisperModel> {
-    let candidate = file.trim();
-    WHISPER_MODELS.iter().find(|model| model.file == candidate)
-}
-
-/// Human label for a Whisper model download status string (mirrors
-/// [`llm_model_status_label`]).
-pub fn whisper_model_status_label(status: &str) -> String {
-    match status {
-        "downloaded" => "Downloaded",
-        "downloading" => "Downloading…",
-        "failed" => "Download failed",
-        _ => "Available",
-    }
-    .to_string()
-}
 
 // ---------------------------------------------------------------------------
 // Interface (appearance) reference data + dynamic theme stylesheet
@@ -1353,23 +1281,6 @@ pub const LLM_MODELS: &[LlmModel] = &[
     },
 ];
 
-// ---------------------------------------------------------------------------
-// Whisper download-detection helper (shared by the STT page + onboarding)
-// ---------------------------------------------------------------------------
-
-/// A lowercase stem used to detect any download of a Whisper model on disk: a
-/// `.bin` whose lowercased name contains this stem counts as downloaded. Derived
-/// from the filename without the `ggml-` prefix / `.bin` suffix.
-pub fn whisper_model_match_stem(model: &WhisperModel) -> String {
-    model
-        .file
-        .strip_prefix("ggml-")
-        .unwrap_or(model.file)
-        .strip_suffix(".bin")
-        .unwrap_or(model.file)
-        .to_lowercase()
-}
-
 /// The basename of a repo (the part after `/`), used to build the conventional
 /// GGUF filename: `<repo-basename>-<quant>.gguf`.
 pub fn llm_repo_basename(repo: &str) -> &str {
@@ -1553,8 +1464,12 @@ pub fn engine_status_label(status: &str) -> String {
     .to_string()
 }
 
-/// All API TTS providers available in SillyTavern (the TTS provider dropdown).
-pub const TTS_API_PROVIDERS: &[&str] = &[
+/// Provider names for the audio-tags PROFILE list (mirrored from SillyTavern's TTS
+/// provider dropdown). This is ONLY the audio-tag emote-profile selector; the
+/// actual hosted-TTS routing providers are [`crate::TTS_API_PROVIDERS`] in
+/// `providers.rs`. Renamed from the old `TTS_API_PROVIDERS` to avoid colliding
+/// with that catalog.
+pub const TTS_AUDIO_TAG_PROVIDERS: &[&str] = &[
     "AllTalk",
     "Azure",
     "Chatterbox",
@@ -1594,7 +1509,7 @@ pub fn tts_audio_tag_profiles() -> Vec<(String, String)> {
         ("custom".to_string(), "Custom".to_string()),
     ];
     options.extend(
-        TTS_API_PROVIDERS
+        TTS_AUDIO_TAG_PROVIDERS
             .iter()
             .map(|name| (name.to_string(), name.to_string())),
     );
@@ -2035,58 +1950,6 @@ pub fn tts_tuning_view(tuning: &TtsTuningSettings) -> TtsTuningView {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct SttProviderView {
-    pub value: String,
-    pub label: String,
-    pub selected: bool,
-}
-
-/// One downloadable Whisper model as rendered in the STT picker (radio +
-/// download button + status pill + recommended badge + hardware hint). Mirrors
-/// [`LlmModelView`] / [`RetrievalModelView`]; `selected` drives the radio's
-/// `checked` state (the active model is the saved `model` filename).
-#[derive(Debug, Clone, Serialize)]
-pub struct WhisperModelView {
-    pub id: String,
-    pub name: String,
-    /// The GGML `.bin` filename — the radio's value AND the `model` field saved.
-    pub file: String,
-    /// Approx footprint, pre-formatted (e.g. `~0.2 GB`).
-    pub size_label: String,
-    /// `downloaded`, `downloading`, `failed`, or `available`.
-    pub status: String,
-    pub status_label: String,
-    pub downloaded: bool,
-    pub downloading: bool,
-    pub can_download: bool,
-    /// `true` for the single best-fit model (the "Recommended" badge).
-    pub recommended: bool,
-    /// Short hardware hint, e.g. `Fits GPU comfortably` / `CPU only`.
-    pub fit_hint: String,
-    /// `true` when this model's `.bin` is the currently-selected one (drives the
-    /// radio's `checked` state). Set in [`stt_panel_view`].
-    pub selected: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SttPanelView {
-    pub provider: String,
-    pub providers: Vec<SttProviderView>,
-    pub model: String,
-    pub language: String,
-    pub prompt: String,
-    pub timeout_ms: u64,
-    pub timeout_ms_min: u64,
-    pub timeout_ms_max: u64,
-    /// Downloadable Whisper models (status + recommended badge + active radio).
-    /// Built by the web layer (depends on on-disk download status + hardware).
-    pub models: Vec<WhisperModelView>,
-    /// Detected-host summary shown above the model list (reuses the retrieval
-    /// host view shape).
-    pub host: RetrievalHostView,
-}
-
 /// The LLM generation-sampling card view: the current (normalized) value of
 /// every knob plus the min/max/step each input should render.
 #[derive(Debug, Clone, Serialize)]
@@ -2258,43 +2121,6 @@ pub struct ProfilesPanelView {
     pub profiles: Vec<ProfileCardView>,
     /// The profiles directory path (shown in the "how to add a profile" note).
     pub profiles_dir: String,
-}
-
-/// Builds the STT panel view from the persisted settings + reference data.
-/// `models` + `host` are built by the caller (the web layer) because they depend
-/// on detected hardware and the on-disk download status of each Whisper `.bin`.
-/// The active model (the saved `model` filename) is marked `selected` so its
-/// radio renders checked.
-pub fn stt_panel_view(
-    stt: &SttSettings,
-    mut models: Vec<WhisperModelView>,
-    host: RetrievalHostView,
-) -> SttPanelView {
-    let provider = normalize_stt_provider(&stt.provider);
-    let providers = STT_PROVIDERS
-        .iter()
-        .map(|(value, label)| SttProviderView {
-            selected: *value == provider,
-            value: value.to_string(),
-            label: label.to_string(),
-        })
-        .collect();
-    let active_model = stt_effective_model(stt);
-    for model in &mut models {
-        model.selected = model.file == active_model;
-    }
-    SttPanelView {
-        provider,
-        providers,
-        model: active_model,
-        language: stt.language.clone(),
-        prompt: stt.prompt.clone(),
-        timeout_ms: normalize_stt_timeout_ms(stt.timeout_ms),
-        timeout_ms_min: STT_TIMEOUT_MS_MIN,
-        timeout_ms_max: STT_TIMEOUT_MS_MAX,
-        models,
-        host,
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2471,103 +2297,6 @@ pub fn clone_status_label(status: &str) -> String {
     .to_string()
 }
 
-/// The "drop files here to add models manually" folder paths, one per model
-/// category. Each is an absolute path string computed in the web layer (the
-/// dirs are filesystem-dependent), rendered on the matching category's panel.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct ModelPathsView {
-    /// LLM GGUF folder (`llm_models_dir`) — drop `*.gguf` files here.
-    pub llm: String,
-    /// Whisper `.bin` folder (`whisper_models_dir`) — drop `*.bin` files here.
-    pub stt: String,
-    /// Active profile's voice-samples folder (`active_voices_dir`) — drop voice
-    /// audio here to add clone voices.
-    pub tts_voices: String,
-    /// Where the TTS engine venvs are installed (`engines_dir`) — shown for
-    /// reference (installed via the picker, not really drag-droppable).
-    pub tts_engines: String,
-}
-
-/// The runtime-requirement status shown on a model settings page: which runtime
-/// runs the page's models (koboldcpp for LLM/STT, the TTS engine for TTS) and
-/// whether it's present. `status` is the pill class suffix (`installed` /
-/// `downloading` / `missing`), `status_label` the short pill text, and `detail`
-/// the one-line explanation under it. Resolved in the web layer (filesystem +
-/// helper-config dependent), mirroring [`ModelPathsView`].
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct RuntimeStatusView {
-    /// Runtime name shown to the user, e.g. `"koboldcpp"` or a TTS engine label.
-    pub name: String,
-    /// Pill class suffix: `installed` | `downloading` | `missing`.
-    pub status: String,
-    /// Short pill text, e.g. `"Installed"` / `"Downloading…"` / `"Not installed"`.
-    pub status_label: String,
-    /// One-line explanation, e.g. "Downloaded with your first model".
-    pub detail: String,
-    pub installed: bool,
-    pub downloading: bool,
-    pub missing: bool,
-}
-
-/// Builds the koboldcpp [`RuntimeStatusView`] from a status string (`installed` /
-/// `downloading` / `missing`). Shared by the LLM + STT pages, since koboldcpp runs
-/// both the LLM and Whisper STT.
-pub fn koboldcpp_runtime_status(status: &str) -> RuntimeStatusView {
-    let (status_label, detail) = match status {
-        "installed" => ("Installed", "Ready — the runtime that runs your models is present."),
-        "downloading" => (
-            "Downloading…",
-            "Fetching koboldcpp from GitHub in the background — click Refresh to update.",
-        ),
-        _ => (
-            "Not installed",
-            "Will be downloaded automatically with your first model.",
-        ),
-    };
-    RuntimeStatusView {
-        name: "koboldcpp".to_string(),
-        status: status.to_string(),
-        status_label: status_label.to_string(),
-        detail: detail.to_string(),
-        installed: status == "installed",
-        downloading: status == "downloading",
-        missing: status != "installed" && status != "downloading",
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SettingsPageView {
-    pub category: String,
-    pub nav: Vec<SettingsNavItem>,
-    /// Grouped nav (small section labels above clusters of categories).
-    pub nav_groups: Vec<SettingsNavGroup>,
-    pub saved: bool,
-    pub settings_path: String,
-    /// On-disk folder where each model category's files live, surfaced on the
-    /// matching settings page so power users can drop files in by hand (they then
-    /// show up in the picker). Resolved as absolute strings in the web layer
-    /// (filesystem-dependent), mirroring `settings_path`.
-    pub model_paths: ModelPathsView,
-    /// Runtime-requirement status for the LLM + STT pages: koboldcpp (which runs
-    /// both the LLM and Whisper STT). Resolved in the web layer.
-    pub kobold_runtime: RuntimeStatusView,
-    pub tts: TtsPanelView,
-    pub llm: LlmSettings,
-    pub stt: SttSettings,
-    pub stt_panel: SttPanelView,
-    pub retrieval: RetrievalPanelView,
-    pub voice_clone: VoiceCloneView,
-    pub llm_models: LlmModelsPanelView,
-    /// LLM generation sampling controls (wired into the llama.cpp request).
-    pub llm_sampling: LlmSamplingView,
-    /// The "Game" (launcher) panel: MO2 status + required mods.
-    pub game: GameLauncherView,
-    /// The "Interface" (appearance) panel, wired via `/theme.css`.
-    pub interface: InterfacePanelView,
-    /// The "Profiles" panel: the drop-in game profiles as cards.
-    pub profiles: ProfilesPanelView,
-}
-
 /// Builds the TTS panel view from the persisted settings + reference data.
 /// `engine_status` maps a local-engine id to its install status string.
 pub fn tts_panel_view(
@@ -2602,7 +2331,7 @@ pub fn tts_panel_view(
         })
         .collect();
 
-    let api_providers = TTS_API_PROVIDERS
+    let api_providers = TTS_AUDIO_TAG_PROVIDERS
         .iter()
         .map(|name| {
             let tags = tts_provider_audio_tags(name);
@@ -2814,51 +2543,6 @@ pub fn settings_nav_groups(category: &str) -> Vec<SettingsNavGroup> {
         .collect()
 }
 
-/// Builds the full settings page view for `category` (`llm`/`tts`/`stt`).
-#[allow(clippy::too_many_arguments)]
-pub fn settings_page_view(
-    settings: &AppSettings,
-    category: &str,
-    saved: bool,
-    settings_path: String,
-    model_paths: ModelPathsView,
-    kobold_runtime: RuntimeStatusView,
-    engine_status: &HashMap<String, String>,
-    voice_clone: VoiceCloneView,
-    llm_models: LlmModelsPanelView,
-    retrieval_models: Vec<RetrievalModelView>,
-    retrieval_host: RetrievalHostView,
-    whisper_models: Vec<WhisperModelView>,
-    whisper_host: RetrievalHostView,
-    game: GameLauncherView,
-    profiles: ProfilesPanelView,
-    running_engine: Option<String>,
-) -> SettingsPageView {
-    let nav = settings_nav_items(category);
-    let nav_groups = settings_nav_groups(category);
-
-    SettingsPageView {
-        category: category.to_string(),
-        nav,
-        nav_groups,
-        saved,
-        settings_path,
-        model_paths,
-        kobold_runtime,
-        tts: tts_panel_view(&settings.tts, engine_status, running_engine.as_deref()),
-        llm: settings.llm.clone(),
-        stt: settings.stt.clone(),
-        stt_panel: stt_panel_view(&settings.stt, whisper_models, whisper_host),
-        retrieval: retrieval_panel_view(&settings.retrieval, retrieval_models, retrieval_host),
-        voice_clone,
-        llm_models,
-        llm_sampling: llm_sampling_view(&settings.llm.sampling),
-        game,
-        interface: interface_panel_view(&settings.interface),
-        profiles,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2868,15 +2552,6 @@ mod tests {
         let tts = TtsSettings::default();
         assert_eq!(tts.audio_tags.max_tags_per_reply, 2);
         assert!(!tts.audio_tags.enabled);
-    }
-
-    #[test]
-    fn whisper_stem_matches_bin_name() {
-        let turbo = whisper_model_by_id("large-v3-turbo").unwrap();
-        let stem = whisper_model_match_stem(turbo);
-        assert_eq!(stem, "large-v3-turbo");
-        // A real on-disk filename should contain the stem (case-insensitive).
-        assert!("ggml-large-v3-turbo.bin".to_lowercase().contains(&stem));
     }
 
     #[test]
@@ -2997,100 +2672,11 @@ mod tests {
     }
 
     #[test]
-    fn stt_defaults_to_whisper_provider_but_no_model() {
+    fn stt_defaults_to_local_provider() {
+        // Parakeet is the only managed local STT now, so the default provider is
+        // the shared `local` sentinel (no whisper model field any more).
         let stt = SttSettings::default();
-        assert_eq!(stt.provider, "whisper");
-        // No default model for a public release — the user must pick one.
-        assert_eq!(stt.model, "");
-        let view = stt_panel_view(&stt, Vec::new(), RetrievalHostView::default());
-        assert_eq!(view.providers.len(), 2);
-        assert!(view.providers[0].selected); // whisper is the default
-        assert!(!view.providers[1].selected);
-        // No model selected by default.
-        assert_eq!(view.model, "");
-        // Parakeet is a real provider now; unknown/legacy values still → whisper.
-        assert_eq!(normalize_stt_provider("parakeet"), "parakeet");
-        assert_eq!(normalize_stt_provider("sillytavern"), "whisper");
-        assert_eq!(normalize_stt_provider("whisper"), "whisper");
-        assert_eq!(normalize_stt_provider(""), "whisper");
-    }
-
-    #[test]
-    fn llm_runtime_normalizes_with_kobold_default() {
-        // Empty/unknown (incl. every pre-Runtimes settings file) → koboldcpp.
-        assert_eq!(normalize_llm_runtime(""), "koboldcpp");
-        assert_eq!(normalize_llm_runtime("  "), "koboldcpp");
-        assert_eq!(normalize_llm_runtime("nonsense"), "koboldcpp");
-        assert_eq!(normalize_llm_runtime("koboldcpp"), "koboldcpp");
-        assert_eq!(normalize_llm_runtime("llamacpp"), "llamacpp");
-        // An old settings JSON with no `runtime` key deserializes to the default.
-        let old: AppSettings = serde_json::from_str("{}").unwrap();
-        assert_eq!(normalize_llm_runtime(&old.runtime.llm_runtime), "koboldcpp");
-    }
-
-    #[test]
-    fn stt_effective_model_drops_stale_and_empty() {
-        // A stale Parakeet model name from an old settings file → none (empty).
-        let mut stt = SttSettings::default();
-        stt.model = "nvidia/parakeet-tdt-0.6b-v3".to_string();
-        assert_eq!(stt_effective_model(&stt), "");
-        // A real whisper .bin is kept as-is.
-        stt.model = "ggml-large-v3-turbo.bin".to_string();
-        assert_eq!(stt_effective_model(&stt), "ggml-large-v3-turbo.bin");
-        // Blank → none (no default).
-        stt.model = "  ".to_string();
-        assert_eq!(stt_effective_model(&stt), "");
-    }
-
-    #[test]
-    fn whisper_registry_is_well_formed() {
-        // Ids + filenames unique; every file is a .bin; the picker can find the
-        // active model by filename; the default resolves.
-        let mut ids = std::collections::HashSet::new();
-        let mut files = std::collections::HashSet::new();
-        for m in WHISPER_MODELS {
-            assert!(ids.insert(m.id), "duplicate whisper id {}", m.id);
-            assert!(files.insert(m.file), "duplicate whisper file {}", m.file);
-            assert!(m.file.ends_with(".bin"), "{} is not a .bin", m.file);
-            assert!(m.size_gb > 0.0);
-        }
-        assert!(whisper_model_by_id("large-v3-turbo").is_some());
-        assert!(whisper_model_by_file("whisper-small-q5_1.bin").is_some());
-        assert!(whisper_model_by_file("nope.bin").is_none());
-        // The default constant points at a real registry entry.
-        assert!(whisper_model_by_file(STT_WHISPER_DEFAULT_MODEL).is_some());
-    }
-
-    #[test]
-    fn stt_panel_marks_active_model_selected() {
-        let mut stt = SttSettings::default();
-        stt.model = "ggml-large-v3-turbo.bin".to_string();
-        let models = WHISPER_MODELS
-            .iter()
-            .map(|m| WhisperModelView {
-                id: m.id.to_string(),
-                name: m.name.to_string(),
-                file: m.file.to_string(),
-                size_label: format!("~{:.1} GB", m.size_gb),
-                status: "available".to_string(),
-                status_label: whisper_model_status_label("available"),
-                downloaded: false,
-                downloading: false,
-                can_download: true,
-                recommended: false,
-                fit_hint: String::new(),
-                selected: false,
-            })
-            .collect();
-        let view = stt_panel_view(&stt, models, RetrievalHostView::default());
-        let selected: Vec<&str> = view
-            .models
-            .iter()
-            .filter(|m| m.selected)
-            .map(|m| m.id.as_str())
-            .collect();
-        assert_eq!(selected, vec!["large-v3-turbo"]);
-        assert_eq!(view.model, "ggml-large-v3-turbo.bin");
+        assert_eq!(stt.provider, crate::PROVIDER_LOCAL);
     }
 
     #[test]
@@ -3394,5 +2980,76 @@ mod tests {
             .map(|i| i.key.as_str())
             .collect();
         assert_eq!(active, vec!["profiles"]);
+    }
+
+    /// Writes `json` to a unique temp file, loads it via [`AppSettings::load`]
+    /// (which runs the migration), removes the file, and returns the settings.
+    fn load_from_json(tag: &str, json: &str) -> AppSettings {
+        let path = std::env::temp_dir().join(format!(
+            "chasm-settings-migrate-{}-{}.json",
+            std::process::id(),
+            tag
+        ));
+        fs::write(&path, json).unwrap();
+        let settings = AppSettings::load(&path);
+        let _ = fs::remove_file(&path);
+        settings
+    }
+
+    #[test]
+    fn migrate_pre_rework_settings_to_providers() {
+        // A pre-rework file: koboldcpp LLM runtime, whisper STT with a now-removed
+        // `model`, blank LLM provider, legacy TTS mode=api + api_provider. The
+        // removed keys are ignored (no `deny_unknown_fields`), and every provider
+        // migrates to the new shape without panicking.
+        let json = r#"{"runtime":{"llm_runtime":"koboldcpp"},
+            "stt":{"provider":"whisper","model":"ggml-small.bin"},
+            "llm":{"provider":""},
+            "tts":{"mode":"api","api_provider":"ElevenLabs"}}"#;
+        let settings = load_from_json("pre-rework", json);
+        assert_eq!(settings.llm.provider, "local");
+        assert_eq!(settings.stt.provider, "local");
+        assert_eq!(settings.tts.provider, "elevenlabs");
+    }
+
+    #[test]
+    fn migrate_leaves_modern_providers_unchanged() {
+        // A modern file already names hosted providers; migrate must round-trip
+        // them (the new `tts.provider` is set, so the legacy mode is ignored).
+        let json = r#"{"llm":{"provider":"openrouter"},
+            "stt":{"provider":"groq"},
+            "tts":{"provider":"elevenlabs","mode":"local"}}"#;
+        let settings = load_from_json("modern", json);
+        assert_eq!(settings.llm.provider, "openrouter");
+        assert_eq!(settings.stt.provider, "groq");
+        assert_eq!(settings.tts.provider, "elevenlabs");
+    }
+
+    #[test]
+    fn api_keys_carry_over_and_migrate_promotes_per_capability() {
+        // A key entered only for the LLM's openrouter carries to STT via the shared
+        // store after migrate promotes it.
+        let json = r#"{"llm":{"provider":"openrouter","api":{"openrouter":{"api_key":"sk-or-1"}}},
+            "stt":{"provider":"openrouter"}}"#;
+        let s = load_from_json("carry", json);
+        assert_eq!(s.api_keys.get("openrouter").map(String::as_str), Some("sk-or-1"));
+        // STT has no own key → resolves the shared one.
+        assert_eq!(s.provider_key(s.stt.api.get("openrouter"), "openrouter"), "sk-or-1");
+        // A per-capability key still overrides the shared one.
+        let mut cfg = crate::ApiProviderConfig::default();
+        cfg.api_key = "sk-override".into();
+        assert_eq!(s.provider_key(Some(&cfg), "openrouter"), "sk-override");
+        // Unknown provider with no shared key → empty.
+        assert_eq!(s.provider_key(None, "groq"), "");
+    }
+
+    #[test]
+    fn migrate_empty_object_yields_all_local() {
+        // A totally empty `{}` deserializes to defaults and migrates to the
+        // managed-local provider for every capability.
+        let settings = load_from_json("empty", "{}");
+        assert_eq!(settings.llm.provider, "local");
+        assert_eq!(settings.stt.provider, "local");
+        assert_eq!(settings.tts.provider, "local");
     }
 }

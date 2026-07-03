@@ -1,9 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { configApi, modelsApi, type LlmConfig, type ModelDto } from "@/lib/api";
+import { configApi, modelsApi, type LlmConfig } from "@/lib/api";
+import { useProvider } from "@/lib/useProvider";
 import { SettingsPage } from "@/components/ui/settings-page";
-import { ModelPicker, type ModelCard } from "@/components/ModelPicker";
+import { ProviderPicker } from "@/components/ProviderPicker";
+import { ApiProviderConfig } from "@/components/ApiProviderConfig";
+import { RuntimeStatus } from "@/components/RuntimeStatus";
+import { ModelPlacement } from "@/components/ModelPlacement";
+import { InstalledModelSelector } from "@/components/InstalledModelSelector";
 import {
   Card,
   CardContent,
@@ -11,25 +16,12 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Field, FormRow } from "@/components/ui/page";
+import { Field, FormRow, Stack } from "@/components/ui/page";
 
-// LLM settings — picks the language model (ModelPicker) AND exposes the
-// per-request generation sampling the legacy settings page saved (temperature,
-// top-p, top-k, min-p, repeat penalty, max tokens, n_ctx, seed). The config form
-// hits /api/ui/v1/config/llm, which reuses the legacy apply_llm_form path so the
-// values normalize + take effect on the next turn exactly as before.
-
-function toCard(dto: ModelDto): ModelCard {
-  return {
-    id: dto.id,
-    name: dto.name,
-    description: dto.description,
-    installed: dto.installed,
-    recommended: dto.recommended,
-    meta: dto.meta,
-    status: dto.status,
-  };
-}
+// LLM settings — picks the provider (local llama.cpp or a hosted API), guides
+// manual placement of a recommended .gguf when local, or shows the hosted API
+// config, and keeps the per-request generation sampling below (all providers).
+// The sampling form hits /api/ui/v1/config/llm.
 
 /** A labeled number input row, shared by the config fields below. */
 function NumberRow({
@@ -70,22 +62,17 @@ function NumberRow({
 
 export function Llm() {
   const qc = useQueryClient();
-  const query = useQuery({
+  const provider = useProvider("llm");
+
+  // The recommended .gguf catalog + target folder for manual placement.
+  const models = useQuery({
     queryKey: ["models", "llm"],
     queryFn: () => modelsApi.get("llm"),
   });
+
   const config = useQuery({
     queryKey: ["config", "llm"],
     queryFn: () => configApi.get("llm"),
-  });
-
-  const select = useMutation({
-    mutationFn: (id: string) => modelsApi.select("llm", id),
-    onSuccess: (fresh) => qc.setQueryData(["models", "llm"], fresh),
-  });
-  const download = useMutation({
-    mutationFn: (id: string) => modelsApi.download("llm", id),
-    onSuccess: (fresh) => qc.setQueryData(["models", "llm"], fresh),
   });
 
   const initial = config.data?.llm;
@@ -114,7 +101,7 @@ export function Llm() {
     <SettingsPage
       eyebrow="AI"
       title="Language model"
-      description="The model that drives NPC dialogue and decisions. Served locally by koboldcpp."
+      description="The model that drives NPC dialogue and decisions. Run it locally with llama.cpp, or connect a hosted API."
       save={
         form
           ? {
@@ -129,24 +116,57 @@ export function Llm() {
           : undefined
       }
     >
-      <ModelPicker
-        models={(query.data?.models ?? []).map(toCard)}
-        selectedId={query.data?.selected_id}
-        folder={query.data?.folder ? { path: query.data.folder } : undefined}
-        isLoading={query.isLoading}
-        isError={query.isError}
-        downloadingId={download.isPending ? download.variables : null}
-        onSelect={(id) => select.mutate(id)}
-        onDownload={(id) => download.mutate(id)}
+      <ProviderPicker
+        providers={provider.view?.providers ?? []}
+        selectedId={provider.selectedId}
+        onSelect={(id) => provider.select.mutate(id)}
+        selectingId={provider.select.isPending ? provider.select.variables : null}
+        isLoading={provider.query.isLoading}
       />
+
+      {provider.isLocal ? (
+        provider.view && (
+          <Stack>
+            <RuntimeStatus runtime={provider.view.local_runtime} />
+            <InstalledModelSelector
+              domain="llm"
+              models={models.data?.models ?? []}
+              selectedId={models.data?.selected_id}
+              isLoading={models.isLoading}
+              isError={models.isError}
+              emptyTitle="No model installed yet"
+              emptyDescription="Place a recommended .gguf below to make it available, then it appears here to activate."
+            />
+            <ModelPlacement
+              domain="llm"
+              folderKind="llm"
+              models={models.data?.models ?? []}
+              folder={models.data?.folder}
+              isLoading={models.isLoading}
+              isError={models.isError}
+            />
+          </Stack>
+        )
+      ) : (
+        provider.selectedProvider && (
+          <ApiProviderConfig
+            capability="llm"
+            provider={provider.selectedProvider}
+            onSave={(f) => provider.saveConfig.mutate(f)}
+            saving={provider.saveConfig.isPending}
+            error={provider.saveError}
+            justSaved={provider.justSaved}
+          />
+        )
+      )}
 
       {form && (
         <Card>
           <CardHeader>
             <CardTitle>Generation sampling</CardTitle>
             <CardDescription>
-              Forwarded to koboldcpp on every NPC / admin turn. Read fresh per
-              request, so a change applies on the next line — no restart.
+              Sent on every NPC / admin turn. Read fresh per request, so a change
+              applies on the next line — no restart.
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">

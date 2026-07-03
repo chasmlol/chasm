@@ -247,15 +247,16 @@ async fn run_pass(state: &AppState) -> Result<PassOutcome, String> {
         json!({ "role": "system", "content": GM_SYSTEM_PROMPT }),
         json!({ "role": "user", "content": user_prompt }),
     ];
-    let sampling = crate::llm::Sampling::from_settings(
-        &AppSettings::load(&state.config.settings_path).llm.sampling,
-    )
-    .with_overrides(crate::llm::GenerationOptions {
-        temperature: Some(0.4),
-        max_tokens: Some(GM_MAX_TOKENS),
-    });
+    let gm_settings = AppSettings::load(&state.config.settings_path);
+    let sampling = crate::llm::Sampling::from_settings(&gm_settings.llm.sampling).with_overrides(
+        crate::llm::GenerationOptions {
+            temperature: Some(0.4),
+            max_tokens: Some(GM_MAX_TOKENS),
+        },
+    );
+    let target = crate::llm::LlmTarget::resolve(&gm_settings, &state.config);
     let (content, _metrics) = crate::llm::chat_completion_capturing_sampled(
-        &state.config.llm_endpoint,
+        &target,
         &messages,
         Some(&updates_response_format()),
         sampling,

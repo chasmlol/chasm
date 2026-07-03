@@ -223,6 +223,59 @@ export interface VoiceCloneView {
   cloned_count: number;
 }
 
+// --- System integration (OS actions the webview can't do itself) -----------
+
+/** Result of `POST /system/open-url`. */
+export interface OpenUrlResult {
+  ok: boolean;
+  error?: string;
+}
+
+/** Result of `POST /system/open-folder` — includes the resolved path. */
+export interface OpenFolderResult {
+  ok: boolean;
+  error?: string;
+  path?: string;
+}
+
+/** Which OS folder to reveal in Explorer. */
+export type OpenFolderKind = "llm" | "embed" | "engines";
+
+/** The manual-placement domains that accept a raw model-file upload. */
+export type PlaceDomain = "llm" | "retrieval";
+
+/** Result of a raw model-file upload (`POST /models/:domain/place?name=…`). */
+export interface PlaceModelResult {
+  ok: boolean;
+  error?: string;
+  path?: string;
+}
+
+/**
+ * Upload a picked/dropped model file into the domain's models folder.
+ *
+ * The backend takes the RAW FILE BYTES as the request body (NOT multipart /
+ * JSON) and the filename via the `?name=` query. It validates the extension
+ * server-side (.gguf for llm, .onnx for retrieval) and rejects mismatches with
+ * `{ ok:false, error }`. Identical for drag-drop and choose-file: both pass a
+ * `File` here.
+ */
+export async function placeModel(
+  domain: PlaceDomain,
+  file: File,
+): Promise<PlaceModelResult> {
+  const url = `${UI_API}/models/${domain}/place?name=${encodeURIComponent(file.name)}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Accept: "application/json" },
+    body: file,
+  });
+  if (!res.ok) {
+    return { ok: false, error: `${res.status} ${res.statusText}` };
+  }
+  return (await res.json()) as PlaceModelResult;
+}
+
 export const systemApi = {
   settings: (category: string) =>
     getJson<SettingsPage>(`${UI_API}/settings/${category}`),
@@ -257,4 +310,12 @@ export const systemApi = {
   // Tracing (read-only)
   traces: () => getJson<TracesList>(`${UI_API}/traces`),
   trace: (id: string) => getJson<TraceDetail>(`${UI_API}/traces/${id}`),
+
+  // System integration — open a URL in the real browser / a folder in Explorer,
+  // and upload a manually-placed model file (raw bytes).
+  openUrl: (url: string) =>
+    postJson<OpenUrlResult>(`${UI_API}/system/open-url`, { url }),
+  openFolder: (kind: OpenFolderKind) =>
+    postJson<OpenFolderResult>(`${UI_API}/system/open-folder`, { kind }),
+  placeModel,
 };

@@ -31,7 +31,10 @@ mime_guess = "2"
 notify = "6"
 rand = "0.9"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream"] }
+# `rustls-tls` gives HTTPS with bundled webpki CA roots (no OpenSSL / system cert
+# store) — required for the hosted-API providers (OpenAI, Anthropic, ElevenLabs,
+# …); the managed-local runtimes stay on plain http://127.0.0.1.
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }

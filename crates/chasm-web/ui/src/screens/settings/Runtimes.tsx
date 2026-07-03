@@ -1,8 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Check, Download, Loader2 } from "lucide-react";
 
-import { modelsApi, type ModelDto } from "@/lib/api";
+import { modelsApi, type ModelDomain, type ModelDto } from "@/lib/api";
 import { SettingsPage } from "@/components/ui/settings-page";
-import { ModelPicker, type ModelCard } from "@/components/ModelPicker";
+import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
@@ -10,101 +11,136 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { StatusPill, type StatusTone } from "@/components/ui/page";
 
-// Runtimes settings — picks the managed LLM runtime that serves :5001.
-//
-//   * koboldcpp (default): LLM + Whisper STT in one process, single KV slot.
-//   * llama.cpp (llama-server): multiple prompt-cache slots, so group-scene
-//     speaker swaps reuse each speaker's cached prompt instead of paying a
-//     full reprocess. llama-server has NO Whisper, so voice input then needs
-//     the Parakeet STT engine (Settings → STT).
-//
-// Selecting a runtime persists it and live-swaps the process serving :5001
-// (same selected model). The compatibility card below surfaces the
-// whisper-requires-koboldcpp interaction so voice input never dies silently.
+// Runtimes settings — the one-click ENGINE installers that STAY (the model FILES
+// moved to guided manual placement, and there's no LLM runtime choice anymore).
+// Three managed engines, each with live status + an Install button:
+//   * llama.cpp       — GET /models/runtime, install POST /models/runtime/download {id:"llamacpp"}
+//   * Parakeet STT    — GET /models/stt (parakeet card), install .../stt/download {id:"parakeet"}
+//   * qwen3-tts       — GET /models/tts, install .../tts/download {id:"faster-qwen3-tts"}
+// While an install is in flight the query polls every ~2s so the pill flips to
+// installed on its own.
 
-function toCard(dto: ModelDto): ModelCard {
-  return {
-    id: dto.id,
-    name: dto.name,
-    description: dto.description,
-    installed: dto.installed,
-    recommended: dto.recommended,
-    meta: dto.meta,
-    status: dto.status,
-  };
+interface EngineSpec {
+  key: string;
+  title: string;
+  domain: ModelDomain;
+  /** The card id within GET /models/:domain to read status from + install. */
+  id: string;
+  blurb: string;
+}
+
+const ENGINES: EngineSpec[] = [
+  {
+    key: "llamacpp",
+    title: "llama.cpp",
+    domain: "runtime",
+    id: "llamacpp",
+    blurb:
+      "The managed local LLM server (llama-server on :5001). Serves the placed .gguf with prompt-cache slots for fast speaker swaps.",
+  },
+  {
+    key: "parakeet",
+    title: "Parakeet STT engine",
+    domain: "stt",
+    id: "parakeet",
+    blurb:
+      "The managed local speech-to-text engine. Runs on its own port and transcribes your microphone for the player's turn.",
+  },
+  {
+    key: "qwen3-tts",
+    title: "qwen3-tts engine",
+    domain: "tts",
+    id: "faster-qwen3-tts",
+    blurb:
+      "The managed local text-to-speech engine. Synthesizes NPC voices and streams the audio to the game.",
+  },
+];
+
+function statusFor(installed: boolean, installing: boolean): {
+  tone: StatusTone;
+  label: string;
+} {
+  if (installing) return { tone: "busy", label: "Installing…" };
+  if (installed) return { tone: "ok", label: "Installed" };
+  return { tone: "idle", label: "Not installed" };
+}
+
+function EngineCard({ spec }: { spec: EngineSpec }) {
+  const qc = useQueryClient();
+  const key = ["models", spec.domain];
+
+  const install = useMutation({
+    mutationFn: () => modelsApi.download(spec.domain, spec.id),
+    onSuccess: (fresh) => qc.setQueryData(key, fresh),
+  });
+
+  const query = useQuery({
+    queryKey: key,
+    queryFn: () => modelsApi.get(spec.domain),
+    // Poll while an install is running so the status flips on its own.
+    refetchInterval: () => (install.isPending ? 2000 : false),
+  });
+
+  const card: ModelDto | undefined =
+    query.data?.models?.find((m) => m.id === spec.id) ?? query.data?.models?.[0];
+  const installed = Boolean(card?.installed);
+  const installing = install.isPending;
+  const status = statusFor(installed, installing);
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <CardTitle>{spec.title}</CardTitle>
+            <CardDescription className="mt-1.5">{spec.blurb}</CardDescription>
+          </div>
+          <StatusPill tone={status.tone} pulse={status.tone === "busy"}>
+            {status.label}
+          </StatusPill>
+        </div>
+      </CardHeader>
+      <CardContent>
+        {installed ? (
+          <span className="inline-flex items-center gap-1.5 text-[13px] font-medium text-[var(--color-player)]">
+            <Check className="size-4" /> Ready
+          </span>
+        ) : (
+          <Button
+            size="sm"
+            disabled={installing || query.isLoading}
+            onClick={() => install.mutate()}
+          >
+            {installing ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <Download className="size-4" />
+            )}
+            {installing ? "Installing" : "Install"}
+          </Button>
+        )}
+        {install.isError && (
+          <p className="mt-2 text-[13px] text-[var(--color-danger)]">
+            Install failed. Check the logs and try again.
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  );
 }
 
 export function Runtimes() {
-  const qc = useQueryClient();
-  const query = useQuery({
-    queryKey: ["models", "runtime"],
-    queryFn: () => modelsApi.get("runtime"),
-  });
-  // The STT selection, to surface the whisper/koboldcpp dependency: the
-  // Parakeet card's id is "parakeet"; anything else selected = a whisper model.
-  const stt = useQuery({
-    queryKey: ["models", "stt"],
-    queryFn: () => modelsApi.get("stt"),
-  });
-
-  const select = useMutation({
-    mutationFn: (id: string) => modelsApi.select("runtime", id),
-    onSuccess: (fresh) => qc.setQueryData(["models", "runtime"], fresh),
-  });
-  const download = useMutation({
-    mutationFn: (id: string) => modelsApi.download("runtime", id),
-    onSuccess: (fresh) => qc.setQueryData(["models", "runtime"], fresh),
-  });
-
-  const selectedRuntime = query.data?.selected_id ?? "koboldcpp";
-  const sttSelection = stt.data?.selected_id;
-  const sttIsParakeet = sttSelection === "parakeet";
-  const showWhisperWarning =
-    selectedRuntime === "llamacpp" && !sttIsParakeet && !stt.isLoading;
-
   return (
     <SettingsPage
       eyebrow="AI"
       title="Runtimes"
-      description="The local server that runs the selected LLM. Switching runtimes reloads the model in place — same port, same model, no other changes."
+      description="One-click installers for the managed local engines. Model files are placed manually on their own pages (LLM, Retrieval); the engines below install automatically."
     >
-      <ModelPicker
-        models={(query.data?.models ?? []).map(toCard)}
-        selectedId={query.data?.selected_id}
-        folder={query.data?.folder ? { path: query.data.folder } : undefined}
-        isLoading={query.isLoading}
-        isError={query.isError}
-        downloadingId={download.isPending ? download.variables : null}
-        onSelect={(id) => select.mutate(id)}
-        onDownload={(id) => download.mutate(id)}
-      />
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Voice input compatibility</CardTitle>
-          <CardDescription>
-            Whisper runs inside koboldcpp. llama.cpp has no Whisper, so with
-            that runtime voice input needs the Parakeet engine (Settings →
-            STT), which runs on its own port and works with either runtime.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          {showWhisperWarning ? (
-            <p className="text-sm text-[var(--color-npc)]">
-              llama.cpp is selected but STT is still set to a Whisper model —
-              voice input will be unavailable. Select Parakeet under Settings →
-              STT (or switch back to koboldcpp) to keep push-to-talk working.
-            </p>
-          ) : (
-            <p className="text-sm text-[var(--muted-foreground)]">
-              {selectedRuntime === "llamacpp"
-                ? "STT is set to Parakeet — voice input keeps working on llama.cpp."
-                : "koboldcpp is selected — both Whisper and Parakeet work."}
-            </p>
-          )}
-        </CardContent>
-      </Card>
+      {ENGINES.map((spec) => (
+        <EngineCard key={spec.key} spec={spec} />
+      ))}
     </SettingsPage>
   );
 }

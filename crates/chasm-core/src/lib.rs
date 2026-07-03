@@ -8,10 +8,12 @@ use serde::{Deserialize, Serialize};
 mod game_launcher;
 pub mod profile_import;
 mod profiles;
+mod providers;
 mod request_trace;
 mod settings;
 mod system_info;
 pub use game_launcher::*;
+pub use providers::*;
 pub use profile_import::{
     import_bundle, import_from_source_root, ImportAction, ImportOutcome, ALLOWLIST, DENYLIST,
 };
@@ -22,29 +24,28 @@ pub use system_info::*;
 
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:7341";
 
-/// Default endpoint of the local koboldcpp Whisper transcription server
-/// (OpenAI-compatible). koboldcpp serves LLM, TTS and STT on one port.
-/// Overridable via `CHASM_STT_ENDPOINT`.
+/// Legacy default STT endpoint on the LLM port. No managed engine serves this
+/// any more (the managed local STT is the dedicated Parakeet server on :5003 —
+/// see [`DEFAULT_PARAKEET_STT_ENDPOINT`]); kept only as the `stt_endpoint`
+/// fallback value and overridable via `CHASM_STT_ENDPOINT`.
 pub const DEFAULT_STT_ENDPOINT: &str = "http://127.0.0.1:5001/v1/audio/transcriptions";
 
-/// Default local LLM endpoint — koboldcpp (OpenAI-compatible), which serves LLM
-/// + STT (`/v1/audio/transcriptions`) on the same port. The chat endpoint is
-/// `{llm_endpoint}/v1/chat/completions`. TTS is no longer served here — it moved
-/// to the dedicated faster-qwen3-tts service (see [`DEFAULT_TTS_ENDPOINT`]).
-/// Env-overridable via `CHASM_LLM_ENDPOINT`.
+/// Default local LLM endpoint — the managed llama.cpp `llama-server`
+/// (OpenAI-compatible). The chat endpoint is `{llm_endpoint}/v1/chat/completions`.
+/// STT moved to the dedicated Parakeet service and TTS to faster-qwen3-tts (see
+/// [`DEFAULT_TTS_ENDPOINT`]). Env-overridable via `CHASM_LLM_ENDPOINT`.
 pub const DEFAULT_LLM_ENDPOINT: &str = "http://127.0.0.1:5001";
 
 /// Default endpoint of the dedicated faster-qwen3-tts streaming TTS service
 /// (OpenAI-compatible; the speech endpoint is `{tts_endpoint}/v1/audio/speech`).
-/// Separate from koboldcpp so TTS can stream frame-level at low latency while
-/// koboldcpp handles LLM + STT. Env-overridable via `CHASM_TTS_ENDPOINT`.
+/// Separate from the LLM runtime so TTS can stream frame-level at low latency
+/// while llama.cpp handles the LLM. Env-overridable via `CHASM_TTS_ENDPOINT`.
 pub const DEFAULT_TTS_ENDPOINT: &str = "http://127.0.0.1:5002";
 
 /// Default endpoint of the dedicated Parakeet STT service (OpenAI-compatible
 /// `/v1/audio/transcriptions`), used when the STT provider is `parakeet`. Its
-/// own process + port so voice input never queues behind an LLM generation
-/// (koboldcpp's Whisper shares the LLM's single slot). Env-overridable via
-/// `CHASM_PARAKEET_STT_ENDPOINT`.
+/// own process + port so voice input never queues behind an LLM generation.
+/// Env-overridable via `CHASM_PARAKEET_STT_ENDPOINT`.
 pub const DEFAULT_PARAKEET_STT_ENDPOINT: &str =
     "http://127.0.0.1:5003/v1/audio/transcriptions";
 
@@ -60,11 +61,12 @@ pub struct AppConfig {
     /// Directory holding downloaded local LLM GGUFs. Env-overridable via
     /// `CHASM_LLM_MODELS_DIR`, else `<data_root>/models/llm`.
     pub llm_models_dir: PathBuf,
-    /// Local OpenAI-compatible STT (koboldcpp Whisper) transcription endpoint
-    /// (`{...}/v1/audio/transcriptions`).
+    /// Legacy OpenAI-compatible STT transcription endpoint on the LLM port. No
+    /// managed engine serves it now (managed STT is Parakeet on :5003); kept as a
+    /// fallback / override seam (`CHASM_STT_ENDPOINT`).
     pub stt_endpoint: String,
-    /// Local OpenAI-compatible Parakeet transcription endpoint, used instead of
-    /// [`Self::stt_endpoint`] when the STT provider is `parakeet`. Defaults to
+    /// Local OpenAI-compatible Parakeet transcription endpoint — the managed-local
+    /// STT provider. Defaults to
     /// [`DEFAULT_PARAKEET_STT_ENDPOINT`]; override via `CHASM_PARAKEET_STT_ENDPOINT`.
     pub parakeet_stt_endpoint: String,
     /// Base URL of the local OpenAI-compatible LLM (llama.cpp). The chat

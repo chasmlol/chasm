@@ -22,18 +22,16 @@ use chasm_core::{
     llm_model_match_stem, llm_models_panel_view, mo2_detected, normalize_embedder_tier,
     normalize_execution, normalize_max_tags, normalize_reranker_tier,
     normalize_stt_provider, nvse_detected,
-    recommended_index, retrieval_model_status_label, settings_page_view,
-    stt_effective_model, whisper_model_by_id, whisper_model_status_label,
+    recommended_index, retrieval_model_status_label,
     AppConfig, AppSettings, GameLauncherView, GameProfile, GpuFit, InterfaceSettings, LauncherConfig,
     LauncherSettings, LiveChatView, LlmSamplingSettings, LlmSettings, MessageView,
     ParticipantView, ProfileCardView, ProfilesPanelView, PromptAssemblyView,
-    RetrievalHostView, RetrievalModelView, RetrievalSettings, SettingsPageView,
+    RetrievalHostView, RetrievalModelView, RetrievalSettings,
     SttSettings, SystemInfo, TtsSettings, TtsTuningSettings, VoiceCloneCharacterView, VoiceCloneView,
-    WhisperModelView, LLM_MODELS, ORCHESTRATOR_DEFAULT_SYSTEM_PROMPT, ORCHESTRATOR_MAX_SPEAKERS_MAX,
+    LLM_MODELS, ORCHESTRATOR_DEFAULT_SYSTEM_PROMPT, ORCHESTRATOR_MAX_SPEAKERS_MAX,
     ORCHESTRATOR_MAX_SPEAKERS_MIN, ORCHESTRATOR_TEMPERATURE_MAX, ORCHESTRATOR_TEMPERATURE_MIN,
     RETRIEVAL_CANDIDATES_MAX, RETRIEVAL_CANDIDATES_MIN, RETRIEVAL_MODELS, RETRIEVAL_SOURCE_LIMIT_MAX,
     RETRIEVAL_SOURCE_LIMIT_MIN, RETRIEVAL_TOP_K_MAX, RETRIEVAL_TOP_K_MIN, TTS_LOCAL_ENGINES,
-    WHISPER_MODELS, WHISPER_REPO,
 };
 use chasm_embed::{embed_cache_dir, EmbeddingCache, Retriever, RetrieverConfig};
 use chasm_st_compat::{CompatError, LiveChatRepository};
@@ -49,11 +47,14 @@ mod gamemaster;
 mod generate;
 mod launcher;
 mod llm;
+mod llm_api;
 mod orchestrator;
 mod persona;
 mod save_sync;
 mod stack_lifecycle;
+mod stt_api;
 mod trace_routes;
+mod tts_api;
 mod ui;
 mod warmup;
 
@@ -318,21 +319,9 @@ struct MessageListTemplate {
 }
 
 #[derive(Template)]
-#[template(path = "settings.html")]
-struct SettingsTemplate {
-    page: SettingsPageView,
-}
-
-#[derive(Template)]
 #[template(path = "tracing.html")]
 struct TracingTemplate {
     page: trace_routes::TracingPageView,
-}
-
-#[derive(Template)]
-#[template(path = "partials/voice_clone.html")]
-struct VoiceClonePartialTemplate {
-    voice_clone: VoiceCloneView,
 }
 
 #[derive(Debug)]
@@ -443,12 +432,6 @@ pub fn router(config: AppConfig) -> Router {
             "/actionbook",
             get(books::actionbook_editor).post(books::actionbook_save),
         )
-        .route("/settings", get(settings_index))
-        .route(
-            "/settings/:category",
-            get(settings_page).post(save_settings),
-        )
-        .route("/partials/settings/voice-clone", get(voice_clone_partial))
         // --- Tracing (per-request waterfall) --------------------------------
         .route("/traces", get(trace_routes::list_traces_endpoint))
         .route("/traces/:id", get(trace_routes::get_trace_endpoint))
@@ -460,15 +443,6 @@ pub fn router(config: AppConfig) -> Router {
         .route("/api/stack/status", get(stack_status))
         .route("/api/stack/start", post(stack_start))
         .route("/engines/:id/install", post(install_engine))
-        .route("/llm-models/:id/download", post(download_llm_model))
-        .route("/whisper-models/:id/download", post(download_whisper_model))
-        // Opens a model-category folder in Windows Explorer. The dir is resolved
-        // from fixed config (keyed on `:category`), never from user input.
-        .route("/open-folder/:category", post(open_model_folder))
-        .route(
-            "/retrieval-models/:id/download",
-            post(download_retrieval_model),
-        )
         .route("/voices/clone", post(clone_voices))
         // JSON voice-clone for the React TTS page: GET status, POST to start.
         .route(
@@ -550,7 +524,7 @@ pub fn router(config: AppConfig) -> Router {
         .with_state(state)
 }
 
-/// Tears down the AI stack (koboldcpp + TTS) that chasm's connection lifecycle
+/// Tears down the AI stack (llama.cpp + STT + TTS) that chasm's connection lifecycle
 /// may have started, so a desktop-shell **Quit** doesn't orphan those runtimes.
 /// Builds a throwaway [`AppState`] from `config` — [`launcher::stop_ai_stack`]
 /// only reads the settings/endpoint paths off it and kills the runtimes by
@@ -600,8 +574,9 @@ pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
         "chasm — Agentic NPC Engine listening on http://{}",
         listener.local_addr()?
     );
-    // TTS, LLM and STT are all served by koboldcpp (spawned by the launcher on
-    // Play); no separate Python TTS worker is started here.
+    // The LLM (llama.cpp on :5001), STT (Parakeet on :5003) and TTS are each
+    // served by their own runtime (spawned by the launcher on Play); no separate
+    // Python TTS worker is started here.
     axum::serve(listener, router(config)).await?;
     Ok(())
 }
@@ -723,7 +698,7 @@ fn tuning_json(tuning: &TtsTuningSettings) -> serde_json::Value {
 }
 
 /// faster-qwen3-tts model output: 24 kHz mono int16. The FNV plugin's WAV loader
-/// handles 24 kHz (it played koboldcpp's 24 kHz clips), so we keep the native
+/// handles 24 kHz (it played the earlier 24 kHz clips), so we keep the native
 /// rate and let DirectSound resample on playback.
 const TTS_SAMPLE_RATE: u32 = 24_000;
 
@@ -744,10 +719,76 @@ async fn synthesize_via_worker(
     Ok(pcm16_to_wav(&pcm, TTS_SAMPLE_RATE, 1, 16))
 }
 
+/// Synthesizes `text` for `character` via the active hosted-TTS provider
+/// (ElevenLabs / Cartesia / Inworld), returning a complete WAV. Uses the
+/// character's API-CLONED voice id when one exists, else the provider's configured
+/// default voice. A missing key / bad response surfaces a readable error.
+async fn synthesize_via_api(
+    config: &AppConfig,
+    settings: &AppSettings,
+    provider: &str,
+    text: &str,
+    character: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let def = chasm_core::tts_api_provider(provider)
+        .ok_or_else(|| anyhow::anyhow!("Unknown TTS provider '{provider}'."))?;
+    let cfg = settings.tts.api.get(provider);
+    let mut resolved = chasm_core::resolve_api(def, cfg);
+    resolved.api_key = settings.provider_key(cfg, provider);
+    // A per-character cloned voice wins over the configured default voice.
+    if let Some(voice) = load_api_voice(config, provider, character) {
+        resolved.voice = voice;
+    }
+    let client = reqwest::Client::new();
+    crate::tts_api::synthesize(&client, provider, &resolved, text)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+/// The JSON store of API-cloned voice ids for the active profile:
+/// `<active voices dir>/api-voices.json` = `{ "<provider>": { "<character>": "<voice_id>" } }`.
+fn api_voices_path(config: &AppConfig) -> std::path::PathBuf {
+    active_voices_dir(config).join("api-voices.json")
+}
+
+/// Reads the cloned voice id for `(provider, character)`, if one was cloned.
+pub(crate) fn load_api_voice(config: &AppConfig, provider: &str, character: &str) -> Option<String> {
+    let text = fs::read_to_string(api_voices_path(config)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get(provider)?
+        .get(character)?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Stores the cloned voice id for `(provider, character)`, merging into the file.
+pub(crate) fn save_api_voice(
+    config: &AppConfig,
+    provider: &str,
+    character: &str,
+    voice_id: &str,
+) -> std::io::Result<()> {
+    let path = api_voices_path(config);
+    let mut root: serde_json::Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    root[provider][character] = serde_json::Value::String(voice_id.to_string());
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string_pretty(&root).unwrap_or_default())
+}
+
 /// Requests raw int16-LE mono 24 kHz PCM for `text` in `character`'s cloned voice
 /// from faster-qwen3-tts (`{base}/v1/audio/speech`, `response_format: "pcm"`).
 /// The `voice` field is the plain NPC name — a key in the service's voices.json
-/// (NO extension, unlike koboldcpp's filename-keyed `--ttsdir`). Retries while the
+/// (NO extension, unlike a filename-keyed TTS voice directory). Retries while the
 /// service warms up / captures CUDA graphs on the first request.
 async fn synthesize_pcm(base: &str, text: &str, character: &str) -> anyhow::Result<Vec<u8>> {
     let url = format!("{}/v1/audio/speech", base.trim_end_matches('/'));
@@ -848,16 +889,14 @@ async fn speech_synthesize(
 ) -> WebResult<Json<serde_json::Value>> {
     let (text, character) = speech_request(&req);
     let settings = AppSettings::load(&state.config.settings_path);
-    let tuning = resolve_tuning(&settings.tts.tuning, &req);
-    let volume = resolve_voice_volume(&settings, &req);
-    let bytes = synthesize_via_worker(
-        &state.config.tts_endpoint,
-        &text,
-        &character,
-        &tuning,
-        volume,
-    )
-    .await?;
+    let provider = chasm_core::normalize_tts_provider(&settings.tts.provider);
+    let bytes = if provider == chasm_core::PROVIDER_LOCAL {
+        let tuning = resolve_tuning(&settings.tts.tuning, &req);
+        let volume = resolve_voice_volume(&settings, &req);
+        synthesize_via_worker(&state.config.tts_endpoint, &text, &character, &tuning, volume).await?
+    } else {
+        synthesize_via_api(&state.config, &settings, &provider, &text, &character).await?
+    };
     Ok(Json(serde_json::json!({
         "audio": { "data": STANDARD.encode(&bytes) },
         "mimeType": "audio/wav",
@@ -933,6 +972,12 @@ pub(crate) fn speech_synthesize_stream_core(
     let caption_max_chars =
         chasm_core::normalize_caption_max_chars(settings.tts.caption_max_chars);
     let base = state.config.tts_endpoint.clone();
+    // Active TTS provider: local streaming engine, or a hosted API (whole-line
+    // synthesis handed back as a single WAV chunk).
+    let tts_provider = chasm_core::normalize_tts_provider(&settings.tts.provider);
+    let api_settings = settings.clone();
+    let api_config = state.config.clone();
+    let api_character = character.clone();
     // Live voice volume for this line (admin vs directional), read fresh per request.
     let volume = resolve_voice_volume(&settings, &req);
     // Live PocketTTS tuning, forwarded per request so the Settings → TTS → Tuning
@@ -953,6 +998,15 @@ pub(crate) fn speech_synthesize_stream_core(
     let pt_frames_after_eos = pad.frames_after_eos;
 
     let stream = async_stream::stream! {
+        // Hosted-API provider: synthesize the whole line, emit it as ONE WAV chunk.
+        // (No native streaming; the bridge still plays it gaplessly.)
+        if tts_provider != chasm_core::PROVIDER_LOCAL {
+            match synthesize_via_api(&api_config, &api_settings, &tts_provider, &text, &api_character).await {
+                Ok(wav) => yield audio_chunk_line(0, &wav, &text, caption_max_chars),
+                Err(error) => yield speech_error_line(&format!("{error}")),
+            }
+            return;
+        }
         let url = format!("{}/v1/audio/speech", base.trim_end_matches('/'));
         let client = reqwest::Client::new();
         let body = serde_json::json!({
@@ -1117,17 +1171,17 @@ fn extract_transcript_text(value: &serde_json::Value) -> String {
     }
 }
 
-/// Minimum audio length (ms) handed to whisper. koboldcpp's whisper returns
-/// EMPTY text for clips shorter than ~1s because — unlike reference whisper — it
-/// does not pad short audio up to a usable encoder window, so a quick "hi" comes
-/// back blank (and the FNV helper then surfaces a bridge error). Parakeet (the
-/// previous STT) had no such floor, which is why short utterances used to work.
+/// Minimum audio length (ms) handed to the STT server. Very short clips (under
+/// ~1s) can come back with EMPTY text when the model does not pad short audio up
+/// to a usable encoder window, so a quick "hi" transcribes blank (and the FNV
+/// helper then surfaces a bridge error). Padding every clip up to this floor
+/// keeps short utterances working regardless of the STT engine's own behavior.
 const STT_MIN_AUDIO_MS: u32 = 2000;
 
 /// Pads a PCM WAV with trailing silence so it is at least `min_ms` long, returning
 /// a canonical PCM WAV. Audio that is already long enough — or that isn't a PCM
-/// WAV we can parse — is returned byte-for-byte unchanged. whisper ignores the
-/// trailing silence, so the spoken words still transcribe; this just guarantees
+/// WAV we can parse — is returned byte-for-byte unchanged. The STT engine ignores
+/// the trailing silence, so the spoken words still transcribe; this just guarantees
 /// the encoder gets enough samples (see [`STT_MIN_AUDIO_MS`]).
 fn pad_wav_to_min_duration(bytes: &[u8], min_ms: u32) -> Vec<u8> {
     // Canonical WAV starts `RIFF....WAVE`; pass anything else through unchanged.
@@ -1200,28 +1254,12 @@ fn pad_wav_to_min_duration(bytes: &[u8], min_ms: u32) -> Vec<u8> {
     out
 }
 
-/// The transcription endpoint the active STT provider serves: the dedicated
-/// Parakeet server when the provider is `parakeet` AND the engine is installed,
-/// else the koboldcpp Whisper endpoint. Falling back on "selected but not
-/// installed" means voice input keeps working (on Whisper) instead of dying
-/// against a port nothing listens on.
-pub(crate) fn effective_stt_endpoint(
-    config: &chasm_core::AppConfig,
-    settings: &AppSettings,
-) -> String {
-    if launcher::stt_uses_parakeet(settings, config) {
-        config.parakeet_stt_endpoint.clone()
-    } else {
-        config.stt_endpoint.clone()
-    }
-}
-
-/// Speech recognition — mirrors ST `/speech/recognize`. Forwards the base64 WAV
-/// payload the FNV helper sends to the active local OpenAI-compatible STT server
-/// (koboldcpp Whisper, or the dedicated Parakeet server when selected;
-/// `/v1/audio/transcriptions`, multipart `file` upload) and returns the
-/// transcription in the same JSON shape ST returns so the helper parses
-/// `recognition.text` unchanged.
+/// Speech recognition — mirrors ST `/speech/recognize`. Routes the base64 WAV
+/// payload the FNV helper sends to the active STT provider: the managed-local
+/// Parakeet server (`local`) via a multipart `/v1/audio/transcriptions` POST, or
+/// a hosted API (OpenAI / Groq / Deepgram / AssemblyAI) via [`crate::stt_api`].
+/// Returns the transcription in the same JSON shape ST returns so the helper
+/// parses `recognition.text` unchanged.
 async fn speech_recognize(
     State(state): State<Arc<AppState>>,
     Json(req): Json<serde_json::Value>,
@@ -1237,42 +1275,29 @@ async fn speech_recognize(
         .decode(audio_b64.as_bytes())
         .map_err(|_| anyhow::anyhow!("audio must be valid base64."))?;
     let byte_length = audio_bytes.len();
-    // koboldcpp's whisper returns empty text for clips shorter than ~1s (it does
-    // not pad short audio up to a usable encoder window like reference whisper),
-    // so a quick "hi" comes back blank. Pad short PCM WAV audio with trailing
-    // silence first; whisper ignores the silence, so the words still transcribe.
+    // Short clips (a quick "hi") return blank from some recognizers that don't pad
+    // up to a usable encoder window — pad short PCM WAV audio with trailing silence
+    // first (the words still transcribe; the recognizer ignores the silence).
     let audio_bytes = pad_wav_to_min_duration(&audio_bytes, STT_MIN_AUDIO_MS);
 
-    // Provider/model/language: request overrides the saved STT settings.
     let requested_provider = req
         .get("provider")
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .unwrap_or_default();
     let resolved_provider = normalize_stt_provider(&settings.stt.provider);
-    let model = req
-        .get("model")
-        .and_then(|v| v.as_str())
-        .or_else(|| req.get("modelId").and_then(|v| v.as_str()))
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| stt_effective_model(&settings.stt));
     let language = req
         .get("language")
         .and_then(|v| v.as_str())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| settings.stt.language.trim().to_string());
-    // Prompt: request value wins, else the saved STT default biasing prompt
-    // (forwarded as the OpenAI `prompt` multipart field below).
     let prompt = req
         .get("prompt")
         .and_then(|v| v.as_str())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| settings.stt.prompt.trim().to_string());
-    // Timeout: request value (clamped) wins, else the saved STT default timeout,
-    // which becomes the actual reqwest deadline on the Parakeet POST.
     let timeout_ms = req
         .get("timeoutMs")
         .or_else(|| req.get("timeout_ms"))
@@ -1280,55 +1305,91 @@ async fn speech_recognize(
         .map(|value| value.clamp(STT_MIN_TIMEOUT_MS, STT_MAX_TIMEOUT_MS))
         .unwrap_or_else(|| chasm_core::normalize_stt_timeout_ms(settings.stt.timeout_ms));
 
-    let filename = format!("audio.{format}");
-    let file_part = reqwest::multipart::Part::bytes(audio_bytes)
-        .file_name(filename)
-        .mime_str(&mime_type)
-        .unwrap_or_else(|_| {
-            reqwest::multipart::Part::bytes(Vec::new())
-                .file_name("audio.wav")
-                .mime_str("audio/wav")
-                .expect("static wav mime")
-        });
-    let mut form = reqwest::multipart::Form::new()
-        .part("file", file_part)
-        .text("model", model.clone());
-    if !language.is_empty() {
-        form = form.text("language", language.clone());
-    }
-    if !prompt.is_empty() {
-        form = form.text("prompt", prompt.clone());
-    }
-
-    let endpoint = effective_stt_endpoint(&state.config, &settings);
-    tracing::debug!("speech recognize: provider={resolved_provider} endpoint={endpoint}");
-    let client = reqwest::Client::new();
     let start = std::time::Instant::now();
-    let response = client
-        .post(&endpoint)
-        .timeout(std::time::Duration::from_millis(timeout_ms))
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "{resolved_provider} speech-to-text request failed ({endpoint}): {error}"
-            )
-        })?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        let snippet: String = body.chars().take(1000).collect();
-        return Err(WebError(anyhow::anyhow!(
-            "{resolved_provider} speech-to-text request failed (status {status}): {snippet}"
-        )));
-    }
-    let provider_result: serde_json::Value = response.json().await.map_err(|error| {
-        anyhow::anyhow!("{resolved_provider} returned an unreadable response: {error}")
-    })?;
-    let duration_ms = start.elapsed().as_millis() as u64;
+    // `model` reported back in the metadata: the fixed local model for Parakeet, or
+    // the resolved hosted model id.
+    let mut reported_model = String::new();
 
-    let text = extract_transcript_text(&provider_result);
+    let text = if resolved_provider == chasm_core::PROVIDER_LOCAL {
+        // Managed-local Parakeet server (the only managed local STT).
+        if !launcher::stt_uses_parakeet(&settings, &state.config) {
+            return Err(WebError(anyhow::anyhow!(
+                "Local STT is selected but the Parakeet engine is not installed \
+                 (Settings -> Runtimes)."
+            )));
+        }
+        reported_model = chasm_core::PARAKEET_HF_REPO.to_string();
+        let filename = format!("audio.{format}");
+        let file_part = reqwest::multipart::Part::bytes(audio_bytes)
+            .file_name(filename)
+            .mime_str(&mime_type)
+            .unwrap_or_else(|_| {
+                reqwest::multipart::Part::bytes(Vec::new())
+                    .file_name("audio.wav")
+                    .mime_str("audio/wav")
+                    .expect("static wav mime")
+            });
+        let mut form = reqwest::multipart::Form::new()
+            .part("file", file_part)
+            .text("model", reported_model.clone());
+        if !language.is_empty() {
+            form = form.text("language", language.clone());
+        }
+        if !prompt.is_empty() {
+            form = form.text("prompt", prompt.clone());
+        }
+        let endpoint = state.config.parakeet_stt_endpoint.clone();
+        tracing::debug!("speech recognize: provider=local (Parakeet) endpoint={endpoint}");
+        let client = reqwest::Client::new();
+        let response = client
+            .post(&endpoint)
+            .timeout(std::time::Duration::from_millis(timeout_ms))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("Parakeet speech-to-text request failed ({endpoint}): {error}")
+            })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(1000).collect();
+            return Err(WebError(anyhow::anyhow!(
+                "Parakeet speech-to-text request failed (status {status}): {snippet}"
+            )));
+        }
+        let provider_result: serde_json::Value = response.json().await.map_err(|error| {
+            anyhow::anyhow!("Parakeet returned an unreadable response: {error}")
+        })?;
+        extract_transcript_text(&provider_result)
+    } else {
+        // A hosted API STT provider.
+        let Some(def) = chasm_core::stt_api_provider(&resolved_provider) else {
+            return Err(WebError(anyhow::anyhow!(
+                "Unknown STT provider '{resolved_provider}'."
+            )));
+        };
+        let cfg = settings.stt.api.get(&resolved_provider);
+        let mut resolved = chasm_core::resolve_api(def, cfg);
+        resolved.api_key = settings.provider_key(cfg, &resolved_provider);
+        reported_model = resolved.model.clone();
+        tracing::debug!("speech recognize: provider={resolved_provider} (hosted API)");
+        let client = reqwest::Client::new();
+        crate::stt_api::transcribe(
+            &client,
+            &resolved_provider,
+            &resolved,
+            audio_bytes,
+            &language,
+            &prompt,
+            std::time::Duration::from_millis(timeout_ms),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+    };
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let model = reported_model;
+
     if text.is_empty() {
         return Err(WebError(anyhow::anyhow!(
             "Speech recognition returned no text."
@@ -1555,28 +1616,6 @@ fn empty_prompt_assembly(participant_id: &str) -> PromptAssemblyView {
     }
 }
 
-const SETTINGS_CATEGORIES: [&str; 8] = [
-    "interface",
-    "profiles",
-    "llm",
-    "tts",
-    "stt",
-    "retrieval",
-    "game",
-    "tracing",
-];
-
-fn normalize_category(category: &str) -> String {
-    if SETTINGS_CATEGORIES.contains(&category) {
-        category.to_string()
-    } else {
-        "interface".to_string()
-    }
-}
-
-async fn settings_index() -> Redirect {
-    Redirect::to("/settings/interface")
-}
 
 /// `GET /theme.css` — the dynamic appearance stylesheet. Reads the saved
 /// `InterfaceSettings` FRESH on every request and emits a small `:root{}`
@@ -1595,92 +1634,6 @@ async fn theme_css(State(state): State<Arc<AppState>>) -> Response {
         css,
     )
         .into_response()
-}
-
-async fn settings_page(
-    State(state): State<Arc<AppState>>,
-    Path(category): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-) -> WebResult<Html<String>> {
-    let category = normalize_category(&category);
-    let settings = AppSettings::load(&state.config.settings_path);
-    let saved = params.get("saved").is_some_and(|value| value == "1");
-
-    // The Tracing page has its own (richer) view model + template.
-    if category == "tracing" {
-        let nav = chasm_core::settings_nav_items(&category);
-        let selected = params.get("trace").map(String::as_str);
-        let page = trace_routes::build_tracing_view(
-            &settings,
-            nav,
-            saved,
-            state.config.settings_path.display().to_string(),
-            selected,
-        );
-        return Ok(Html(TracingTemplate { page }.render()?));
-    }
-
-    let faster_installed = crate::launcher::faster_qwen3_tts_installed(&settings, &state.config);
-    let engine_status = engine_statuses(&state.config.engines_dir, faster_installed);
-    let running_engine = crate::launcher::tts_running_engine(&state);
-    let voice_clone = build_voice_clone(&state.config, &settings, &settings.tts.local_engine);
-    let model_status = llm_model_statuses(&state.config.llm_models_dir);
-    let selected_llm = chasm_core::selected_llm_model_id(&settings.llm.model, &model_status);
-    let llm_models = llm_models_panel_view(&model_status, &state.system_info, &selected_llm);
-    let (retrieval_models, retrieval_host) = build_retrieval_models(&state.system_info);
-    let (whisper_models, whisper_host) = build_whisper_models(&settings, &state.system_info);
-    let game = build_game_launcher_view(&settings.launcher);
-    let profiles = build_profiles_panel(&state, &settings);
-    // Absolute "drop files here" folders, surfaced on each model page so power
-    // users can add models by hand. Filesystem-dependent, so resolved here.
-    let model_paths = chasm_core::ModelPathsView {
-        llm: state.config.llm_models_dir.display().to_string(),
-        stt: crate::launcher::whisper_models_dir(&settings)
-            .display()
-            .to_string(),
-        tts_voices: active_voices_dir(&state.config).display().to_string(),
-        tts_engines: state.config.engines_dir.display().to_string(),
-    };
-    // Runtime status for the LLM + STT pages: koboldcpp runs both, so one status
-    // drives both. (TTS surfaces its per-engine status in the engine list itself.)
-    let kobold_runtime = chasm_core::koboldcpp_runtime_status(
-        crate::launcher::koboldcpp_status(&settings, &state.config).as_str(),
-    );
-    let page = settings_page_view(
-        &settings,
-        &category,
-        saved,
-        state.config.settings_path.display().to_string(),
-        model_paths,
-        kobold_runtime,
-        &engine_status,
-        voice_clone,
-        llm_models,
-        retrieval_models,
-        retrieval_host,
-        whisper_models,
-        whisper_host,
-        game,
-        profiles,
-        running_engine,
-    );
-    Ok(Html(SettingsTemplate { page }.render()?))
-}
-
-/// Renders just the voice-cloning panel for the engine named in `?engine=`,
-/// so the settings page can swap it in when the local-engine dropdown changes
-/// (clone status is per-engine). Unknown engines fall back to the saved one.
-async fn voice_clone_partial(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
-) -> WebResult<Html<String>> {
-    let settings = AppSettings::load(&state.config.settings_path);
-    let engine = params
-        .get("engine")
-        .cloned()
-        .unwrap_or_else(|| settings.tts.local_engine.clone());
-    let voice_clone = build_voice_clone(&state.config, &settings, &engine);
-    Ok(Html(VoiceClonePartialTemplate { voice_clone }.render()?))
 }
 
 /// Builds the voice-cloning view for a specific engine from the active game
@@ -1928,8 +1881,8 @@ fn select_profile_inner(state: &Arc<AppState>, id: &str) -> WebResult<Json<serde
     settings.profile = profile.id.clone();
     settings.save(&state.config.settings_path)?;
 
-    // koboldcpp serves TTS with voices fixed at launch (--ttsdir), so a profile
-    // switch does not respawn a per-profile TTS worker.
+    // The TTS server serves voices fixed at launch, so a profile switch does not
+    // respawn a per-profile TTS worker.
     info!("active profile switched to '{}'", profile.id);
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -2234,83 +2187,6 @@ pub(crate) fn llm_model_statuses(models_dir: &std::path::Path) -> HashMap<String
         .collect()
 }
 
-/// Reads the download status of each Whisper model from the Whisper models dir:
-/// the model's `.bin` file present → `downloaded`; a `<id>.downloading` marker →
-/// `downloading`; a `<id>.failed` marker → `failed`; else `available`. Mirrors
-/// [`llm_model_statuses`] but keys off the exact `.bin` filename (koboldcpp loads
-/// Whisper by file, not a HF repo id).
-fn whisper_model_statuses(models_dir: &std::path::Path) -> HashMap<String, String> {
-    WHISPER_MODELS
-        .iter()
-        .map(|model| {
-            let downloading = models_dir.join(format!("{}.downloading", model.id));
-            let failed = models_dir.join(format!("{}.failed", model.id));
-            let progress = [
-                models_dir.join(format!("{}.log", model.id)),
-                models_dir.join(format!("{}.part", model.file)),
-            ];
-            flip_marker_if_stale(&downloading, &failed, &progress);
-            let status = if models_dir.join(model.file).is_file() {
-                "downloaded"
-            } else if downloading.exists() {
-                "downloading"
-            } else if failed.exists() {
-                "failed"
-            } else {
-                "available"
-            };
-            (model.id.to_string(), status.to_string())
-        })
-        .collect()
-}
-
-/// Builds the Whisper model list + host summary for the STT picker. The
-/// "recommended" badge is the largest model that fits this host's GPU comfortably
-/// (via [`recommended_index`] over the models' footprints); the per-model hint
-/// comes from [`SystemInfo::gpu_fit`]. Mirrors [`build_retrieval_models`].
-pub(crate) fn build_whisper_models(
-    settings: &AppSettings,
-    system: &SystemInfo,
-) -> (Vec<WhisperModelView>, RetrievalHostView) {
-    let models_dir = crate::launcher::whisper_models_dir(settings);
-    let statuses = whisper_model_statuses(&models_dir);
-
-    let footprints: Vec<f64> = WHISPER_MODELS.iter().map(|m| m.size_gb).collect();
-    let recommended = recommended_index(&footprints, system);
-
-    let models = WHISPER_MODELS
-        .iter()
-        .enumerate()
-        .map(|(index, m)| {
-            let status = statuses
-                .get(m.id)
-                .map(String::as_str)
-                .unwrap_or("available");
-            WhisperModelView {
-                id: m.id.to_string(),
-                name: m.name.to_string(),
-                file: m.file.to_string(),
-                size_label: format!("~{:.1} GB", m.size_gb),
-                status: status.to_string(),
-                status_label: whisper_model_status_label(status),
-                downloaded: status == "downloaded",
-                downloading: status == "downloading",
-                can_download: status == "available" || status == "failed",
-                recommended: recommended == Some(index),
-                fit_hint: fit_hint(system, m.size_gb),
-                // Set by stt_panel_view once the saved model filename is known.
-                selected: false,
-            }
-        })
-        .collect();
-
-    let host = RetrievalHostView {
-        summary: host_summary(system),
-        has_gpu: system.vram_total_gb.is_some(),
-    };
-    (models, host)
-}
-
 /// Reads the download status of each retrieval model. A model is `downloaded`
 /// when its `models--<org>--<repo>` weight dir exists under the embed cache dir,
 /// `downloading` when a `.downloading` marker (under a per-id markers dir) is
@@ -2335,79 +2211,13 @@ pub(crate) fn retrieval_model_statuses(cache_dir: &std::path::Path) -> HashMap<S
         .collect()
 }
 
-/// Ensures the koboldcpp runtime (the exe that serves the LLM AND Whisper STT) is
-/// present, kicking off its detached GitHub-release download when it's `Missing`.
-/// A no-op when koboldcpp is already `Installed` (existing users keep their build,
-/// never re-downloaded) or already `Downloading`. Called alongside every LLM /
-/// Whisper model download so one "Download" click also pulls the runtime if needed.
-/// Best-effort: download/marker errors are logged, never surfaced to the caller.
-pub(crate) fn ensure_koboldcpp(state: &AppState) {
-    let settings = AppSettings::load(&state.config.settings_path);
-    let status = crate::launcher::koboldcpp_status(&settings, &state.config);
-    if status != crate::launcher::KoboldcppStatus::Missing {
-        return;
-    }
-    let exe = crate::launcher::koboldcpp_exe_path(&settings, &state.config);
-    let Some(dir) = exe.parent() else {
-        return;
-    };
-    if let Err(error) = fs::create_dir_all(dir) {
-        tracing::warn!("could not create koboldcpp dir {}: {error}", dir.display());
-        return;
-    }
-    let _ = fs::remove_file(dir.join("koboldcpp.failed"));
-    let script = state
-        .config
-        .workspace_root
-        .join("scripts")
-        .join("download-koboldcpp.ps1");
-    // Surface a missing downloader immediately (Requirement E): write `.failed`
-    // instead of a `.downloading` marker that would hang the runtime card forever.
-    if !script.exists() {
-        let _ = fs::write(
-            dir.join("koboldcpp.failed"),
-            format!("downloader missing: {}", script.display()),
-        );
-        tracing::warn!("koboldcpp download: downloader missing at {}; wrote .failed", script.display());
-        return;
-    }
-    if let Err(error) = fs::write(dir.join("koboldcpp.downloading"), "") {
-        tracing::warn!("could not write koboldcpp.downloading marker: {error}");
-        return;
-    }
-    let spawned = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &script.display().to_string(),
-            "-ExePath",
-            &exe.display().to_string(),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    match spawned {
-        Ok(_) => tracing::info!("koboldcpp missing; started runtime download -> {}", exe.display()),
-        Err(error) => {
-            let _ = fs::remove_file(dir.join("koboldcpp.downloading"));
-            let _ = fs::write(
-                dir.join("koboldcpp.failed"),
-                format!("spawn failed: {error}"),
-            );
-            tracing::warn!("could not start koboldcpp download: {error}");
-        }
-    }
-}
-
-/// Ensures the llama.cpp runtime exists: when `llamacpp_status` is Missing,
-/// spawns `scripts/download-llamacpp.ps1` detached (markers `llamacpp.downloading`
-/// / `.done` / `.failed` beside the exe). Mirrors [`ensure_koboldcpp`].
+/// Ensures the managed llama.cpp runtime exists: when `llamacpp_status` is
+/// Missing, spawns `scripts/download-llamacpp.ps1` detached (markers
+/// `llamacpp.downloading` / `.done` / `.failed` beside the exe). Called from the
+/// Runtimes install card and the connect-time stack start.
 pub(crate) fn ensure_llamacpp(state: &AppState) {
     let status = crate::launcher::llamacpp_status(&state.config);
-    if status != crate::launcher::KoboldcppStatus::Missing {
+    if status != crate::launcher::RuntimeStatus::Missing {
         return;
     }
     let exe = crate::launcher::llamacpp_exe_path(&state.config);
@@ -2507,137 +2317,6 @@ pub(crate) fn start_llm_download(state: &AppState, id: &str) -> std::io::Result<
             format!("downloader missing: {}", script.display()),
         );
         tracing::warn!("LLM download '{id}': downloader missing at {}; wrote .failed", script.display());
-        return Ok(true);
-    }
-    fs::write(models_dir.join(format!("{id}.downloading")), "")?;
-
-    let spawned = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &script.display().to_string(),
-            "-Id",
-            id,
-            "-Url",
-            &url,
-            "-File",
-            &file,
-            "-ModelsDir",
-            &models_dir.display().to_string(),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    if let Err(error) = spawned {
-        let _ = fs::remove_file(models_dir.join(format!("{id}.downloading")));
-        let _ = fs::write(
-            models_dir.join(format!("{id}.failed")),
-            format!("spawn failed: {error}"),
-        );
-    }
-    Ok(true)
-}
-
-async fn download_llm_model(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> WebResult<Redirect> {
-    if !start_llm_download(&state, &id)? {
-        return Ok(Redirect::to("/settings/llm"));
-    }
-    // One "Download" click also pulls the koboldcpp runtime if it isn't present,
-    // so the model has something to run on (no-op when already installed).
-    ensure_koboldcpp(&state);
-    Ok(Redirect::to("/settings/llm?downloading=1"))
-}
-
-/// Kicks off downloading a Whisper GGML `.bin` into the Whisper models dir (the
-/// dir koboldcpp loads `--whispermodel` from). Thin wrapper over
-/// [`start_whisper_download`] so the STT page and the onboarding "Use recommended"
-/// flow share one downloader. Mirrors [`download_llm_model`].
-async fn download_whisper_model(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> WebResult<Redirect> {
-    let _ = start_whisper_download(&state, &id);
-    // koboldcpp serves Whisper STT too, so ensure the runtime alongside the model
-    // (no-op when already installed).
-    ensure_koboldcpp(&state);
-    Ok(Redirect::to("/settings/stt?downloading=1"))
-}
-
-/// Opens a model-category folder in Windows Explorer, then redirects back to the
-/// matching settings page. `category` is a fixed key (not user input) mapped to a
-/// config dir, so there's no path injection: unknown keys just redirect with no
-/// side effect. Creates the dir first (a freshly-set-up machine may not have it
-/// yet) so Explorer opens the right place instead of erroring.
-async fn open_model_folder(
-    State(state): State<Arc<AppState>>,
-    Path(category): Path<String>,
-) -> WebResult<Redirect> {
-    let settings = AppSettings::load(&state.config.settings_path);
-    let (dir, back) = match category.as_str() {
-        "llm" => (state.config.llm_models_dir.clone(), "/settings/llm"),
-        "stt" => (crate::launcher::whisper_models_dir(&settings), "/settings/stt"),
-        "tts-voices" => (active_voices_dir(&state.config), "/settings/tts"),
-        "tts-engines" => (state.config.engines_dir.clone(), "/settings/tts"),
-        _ => return Ok(Redirect::to("/settings")),
-    };
-    let _ = fs::create_dir_all(&dir);
-    let _ = Command::new("explorer")
-        .arg(dir.display().to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    Ok(Redirect::to(back))
-}
-
-/// Kicks off a Whisper `.bin` download into the Whisper models dir, returning
-/// whether the model is already present / in flight (so onboarding can fire it the
-/// same fire-and-forget way it does the LLM). Writes a `<id>.downloading` marker
-/// and spawns the detached generic `download-llm.ps1` (Id/Url/File/ModelsDir — it
-/// writes `<id>.done`/`<id>.failed` and clears the marker). The `.bin` lands beside
-/// the model koboldcpp loads, pulled from `ggerganov/whisper.cpp`.
-pub(crate) fn start_whisper_download(state: &AppState, id: &str) -> std::io::Result<bool> {
-    let Some(model) = whisper_model_by_id(id) else {
-        return Ok(false);
-    };
-    let settings = AppSettings::load(&state.config.settings_path);
-    let models_dir = crate::launcher::whisper_models_dir(&settings);
-    fs::create_dir_all(&models_dir)?;
-
-    // Already present (the .bin exists) or already in flight → no-op.
-    let status = whisper_model_statuses(&models_dir);
-    if matches!(
-        status.get(id).map(String::as_str),
-        Some("downloaded") | Some("downloading")
-    ) {
-        return Ok(true);
-    }
-
-    let _ = fs::remove_file(models_dir.join(format!("{id}.failed")));
-
-    let file = model.file.to_string();
-    let url = format!(
-        "https://huggingface.co/{}/resolve/main/{}?download=true",
-        WHISPER_REPO, file
-    );
-    let script = state
-        .config
-        .workspace_root
-        .join("scripts")
-        .join("download-llm.ps1");
-    // Surface a missing downloader immediately (Requirement E).
-    if !script.exists() {
-        let _ = fs::write(
-            models_dir.join(format!("{id}.failed")),
-            format!("downloader missing: {}", script.display()),
-        );
-        tracing::warn!("Whisper download '{id}': downloader missing at {}; wrote .failed", script.display());
         return Ok(true);
     }
     fs::write(models_dir.join(format!("{id}.downloading")), "")?;
@@ -2947,103 +2626,6 @@ pub(crate) fn start_retrieval_download(state: &AppState, id: &str) -> std::io::R
 
 /// Kicks off a retrieval-model download, then redirects back to the Askama
 /// settings page. Thin wrapper over [`start_retrieval_download`].
-async fn download_retrieval_model(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> WebResult<Redirect> {
-    let _ = start_retrieval_download(&state, &id)?;
-    Ok(Redirect::to("/settings/retrieval?downloading=1"))
-}
-
-async fn save_settings(
-    State(state): State<Arc<AppState>>,
-    Path(category): Path<String>,
-    Form(form): Form<HashMap<String, String>>,
-) -> WebResult<Redirect> {
-    let category = normalize_category(&category);
-    let mut settings = AppSettings::load(&state.config.settings_path);
-    // Remember the live TTS engine so we can hot-swap :5002 if the picker changed.
-    let prev_tts_engine = chasm_core::normalize_local_engine(&settings.tts.local_engine);
-    // Remember the live LLM model so we can relaunch koboldcpp if the picker changed.
-    let model_status = llm_model_statuses(&state.config.llm_models_dir);
-    // RAW saved id before the form is applied — compare raw-vs-raw to detect a real
-    // selection change. Comparing the fallback-resolved id (selected_llm_model_id)
-    // hid swaps from an empty/defaulted setting, because it falls back to the first
-    // *downloaded* model and collapses both before/after sides to the same id.
-    let prev_raw_llm_model = settings.llm.model.trim().to_string();
-    // Remember the active Whisper model so we can swap it (and force koboldcpp to
-    // reload) if the STT picker changed.
-    let prev_whisper_model = stt_effective_model(&settings.stt);
-    match category.as_str() {
-        "tts" => apply_tts_form(&mut settings.tts, &form),
-        "llm" => apply_llm_form(&mut settings.llm, &form),
-        "stt" => apply_stt_form(&mut settings.stt, &form),
-        "retrieval" => apply_retrieval_form(&mut settings.retrieval, &form),
-        "game" => apply_game_form(&mut settings.launcher, &form),
-        "interface" => apply_interface_form(&mut settings.interface, &form),
-        // The Profiles category has no persisted form fields: activation is done
-        // via POST /profile/select. A save here is a harmless no-op.
-        "profiles" => {}
-        "tracing" => {
-            if let Some(value) = form.get("trace_dir") {
-                settings.tracing.trace_dir = value.trim().to_string();
-            }
-        }
-        _ => {}
-    }
-    settings.save(&state.config.settings_path)?;
-
-    // If the TTS engine selection changed, apply it to :5002 now (kill + respawn)
-    // so the in-settings voice Test and the next in-game line use the newly-picked
-    // engine without waiting for a Play. Off the async path — it sleeps briefly
-    // between kill + spawn — and best-effort (a down stack just means next Play).
-    if category == "tts" {
-        let new_tts_engine = chasm_core::normalize_local_engine(&settings.tts.local_engine);
-        if new_tts_engine != prev_tts_engine {
-            let state = Arc::clone(&state);
-            tokio::task::spawn_blocking(move || {
-                crate::launcher::apply_selected_tts_engine(&state);
-            });
-        }
-    }
-
-    // If the LLM model selection changed, relaunch koboldcpp on the new --model
-    // now (kill the old -> load the new) so the swap takes effect without a Play.
-    // koboldcpp loads --model only at launch, so this is a full reload - the old
-    // model is unloaded before the new one loads. Off the async path (it sleeps
-    // between kill + spawn) and best-effort: a down stack just means the next Play
-    // loads it. Only when the *selected* model id actually changed.
-    if category == "llm" {
-        let new_llm_model =
-            chasm_core::selected_llm_model_id(&settings.llm.model, &model_status);
-        let raw_changed = settings.llm.model.trim() != prev_raw_llm_model;
-        if raw_changed && !new_llm_model.is_empty() {
-            let state = Arc::clone(&state);
-            tokio::task::spawn_blocking(move || {
-                crate::launcher::apply_selected_llm_model(&state);
-            });
-        }
-    }
-
-    // If the Whisper model selection changed, rewrite koboldcpp's --whispermodel
-    // (config + start_kobold.bat) and stop koboldcpp so the OLD model is unloaded;
-    // the next Play relaunches it with the new model. koboldcpp can't hot-swap just
-    // the whisper slot, so a restart (which also reloads the LLM) is the only way
-    // to GUARANTEE the previous model leaves VRAM. Off the async path (it kills a
-    // process + rewrites files); best-effort.
-    if category == "stt" {
-        let new_whisper_model = stt_effective_model(&settings.stt);
-        if new_whisper_model != prev_whisper_model {
-            let state = Arc::clone(&state);
-            tokio::task::spawn_blocking(move || {
-                crate::launcher::apply_selected_whisper_model(&state, &new_whisper_model);
-            });
-        }
-    }
-
-    Ok(Redirect::to(&format!("/settings/{category}?saved=1")))
-}
-
 pub(crate) fn apply_tts_form(tts: &mut TtsSettings, form: &HashMap<String, String>) {
     if let Some(mode) = form.get("mode") {
         if mode == "api" || mode == "local" {
@@ -3278,9 +2860,6 @@ pub(crate) fn apply_stt_form(stt: &mut SttSettings, form: &HashMap<String, Strin
     if let Some(value) = form.get("provider") {
         stt.provider = normalize_stt_provider(value);
     }
-    if let Some(value) = form.get("model") {
-        stt.model = value.trim().to_string();
-    }
     if let Some(value) = form.get("language") {
         stt.language = value.trim().to_string();
     }
@@ -3374,38 +2953,13 @@ struct StackStatusResponse {
 }
 
 /// `GET /api/stack/status` — cheap, non-blocking snapshot of each model/service
-/// for the sidebar lights. LLM + STT both ride koboldcpp (one process, one port):
-/// LLM is up when that port is reachable; STT additionally needs a Whisper model
-/// downloaded. TTS is up when its engine server answers on :5002. Embedder /
-/// reranker are in-process — reported from the already-loaded retriever, which
-/// never triggers a (multi-second) load here.
+/// for the sidebar lights. Each capability reflects its selected PROVIDER: a
+/// hosted API reads "ok" once its key is set (we don't ping it here); the
+/// managed-local option reads up when its server answers (LLM llama.cpp :5001,
+/// STT Parakeet :5003, TTS :5002). Embedder / reranker are in-process — reported
+/// from the already-loaded retriever, which never triggers a load here.
 async fn stack_status(State(state): State<Arc<AppState>>) -> Json<StackStatusResponse> {
     let settings = AppSettings::load(&state.config.settings_path);
-
-    let kobold_up = launcher::koboldcpp_running(&state);
-    // Runtime missing → its auto-download may be in flight; surface that as
-    // "busy" so the LLM/STT lights read "coming up", not "broken". Tracks the
-    // SELECTED runtime's markers (koboldcpp or llama.cpp).
-    let runtime_llamacpp = chasm_core::normalize_llm_runtime(&settings.runtime.llm_runtime)
-        == chasm_core::LLM_RUNTIME_LLAMACPP;
-    let kobold_downloading = if runtime_llamacpp {
-        launcher::llamacpp_status(&state.config) == launcher::KoboldcppStatus::Downloading
-    } else {
-        launcher::koboldcpp_status(&settings, &state.config)
-            == launcher::KoboldcppStatus::Downloading
-    };
-    let tts_up = launcher::tts_running_engine(&state).is_some();
-
-    // STT: the dedicated Parakeet server when selected + installed, else the
-    // koboldcpp Whisper path (rides koboldcpp; needs a Whisper model present).
-    let stt_parakeet = launcher::stt_uses_parakeet(&settings, &state.config);
-    let parakeet_up = stt_parakeet && launcher::parakeet_running(&state);
-    let whisper_dir = launcher::whisper_models_dir(&settings);
-    let whisper_present = whisper_model_statuses(&whisper_dir)
-        .values()
-        .any(|status| status == "downloaded");
-
-    let retriever = state.retriever_loaded();
 
     // "ok" = up · "busy" = coming up (runtime still downloading) · "idle" = down.
     let up_or_busy = |up: bool, busy: bool| {
@@ -3418,25 +2972,49 @@ async fn stack_status(State(state): State<Arc<AppState>>) -> Json<StackStatusRes
         }
     };
     let flag = |up: bool| if up { "ok" } else { "idle" };
+    // Whether a hosted provider `id` has an effective API key (its own or the
+    // shared cross-capability key) — the light reads "ok".
+    let api_key_set = |map: &std::collections::BTreeMap<String, chasm_core::ApiProviderConfig>,
+                       id: &str| { !settings.provider_key(map.get(id), id).is_empty() };
 
-    let stt_up = if stt_parakeet {
-        parakeet_up
+    // --- LLM ---
+    let llm_provider = chasm_core::normalize_llm_provider(&settings.llm.provider);
+    let llm_light = if llm_provider == chasm_core::PROVIDER_LOCAL {
+        let up = launcher::llm_runtime_running(&state);
+        let busy = launcher::llamacpp_status(&state.config) == launcher::RuntimeStatus::Downloading;
+        up_or_busy(up, busy)
     } else {
-        kobold_up && whisper_present
+        flag(api_key_set(&settings.llm.api, &llm_provider))
     };
+
+    // --- STT ---
+    let stt_provider = chasm_core::normalize_stt_provider(&settings.stt.provider);
+    let stt_light = if stt_provider == chasm_core::PROVIDER_LOCAL {
+        flag(launcher::stt_uses_parakeet(&settings, &state.config) && launcher::parakeet_running(&state))
+    } else {
+        flag(api_key_set(&settings.stt.api, &stt_provider))
+    };
+
+    // --- TTS ---
+    let tts_provider = chasm_core::normalize_tts_provider(&settings.tts.provider);
+    let tts_light = if tts_provider == chasm_core::PROVIDER_LOCAL {
+        flag(launcher::tts_running_engine(&state).is_some())
+    } else {
+        flag(api_key_set(&settings.tts.api, &tts_provider))
+    };
+
+    let retriever = state.retriever_loaded();
     Json(StackStatusResponse {
-        llm: up_or_busy(kobold_up, kobold_downloading),
-        // Whisper rides koboldcpp specifically: with the llama.cpp runtime the
-        // whisper path can never come up, so don't show it as "coming up".
-        stt: up_or_busy(stt_up, !stt_parakeet && !runtime_llamacpp && kobold_downloading),
-        tts: flag(tts_up),
+        llm: llm_light,
+        stt: stt_light,
+        tts: tts_light,
         embedder: flag(retriever.is_some()),
         reranker: flag(retriever.map(|r| r.has_reranker()).unwrap_or(false)),
     })
 }
 
 /// `POST /api/stack/start` — manually bring the whole model stack up without
-/// waiting for the game to connect: spawn koboldcpp (LLM + Whisper STT) and the
+/// waiting for the game to connect: spawn the LLM runtime + Parakeet STT and the
 /// selected TTS engine, and warm the in-process retriever (embedder + reranker).
 /// Idempotent — already-running services are left alone. Returns immediately; the
 /// sidebar lights flip to green as each service becomes reachable.
@@ -3444,47 +3022,34 @@ async fn stack_start(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
     // start_ai_stack blocks (reachability probes + process spawn) → blocking pool.
     let stack_state = state.clone();
     tokio::task::spawn_blocking(move || {
-        // Ensure the selected LLM RUNTIME exists — without it, an LLM model can't
-        // be served and Start would silently do nothing for LLM/STT. This also
-        // flips a stale `.downloading` marker (e.g. a download that died on an
-        // older build) so a fresh fetch can start. llama.cpp is opt-in: its
-        // downloader only runs when it IS the selected runtime.
-        let runtime_status = |stack_state: &Arc<AppState>| {
+        // Ensure the managed LLM runtime (llama.cpp) exists when the LLM provider is
+        // local — without it an LLM model can't be served. Also flips a stale
+        // `.downloading` marker so a fresh fetch can start. Skipped when the LLM
+        // provider is a hosted API (nothing local to install).
+        let llm_local = {
             let settings = AppSettings::load(&stack_state.config.settings_path);
-            if chasm_core::normalize_llm_runtime(&settings.runtime.llm_runtime)
-                == chasm_core::LLM_RUNTIME_LLAMACPP
-            {
-                launcher::llamacpp_status(&stack_state.config)
-            } else {
-                launcher::koboldcpp_status(&settings, &stack_state.config)
-            }
+            chasm_core::normalize_llm_provider(&settings.llm.provider) == chasm_core::PROVIDER_LOCAL
         };
-        {
-            let settings = AppSettings::load(&stack_state.config.settings_path);
-            if chasm_core::normalize_llm_runtime(&settings.runtime.llm_runtime)
-                == chasm_core::LLM_RUNTIME_LLAMACPP
-            {
-                ensure_llamacpp(&stack_state);
-            } else {
-                ensure_koboldcpp(&stack_state);
-            }
+        if llm_local {
+            ensure_llamacpp(&stack_state);
         }
-        // Spawn whatever is present now (the TTS engine, and the LLM runtime if
-        // it's already installed).
+        // Spawn whatever is present now (the TTS engine + Parakeet if local, and the
+        // LLM runtime if already installed).
         launcher::start_ai_stack(&stack_state);
-        // If the runtime was still downloading, wait (bounded) for its exe to
-        // land, then spawn it — so a first click brings LLM/STT up without a
-        // second one.
-        if runtime_status(&stack_state) == launcher::KoboldcppStatus::Downloading {
+        // If the runtime was still downloading, wait (bounded) for its exe to land,
+        // then spawn it — so a first click brings the LLM up without a second one.
+        if llm_local
+            && launcher::llamacpp_status(&stack_state.config) == launcher::RuntimeStatus::Downloading
+        {
             for _ in 0..180 {
                 std::thread::sleep(std::time::Duration::from_secs(5)); // ≤15 min
-                match runtime_status(&stack_state) {
-                    launcher::KoboldcppStatus::Installed => {
+                match launcher::llamacpp_status(&stack_state.config) {
+                    launcher::RuntimeStatus::Installed => {
                         launcher::start_ai_stack(&stack_state);
                         break;
                     }
-                    launcher::KoboldcppStatus::Missing => break, // download failed → give up
-                    launcher::KoboldcppStatus::Downloading => continue,
+                    launcher::RuntimeStatus::Missing => break, // download failed → give up
+                    launcher::RuntimeStatus::Downloading => continue,
                 }
             }
         }

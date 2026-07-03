@@ -555,15 +555,15 @@ async fn main_llm_completion(
     state: &AppState,
     messages: &[Value],
 ) -> Result<String, String> {
-    let sampling = crate::llm::Sampling::from_settings(
-        &AppSettings::load(&state.config.settings_path).llm.sampling,
-    )
-    .with_overrides(crate::llm::GenerationOptions {
-        temperature: None,
-        max_tokens: Some(PERSONA_MAX_TOKENS),
-    });
+    let persona_settings = AppSettings::load(&state.config.settings_path);
+    let sampling = crate::llm::Sampling::from_settings(&persona_settings.llm.sampling)
+        .with_overrides(crate::llm::GenerationOptions {
+            temperature: None,
+            max_tokens: Some(PERSONA_MAX_TOKENS),
+        });
+    let target = crate::llm::LlmTarget::resolve(&persona_settings, &state.config);
     let (text, _metrics) = crate::llm::chat_completion_capturing_sampled(
-        &state.config.llm_endpoint,
+        &target,
         messages,
         None,
         sampling,

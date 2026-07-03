@@ -262,6 +262,9 @@ pub async fn generate_stream_core(
     // opener-chunk splitting is needed — that legacy path is removed.)
     let live_settings = AppSettings::load(&state.config.settings_path);
     let sampling = crate::llm::Sampling::from_settings(&live_settings.llm.sampling);
+    // The active LLM target (managed-local or a hosted API), resolved fresh per
+    // request so a provider switch takes effect on the next turn.
+    let target = crate::llm::LlmTarget::resolve(&live_settings, &state.config);
 
     let state = state.clone();
     let live_chat_id = ctx.live_chat.id.clone();
@@ -271,7 +274,6 @@ pub async fn generate_stream_core(
         yield ndjson(&json!({ "type": "live.start", "liveChatId": live_chat_id }));
         let trace_id = trace_id;
 
-        let endpoint = state.config.llm_endpoint.clone();
         let mut turns: Vec<Value> = Vec::new();
 
         // One streamed turn per selected speaker, in order. Each turn is
@@ -305,7 +307,7 @@ pub async fn generate_stream_core(
             let response_format = plan.structured.then(crate::llm::structured_response_format);
             trace_generate_stage(trace_id.as_deref(), "gen_llm_request_dispatch");
             let mut first_token_seen = false;
-            match crate::llm::chat_completion_stream(&endpoint, &plan.chat_messages, response_format.as_ref(), trace_id.as_deref(), sampling)
+            match crate::llm::chat_completion_stream(&target, &plan.chat_messages, response_format.as_ref(), trace_id.as_deref(), sampling)
                 .await
             {
                 Ok(mut rx) => {
@@ -416,17 +418,17 @@ pub async fn generate(
     trace_generate_stage(trace_id.as_deref(), "gen_speakers_selected");
     let speaker_summaries: Vec<Value> = speakers.iter().map(speaker_summary).collect();
 
-    let endpoint = state.config.llm_endpoint.clone();
-    // Saved LLM sampling, read fresh per request so UI tweaks apply next turn.
-    let sampling = crate::llm::Sampling::from_settings(
-        &AppSettings::load(&state.config.settings_path).llm.sampling,
-    );
+    // Saved LLM sampling + the active provider target, read fresh per request so
+    // UI tweaks / a provider switch apply next turn.
+    let live_settings = AppSettings::load(&state.config.settings_path);
+    let sampling = crate::llm::Sampling::from_settings(&live_settings.llm.sampling);
+    let target = crate::llm::LlmTarget::resolve(&live_settings, &state.config);
     let mut turns: Vec<Value> = Vec::new();
     for speaker in &speakers {
         let plan = prepare_speaker_turn(&state, &ctx, speaker)?;
         let response_format = plan.structured.then(crate::llm::structured_response_format);
         let (text, metrics) = crate::llm::chat_completion_capturing_sampled(
-            &endpoint,
+            &target,
             &plan.chat_messages,
             response_format.as_ref(),
             sampling,
@@ -2699,15 +2701,15 @@ pub async fn generate_headless(
 ) -> WebResult<Json<Value>> {
     let trace_id = trace_id_from_headers(&headers);
     let run = resolve_admin_run(&state, &body)?;
-    let endpoint = state.config.llm_endpoint.clone();
     let response_format = run.structured.then(crate::llm::structured_response_format);
-    // Saved sampling overlaid with the request's explicit generationOptions.
-    let sampling = crate::llm::Sampling::from_settings(
-        &AppSettings::load(&state.config.settings_path).llm.sampling,
-    )
-    .with_overrides(run.options);
+    // Saved sampling overlaid with the request's explicit generationOptions, plus
+    // the active provider target.
+    let admin_settings = AppSettings::load(&state.config.settings_path);
+    let sampling =
+        crate::llm::Sampling::from_settings(&admin_settings.llm.sampling).with_overrides(run.options);
+    let target = crate::llm::LlmTarget::resolve(&admin_settings, &state.config);
     let (raw, metrics) = crate::llm::chat_completion_capturing_sampled(
-        &endpoint,
+        &target,
         &run.chat_messages,
         response_format.as_ref(),
         sampling,
@@ -2734,13 +2736,12 @@ pub async fn generate_headless_stream(
     // Resolve synchronously so hard errors surface as a non-200 (matching the
     // helper's `streamApi`, which checks the response status before reading).
     let run = resolve_admin_run(&state, &body)?;
-    let endpoint = state.config.llm_endpoint.clone();
-    // Saved sampling overlaid with the request's explicit generationOptions,
-    // computed before the stream takes ownership of `run`.
-    let sampling = crate::llm::Sampling::from_settings(
-        &AppSettings::load(&state.config.settings_path).llm.sampling,
-    )
-    .with_overrides(run.options);
+    // Saved sampling overlaid with the request's explicit generationOptions, plus
+    // the active provider target, computed before the stream takes ownership of `run`.
+    let admin_settings = AppSettings::load(&state.config.settings_path);
+    let sampling =
+        crate::llm::Sampling::from_settings(&admin_settings.llm.sampling).with_overrides(run.options);
+    let target = crate::llm::LlmTarget::resolve(&admin_settings, &state.config);
 
     let session_id = run.session_id.clone();
     let character_id = run
@@ -2758,7 +2759,7 @@ pub async fn generate_headless_stream(
 
         let response_format = run.structured.then(crate::llm::structured_response_format);
         let mut raw = String::new();
-        match crate::llm::chat_completion_stream(&endpoint, &run.chat_messages, response_format.as_ref(), trace_id.as_deref(), sampling)
+        match crate::llm::chat_completion_stream(&target, &run.chat_messages, response_format.as_ref(), trace_id.as_deref(), sampling)
             .await
         {
             Ok(mut rx) => {
@@ -3403,7 +3404,7 @@ mod tests {
     /// disk-backed live chat: `warmup_chat_messages` (a) is a pure read — the
     /// data root is byte-for-byte unchanged — and (b) equals the real first
     /// turn's chat-completion array minus the trailing player message, so
-    /// koboldcpp's `cache_prompt` fast-forwards over everything the warm-up
+    /// the LLM runtime's `cache_prompt` fast-forwards over everything the warm-up
     /// pre-ingested and turn 1 only pays for the player's new line.
     #[tokio::test]
     async fn warmup_prompt_is_the_real_first_turn_prefix_and_persists_nothing() {

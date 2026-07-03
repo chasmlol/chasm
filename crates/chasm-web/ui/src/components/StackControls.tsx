@@ -9,8 +9,9 @@ import { cn } from "@/lib/utils";
 // directly under the connection pill in the sidebar. Polls `/api/stack/status`
 // every 2s (like the connection pill) and reflects each service: a green pulsing
 // dot when it's up/loaded, a dim dot when it's not. The button POSTs
-// `/api/stack/start`, which spawns koboldcpp (LLM+STT) + the TTS engine and warms
-// the retriever; the lights flip to green as each becomes reachable.
+// `/api/stack/start`, which spawns the configured LLM, STT and TTS providers
+// (the managed local engines when selected) and warms the retriever; the lights
+// flip to green as each becomes reachable.
 
 const MODELS: { key: keyof StackStatus; label: string }[] = [
   { key: "llm", label: "LLM" },

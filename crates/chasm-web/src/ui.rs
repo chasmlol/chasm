@@ -44,8 +44,10 @@ pub(crate) mod globals;
 pub(crate) mod models;
 pub(crate) mod persona;
 pub(crate) mod profiles;
+pub(crate) mod providers;
 pub(crate) mod relationships;
 pub(crate) mod settings;
+pub(crate) mod system;
 
 /// Where the built SPA lives: `crates/chasm-web/ui/dist`, resolved off the
 /// workspace root (the same anchor `AppConfig` uses for `static/`). Built by
@@ -83,10 +85,33 @@ pub(crate) fn api_router() -> Router<Arc<AppState>> {
         // --- books (Characters / Lore / Quest / Action; STUB) ----------------
         .route("/books/:kind", get(books::list_book))
         .route("/books/:kind/:id", post(books::save_book))
-        // --- models (LLM / TTS / STT / Retrieval; STUB) ----------------------
+        // --- models (LLM / TTS / STT / Retrieval) ----------------------------
         .route("/models/:domain", get(models::get_models))
         .route("/models/:domain/select", post(models::select_model))
         .route("/models/:domain/download", post(models::download_model))
+        // Guided manual model placement (theme B): the user drops / picks a model
+        // file and we stream it (raw bytes body) into the resolved folder. Disable
+        // the 2MB default body limit — GGUFs are multi-GB.
+        .route(
+            "/models/:domain/place",
+            post(system::place_model).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        // --- providers (LLM / STT / TTS provider picker + per-provider config) -
+        .route("/providers/:capability", get(providers::get_providers))
+        .route(
+            "/providers/:capability/select",
+            post(providers::select_provider),
+        )
+        .route(
+            "/providers/:capability/config",
+            post(providers::save_provider_config),
+        )
+        // --- TTS API voice cloning (clone a character via the hosted provider) -
+        .route("/tts/clone", post(providers::clone_api_voice))
+        .route("/tts/api-voices", get(providers::list_api_voices))
+        // --- system (OS integration the webview can't do itself) -------------
+        .route("/system/open-url", post(system::open_url))
+        .route("/system/open-folder", post(system::open_folder))
         // --- config (per-engine LLM/TTS/STT/Retrieval knobs; reuses the legacy
         // apply/normalize path so saved values round-trip identically) ---------
         .route(

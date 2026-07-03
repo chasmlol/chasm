@@ -23,7 +23,7 @@ webview at it.
 - **Single instance**: a second launch focuses the existing window instead of
   starting a second server (which would double-bind `:7341` and run two
   bridges/lifecycles).
-- **Quit** tears down the koboldcpp + TTS stack chasm started (so the runtimes
+- **Quit** tears down the llama.cpp + TTS stack chasm started (so the runtimes
   aren't orphaned), then exits.
 
 ## Environment

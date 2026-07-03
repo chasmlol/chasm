@@ -1,7 +1,8 @@
 """Chasm's PocketTTS streaming TTS server (OpenAI-compatible).
 
-The PocketTTS twin of `qwen3_tts_server.py`: koboldcpp handles LLM+STT, this
-handles TTS. Streams raw int16 PCM (or a streaming WAV) as PocketTTS generates,
+The PocketTTS twin of `qwen3_tts_server.py`: llama.cpp handles the LLM and the
+Parakeet server handles STT, while this handles TTS. Streams raw int16 PCM (or a
+streaming WAV) as PocketTTS generates,
 so the Rust backend can slice it into gapless mini-chunks for the game. Both
 servers expose the SAME contract on :5002, so the picker can swap between
 faster-qwen3-tts and PocketTTS with no change to the Rust routing layer.

@@ -71,7 +71,7 @@ fn apply_packaging_paths(app: &tauri::AppHandle) {
     use std::path::PathBuf;
 
     // CHASM_ROOT ← resource_dir. Strip the `\\?\` verbatim prefix Tauri returns,
-    // else spawned tools (powershell -File, koboldcpp) can't load from it.
+    // else spawned tools (powershell -File, llama-server) can't load from it.
     if std::env::var_os("CHASM_ROOT").is_none() {
         if let Ok(resource_dir) = app.path().resource_dir() {
             std::env::set_var("CHASM_ROOT", chasm_core::strip_verbatim_prefix(resource_dir));
@@ -113,10 +113,6 @@ fn apply_packaging_paths(app: &tauri::AppHandle) {
     set_if_unset("CHASM_LLM_MODELS_DIR", models.join("llm"));
     set_if_unset("CHASM_ENGINES_DIR", models.join("tts"));
     set_if_unset("CHASM_WHISPER_MODELS_DIR", models.join("stt"));
-    set_if_unset(
-        "CHASM_KOBOLDCPP_EXE",
-        models.join("koboldcpp").join("koboldcpp.exe"),
-    );
     // Retrieval (fastembed) downloads via HuggingFace, which honors HF_HOME over
     // fastembed's own cache_dir — so point CHASM_EMBED_DIR at the SAME `hf` folder,
     // else `models_present` checks the wrong dir and retrieval reads "not installed".
@@ -148,10 +144,9 @@ fn huggingface_hub_dir() -> Option<std::path::PathBuf> {
 
 /// One-time, best-effort move of models sitting in old scattered locations into the
 /// consolidated `<data_root>/models` layout. Same-drive renames only, only when the
-/// target is absent, never destructive on failure. The heavy movable bits are the
-/// koboldcpp runtime and the HF TTS weights; the LLM already lives under
-/// `<data_root>/models/llm`, and TTS engine venvs aren't relocatable so they simply
-/// reinstall into `models/tts` on demand.
+/// target is absent, never destructive on failure. The heavy movable bit is the HF
+/// TTS weights; the LLM already lives under `<data_root>/models/llm`, and TTS engine
+/// venvs aren't relocatable so they simply reinstall into `models/tts` on demand.
 fn migrate_scattered_models(models: &std::path::Path, old_hf_hub: Option<&std::path::Path>) {
     let move_dir = |src: std::path::PathBuf, dst: std::path::PathBuf| {
         if !src.exists() || dst.exists() {
@@ -169,15 +164,6 @@ fn migrate_scattered_models(models: &std::path::Path, old_hf_hub: Option<&std::p
             ),
         }
     };
-
-    // koboldcpp runtime: <CHASM_ROOT>/koboldcpp -> models/koboldcpp (only if it
-    // actually holds the exe, so an empty/marker-only dir never wins).
-    if let Some(root) = std::env::var_os("CHASM_ROOT") {
-        let old = std::path::PathBuf::from(&root).join("koboldcpp");
-        if old.join("koboldcpp.exe").exists() {
-            move_dir(old, models.join("koboldcpp"));
-        }
-    }
 
     // HF TTS weights: <old hub>/models--… -> models/hf/hub/models--…
     if let Some(hub) = old_hf_hub {
@@ -285,7 +271,7 @@ pub fn run() {
         // MUST be the first plugin: focus the existing window instead of starting
         // a second process (which would double-bind :7341, run two in-process
         // bridges over the same file inbox, and two stack lifecycles fighting over
-        // koboldcpp/TTS).
+        // the local LLM runtime/TTS).
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             info!("second instance launched; focusing the existing window");
             show_main_window(app);
@@ -389,7 +375,7 @@ pub fn run() {
 }
 
 /// Tears down the AI stack chasm started, then exits the process. The lifecycle
-/// brings koboldcpp + TTS up on game connect; if we exit while they're up they'd
+/// brings the LLM runtime + TTS up on game connect; if we exit while they're up they'd
 /// be orphaned, so we stop them first. Reuses the same env-derived config the
 /// server ran with (env is still set), so it resolves the same endpoints/ports.
 fn quit(app: &tauri::AppHandle) {

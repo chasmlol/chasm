@@ -1,17 +1,23 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { Loader2 } from "lucide-react";
+import { Check, Loader2 } from "lucide-react";
 
 import {
   configApi,
   modelsApi,
   systemApi,
+  ttsApi,
   type ModelDto,
+  type ProviderDto,
   type TtsConfig,
 } from "@/lib/api";
+import { useProvider } from "@/lib/useProvider";
 import { SettingsPage } from "@/components/ui/settings-page";
 import { ModelPicker, type ModelCard } from "@/components/ModelPicker";
+import { ProviderPicker } from "@/components/ProviderPicker";
+import { ApiProviderConfig } from "@/components/ApiProviderConfig";
+import { RuntimeStatus } from "@/components/RuntimeStatus";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -26,15 +32,14 @@ import {
   FormRow,
   Section,
   SectionLabel,
+  Stack,
   StatusPill,
   type StatusTone,
 } from "@/components/ui/page";
 
-// TTS settings — picks the speech engine (ModelPicker) AND exposes the voice
-// volumes + per-request synthesis tuning the legacy settings page saved. The
-// config form hits /api/ui/v1/config/tts, which reuses the legacy apply_tts_form
-// path (volumes posted as a percent, then stored as the multiplier), applied
-// live by the warm worker with no restart.
+// TTS settings — picks the provider (local qwen3-tts / engine picker, or a
+// hosted API), keeps the voice-cloning panel and the volumes + synthesis tuning
+// config. The config form hits /api/ui/v1/config/tts.
 
 function toCard(dto: ModelDto): ModelCard {
   return {
@@ -220,8 +225,148 @@ function VoiceCloning() {
   );
 }
 
+// API voice cloning — the hosted-provider equivalent of the LOCAL VoiceCloning
+// panel above. Shown when an API TTS provider is selected. It clones each
+// character's recorded reference clip (the same one the local panel records)
+// into the ACTIVE hosted provider's cloning API; the character then speaks in
+// the returned cloned voice. Reuses the voice-clone status for the character
+// list, and GET /tts/api-voices for which characters already have a cloned id.
+function ApiVoiceCloning({ provider }: { provider: ProviderDto }) {
+  const qc = useQueryClient();
+
+  // Reuse the same source the local VoiceCloning panel uses for the character
+  // list (the active profile's characters + reference-clip state).
+  const status = useQuery({
+    queryKey: ["voice-clone"],
+    queryFn: systemApi.voiceCloneStatus,
+  });
+
+  // Which characters already have a cloned voice id for the active provider.
+  const apiVoices = useQuery({
+    queryKey: ["tts", "api-voices"],
+    queryFn: ttsApi.listApiVoices,
+  });
+
+  // Per-character clone error (keyed by character name), surfaced readably.
+  const [errors, setErrors] = useState<Record<string, string>>({});
+
+  const clone = useMutation({
+    mutationFn: (character: string) => ttsApi.cloneApiVoice(character),
+    onSuccess: (res, character) => {
+      if (res.ok) {
+        setErrors((e) => {
+          const { [character]: _drop, ...rest } = e;
+          return rest;
+        });
+        // Refetch which characters have a cloned voice id now.
+        qc.invalidateQueries({ queryKey: ["tts", "api-voices"] });
+      } else {
+        setErrors((e) => ({
+          ...e,
+          [character]: res.error ?? "Cloning failed.",
+        }));
+      }
+    },
+    onError: (err, character) =>
+      setErrors((e) => ({
+        ...e,
+        [character]: (err as Error).message || "Cloning failed.",
+      })),
+  });
+
+  const v = status.data;
+  const clonedVoices = apiVoices.data?.voices ?? {};
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Clone character voices via {provider.name}</CardTitle>
+        <CardDescription>
+          Cloning sends each character's recorded reference clip (the same one
+          the local voice panel records) to {provider.name}'s cloning API. The
+          character then speaks in the cloned voice. Requires an API key set
+          above and a recorded reference for the character.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4">
+        {status.isLoading ? (
+          <div className="grid place-items-center py-8 text-[var(--muted-foreground)]">
+            <Loader2 className="size-5 animate-spin" />
+          </div>
+        ) : !v?.has_profile ? (
+          <EmptyState
+            title="No game profile"
+            description="Connect the game so its profile + character list import, then clone."
+          />
+        ) : v.characters.length === 0 ? (
+          <EmptyState
+            title="No characters"
+            description="This profile has no characters to clone yet."
+          />
+        ) : (
+          <div className="flex flex-col gap-2">
+            {v.characters.map((c) => {
+              const voiceId = clonedVoices[c.name];
+              const cloned = Boolean(voiceId);
+              const busy = clone.isPending && clone.variables === c.name;
+              const err = errors[c.name];
+              return (
+                <div
+                  key={c.name}
+                  className="flex flex-col gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--color-ink-850)] px-3 py-2"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex min-w-0 items-center gap-2">
+                      {cloned ? (
+                        <StatusPill tone="ok">
+                          <Check className="size-3.5" /> Cloned
+                        </StatusPill>
+                      ) : (
+                        <StatusPill tone="idle">Not cloned</StatusPill>
+                      )}
+                      <span className="truncate text-sm">{c.name}</span>
+                    </div>
+                    <Button
+                      size="sm"
+                      variant={cloned ? "secondary" : "default"}
+                      disabled={busy}
+                      onClick={() => clone.mutate(c.name)}
+                    >
+                      {busy ? (
+                        <>
+                          <Loader2 className="size-4 animate-spin" /> Cloning…
+                        </>
+                      ) : cloned ? (
+                        "Re-clone voice"
+                      ) : (
+                        "Clone voice"
+                      )}
+                    </Button>
+                  </div>
+                  {cloned && (
+                    <p className="truncate font-mono text-[11px] text-[var(--muted-foreground)]">
+                      voice id: {voiceId}
+                    </p>
+                  )}
+                  {err && (
+                    <p className="text-[13px] text-[var(--color-danger)]">
+                      {err}
+                    </p>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 export function Tts() {
   const qc = useQueryClient();
+  const provider = useProvider("tts");
+
   const query = useQuery({
     queryKey: ["models", "tts"],
     queryFn: () => modelsApi.get("tts"),
@@ -233,10 +378,6 @@ export function Tts() {
 
   const select = useMutation({
     mutationFn: (id: string) => modelsApi.select("tts", id),
-    onSuccess: (fresh) => qc.setQueryData(["models", "tts"], fresh),
-  });
-  const download = useMutation({
-    mutationFn: (id: string) => modelsApi.download("tts", id),
     onSuccess: (fresh) => qc.setQueryData(["models", "tts"], fresh),
   });
 
@@ -266,7 +407,7 @@ export function Tts() {
     <SettingsPage
       eyebrow="AI"
       title="Text-to-speech"
-      description="The voice engine that speaks NPC lines. Streams audio to the game."
+      description="The voice that speaks NPC lines. Run it locally with the managed engine, or connect a hosted API."
       save={
         form
           ? {
@@ -281,19 +422,47 @@ export function Tts() {
           : undefined
       }
     >
-      <ModelPicker
-        title="Engine"
-        models={(query.data?.models ?? []).map(toCard)}
-        selectedId={query.data?.selected_id}
-        folder={query.data?.folder ? { path: query.data.folder } : undefined}
-        isLoading={query.isLoading}
-        isError={query.isError}
-        downloadingId={download.isPending ? download.variables : null}
-        onSelect={(id) => select.mutate(id)}
-        onDownload={(id) => download.mutate(id)}
+      <ProviderPicker
+        providers={provider.view?.providers ?? []}
+        selectedId={provider.selectedId}
+        onSelect={(id) => provider.select.mutate(id)}
+        selectingId={provider.select.isPending ? provider.select.variables : null}
+        isLoading={provider.query.isLoading}
       />
 
-      <VoiceCloning />
+      {provider.isLocal ? (
+        provider.view && (
+          <Stack>
+            <RuntimeStatus runtime={provider.view.local_runtime} />
+            <ModelPicker
+              title="Engine"
+              models={(query.data?.models ?? []).map(toCard)}
+              selectedId={query.data?.selected_id}
+              folder={
+                query.data?.folder ? { path: query.data.folder } : undefined
+              }
+              isLoading={query.isLoading}
+              isError={query.isError}
+              onSelect={(id) => select.mutate(id)}
+            />
+            <VoiceCloning />
+          </Stack>
+        )
+      ) : (
+        provider.selectedProvider && (
+          <Stack>
+            <ApiProviderConfig
+              capability="tts"
+              provider={provider.selectedProvider}
+              onSave={(f) => provider.saveConfig.mutate(f)}
+              saving={provider.saveConfig.isPending}
+              error={provider.saveError}
+              justSaved={provider.justSaved}
+            />
+            <ApiVoiceCloning provider={provider.selectedProvider} />
+          </Stack>
+        )
+      )}
 
       {form && (
         <>

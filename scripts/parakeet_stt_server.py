@@ -1,9 +1,8 @@
 """Chasm's Parakeet STT server (OpenAI-compatible).
 
 Serves push-to-talk transcription for the FNV bridge on its OWN port, so voice
-input never queues behind an LLM generation (koboldcpp's Whisper shares the
-LLM's single slot). The Rust backend POSTs the exact same multipart form it
-sends to koboldcpp's Whisper, so selecting Parakeet changes only the endpoint.
+input never queues behind an LLM generation. The Rust backend POSTs a standard
+OpenAI-style multipart transcription form to this server's endpoint.
 
 Model: NVIDIA Parakeet TDT 0.6B v3 via nano-parakeet (pure-PyTorch TDT
 inference, CUDA). nano-parakeet downloads the `.nemo` from HuggingFace into the

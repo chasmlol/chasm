@@ -10,6 +10,8 @@ use futures_util::StreamExt as _;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use crate::llm_api::{self, ApiSampling};
+
 /// First model id advertised by `{endpoint}/v1/models`, when reachable. The
 /// helper resolves the loaded model the same way before generating.
 /// Shared HTTP client: one connection pool for every LLM call. A fresh
@@ -51,6 +53,120 @@ async fn first_model_id(client: &reqwest::Client, endpoint: &str) -> Option<Stri
         map.insert(endpoint.to_string(), id.clone());
     }
     Some(id)
+}
+
+/// Which wire protocol an [`LlmTarget`] speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmProviderKind {
+    /// The managed-local llama.cpp `llama-server`, OR any hosted OpenAI-compatible
+    /// endpoint (OpenAI / OpenRouter / the generic compat option) — same request
+    /// shape, differing only by base URL + auth + model + `response_format`.
+    OpenAiCompat,
+    /// Anthropic Messages API (own request/response shape; buffered).
+    Anthropic,
+    /// Google Gemini generateContent (own request/response shape; buffered).
+    Gemini,
+}
+
+/// The resolved LLM destination for one request: the wire protocol + base URL +
+/// (optional) auth + (optional) forced model id. Built once per request from the
+/// live settings, so switching provider in the UI takes effect on the next turn.
+#[derive(Debug, Clone)]
+pub struct LlmTarget {
+    pub kind: LlmProviderKind,
+    /// Local: `http://127.0.0.1:5001` (no `/v1`). Hosted: e.g.
+    /// `https://api.openai.com/v1` (already includes the version segment).
+    pub base_url: String,
+    /// Empty for the managed-local runtime; the API key for a hosted provider.
+    pub api_key: String,
+    /// Forced model id for a hosted provider; `None` for local (resolved from the
+    /// server's `/v1/models`).
+    pub model: Option<String>,
+    /// Human provider label for error messages ("OpenAI", "Anthropic", …).
+    pub label: String,
+    /// OpenRouter routing preference (`price` / `balanced` / `speed`); unused by
+    /// other providers.
+    pub routing: String,
+    /// True for the managed-local llama.cpp runtime (no auth, model auto-resolved,
+    /// strict json_schema honoured, warm-up meaningful).
+    pub local: bool,
+}
+
+impl LlmTarget {
+    /// The managed-local llama.cpp target at `endpoint`.
+    pub fn local(endpoint: &str) -> Self {
+        Self {
+            kind: LlmProviderKind::OpenAiCompat,
+            base_url: endpoint.trim_end_matches('/').to_string(),
+            api_key: String::new(),
+            model: None,
+            label: "llama.cpp".to_string(),
+            routing: String::new(),
+            local: true,
+        }
+    }
+
+    /// Resolves the active LLM target from the live settings, falling back to the
+    /// managed-local runtime for `provider == "local"` (or any unknown value).
+    pub fn resolve(settings: &chasm_core::AppSettings, config: &chasm_core::AppConfig) -> Self {
+        let provider = chasm_core::normalize_llm_provider(&settings.llm.provider);
+        if provider == chasm_core::PROVIDER_LOCAL {
+            return Self::local(&config.llm_endpoint);
+        }
+        let Some(def) = chasm_core::llm_api_provider(&provider) else {
+            return Self::local(&config.llm_endpoint);
+        };
+        let cfg = settings.llm.api.get(&provider);
+        let mut resolved = chasm_core::resolve_api(def, cfg);
+        // Key carries over from any capability that shares this provider.
+        resolved.api_key = settings.provider_key(cfg, &provider);
+        let routing = chasm_core::normalize_openrouter_routing(
+            cfg.map(|c| c.routing.as_str()).unwrap_or(""),
+        );
+        let kind = match provider.as_str() {
+            "anthropic" => LlmProviderKind::Anthropic,
+            "gemini" => LlmProviderKind::Gemini,
+            _ => LlmProviderKind::OpenAiCompat,
+        };
+        Self {
+            kind,
+            base_url: resolved.base_url,
+            api_key: resolved.api_key,
+            model: Some(resolved.model),
+            label: def.name.to_string(),
+            routing,
+            local: false,
+        }
+    }
+
+    /// The chat-completions URL for the OpenAI-compatible path. Local prepends the
+    /// `/v1` version segment; hosted base URLs already include it.
+    fn chat_completions_url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        if self.local {
+            format!("{base}/v1/chat/completions")
+        } else {
+            format!("{base}/chat/completions")
+        }
+    }
+
+    /// Whether this target can honour chasm's strict `json_schema` response format.
+    /// Only the local llama.cpp does; hosted OpenAI-compatible servers vary, so
+    /// they get plain JSON mode instead (the prompt carries the field contract).
+    fn honours_json_schema(&self) -> bool {
+        self.local
+    }
+}
+
+/// A one-shot receiver that yields the whole `text` then closes — used to feed the
+/// buffered hosted-provider replies (Anthropic / Gemini) through the same channel
+/// interface the streaming path returns, so callers are provider-agnostic.
+fn once_channel(text: String) -> mpsc::Receiver<Result<String, String>> {
+    let (tx, rx) = mpsc::channel::<Result<String, String>>(1);
+    tokio::spawn(async move {
+        let _ = tx.send(Ok(text)).await;
+    });
+    rx
 }
 
 /// The structured-output JSON schema (verbatim shape of SillyTavern's
@@ -143,6 +259,18 @@ impl Sampling {
         self
     }
 
+    /// Projects to the provider-neutral [`ApiSampling`] the hosted adapters
+    /// (Anthropic / Gemini) consume.
+    fn to_api(&self) -> ApiSampling {
+        ApiSampling {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k.unwrap_or(0),
+            max_tokens: self.max_tokens.map(|m| m.max(0) as u32).unwrap_or(0),
+            seed: self.seed.unwrap_or(-1),
+        }
+    }
+
     /// Writes every active sampling field onto an OpenAI-compatible request body.
     /// llama.cpp's server honours these top-level keys (`temperature`, `top_p`,
     /// `top_k`, `min_p`, `repeat_penalty`, `max_tokens`/`n_predict`, `seed`,
@@ -225,18 +353,118 @@ fn request_body_sampled(
 /// SSE chunk — emitted because we set `stream_options.include_usage` — and record
 /// them for the Tracing page's tokens/sec metric. Passing `None` skips capture.
 pub async fn chat_completion_stream(
-    endpoint: &str,
+    target: &LlmTarget,
+    messages: &[Value],
+    response_format: Option<&Value>,
+    trace_id: Option<&str>,
+    sampling: Sampling,
+) -> Result<mpsc::Receiver<Result<String, String>>, String> {
+    match target.kind {
+        LlmProviderKind::OpenAiCompat => {
+            openai_compat_stream(target, messages, response_format, trace_id, sampling).await
+        }
+        // The two native-shape providers are buffered, then handed back through the
+        // same channel interface as a single message (generate.rs splits sentences
+        // from whatever arrives, so a whole-line delivery still streams to TTS).
+        LlmProviderKind::Anthropic => {
+            let text = anthropic_generate(target, messages, response_format.is_some(), sampling).await?;
+            Ok(once_channel(text))
+        }
+        LlmProviderKind::Gemini => {
+            let text = gemini_generate(target, messages, response_format.is_some(), sampling).await?;
+            Ok(once_channel(text))
+        }
+    }
+}
+
+/// Request body for a HOSTED OpenAI-compatible provider (OpenAI / OpenRouter / the
+/// generic compat option). ONLY standard chat-completions fields — none of the
+/// llama.cpp-only extras (`cache_prompt`, `repeat_penalty`, `top_k`, `min_p`,
+/// `n_ctx`, `n_predict`) that strict providers like OpenAI reject with a 400, and
+/// NO forced `response_format`: many OpenRouter models don't support `json_object`
+/// (they 400), and chasm's parser pulls the `"speech"` field out of plain text
+/// anyway (the system prompt already dictates the JSON shape).
+fn hosted_request_body(model: &str, messages: &[Value], stream: bool, sampling: Sampling) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+        "temperature": sampling.temperature,
+        "top_p": sampling.top_p,
+    });
+    if let Some(max_tokens) = sampling.max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    if let Some(seed) = sampling.seed {
+        body["seed"] = json!(seed);
+    }
+    body
+}
+
+/// Adds OpenRouter's recommended attribution headers (harmless elsewhere), so
+/// requests are ranked/attributed rather than rejected as anonymous.
+fn apply_provider_headers(
+    request: reqwest::RequestBuilder,
+    target: &LlmTarget,
+) -> reqwest::RequestBuilder {
+    if target.base_url.contains("openrouter.ai") {
+        request
+            .header("HTTP-Referer", "https://github.com/chasm-app/chasm")
+            .header("X-Title", "chasm")
+    } else {
+        request
+    }
+}
+
+/// OpenRouter-only: apply the user's provider-routing preference. OpenRouter's
+/// default routing optimizes for PRICE and often lands a slow provider — measured
+/// ~7x slower first-token vs. throughput sort (which pinned Cerebras/Groq for
+/// gpt-oss-120b). The user picks per OpenRouter config:
+///   * `speed`    → `provider.sort = "throughput"` (fastest tok/s) — the default.
+///   * `price`    → `provider.sort = "price"` (cheapest).
+///   * `balanced` → no `provider` field (OpenRouter's own load-balancing).
+/// No-op for every other base URL.
+fn apply_openrouter_routing(body: &mut Value, target: &LlmTarget) {
+    if !target.base_url.contains("openrouter.ai") {
+        return;
+    }
+    match target.routing.as_str() {
+        "price" => body["provider"] = json!({ "sort": "price" }),
+        "balanced" => {} // OpenRouter's default routing.
+        _ => body["provider"] = json!({ "sort": "throughput" }), // "speed" / default
+    }
+}
+
+/// The OpenAI-compatible streaming path — the managed-local llama.cpp AND hosted
+/// OpenAI / OpenRouter / generic-compat providers (same wire shape).
+async fn openai_compat_stream(
+    target: &LlmTarget,
     messages: &[Value],
     response_format: Option<&Value>,
     trace_id: Option<&str>,
     sampling: Sampling,
 ) -> Result<mpsc::Receiver<Result<String, String>>, String> {
     let client = http_client().clone();
-    let model = first_model_id(&client, endpoint).await;
-    let url = format!("{endpoint}/v1/chat/completions");
-    let mut body =
-        request_body_sampled(model.as_deref(), messages, true, response_format, sampling);
-    // Ask llama.cpp to include the final `usage`/`timings` chunk in the stream so
+    // Local resolves the loaded model from /v1/models; a hosted provider forces
+    // the configured id (its /v1/models needs auth and may differ).
+    let model = match &target.model {
+        Some(m) => Some(m.clone()),
+        None => first_model_id(&client, &target.base_url).await,
+    };
+    let url = target.chat_completions_url();
+    // Local llama.cpp: the full sampled body with our strict json_schema. Hosted
+    // providers: a clean standard-fields-only body (no llama.cpp extras, no forced
+    // response_format) so strict/varied providers don't 400.
+    let mut body = if target.local {
+        let format = response_format
+            .filter(|_| target.honours_json_schema())
+            .cloned();
+        request_body_sampled(model.as_deref(), messages, true, format.as_ref(), sampling)
+    } else {
+        hosted_request_body(model.as_deref().unwrap_or_default(), messages, true, sampling)
+    };
+    apply_openrouter_routing(&mut body, target);
+    // Ask the server to include the final `usage`/`timings` chunk in the stream so
     // we can capture tokens/sec without a second request.
     body["stream_options"] = json!({ "include_usage": true });
     // Env-gated (CHASM_LLM_DUMP=1) dump of the EXACT request body, for offline
@@ -251,16 +479,20 @@ pub async fn chat_completion_stream(
             let _ = std::fs::write(path, serde_json::to_vec_pretty(&body).unwrap_or_default());
         }
     }
-    let response = client
-        .post(&url)
-        .json(&body)
+    let mut request = apply_provider_headers(client.post(&url).json(&body), target);
+    if !target.api_key.is_empty() {
+        request = request.bearer_auth(&target.api_key);
+    }
+    let response = request
         .send()
         .await
-        .map_err(|error| format!("llama.cpp request failed: {error}"))?;
+        .map_err(|error| format!("{}: request failed: {error}", target.label))?;
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        return Err(format!("llama.cpp returned {status}: {text}"));
+        let message = llm_api::format_http_error(&target.label, status.as_u16(), &text);
+        tracing::warn!(target: "chasm::llm", "{message}");
+        return Err(message);
     }
 
     let trace_id = trace_id.map(str::to_string);
@@ -324,35 +556,68 @@ pub async fn chat_completion_stream(
 /// buffered (non-stream) live + admin generation paths call this so user-set
 /// sampling reaches the model.
 pub async fn chat_completion_capturing_sampled(
-    endpoint: &str,
+    target: &LlmTarget,
+    messages: &[Value],
+    response_format: Option<&Value>,
+    sampling: Sampling,
+) -> Result<(String, Option<chasm_core::LlmMetrics>), String> {
+    match target.kind {
+        LlmProviderKind::OpenAiCompat => {
+            openai_compat_capturing(target, messages, response_format, sampling).await
+        }
+        LlmProviderKind::Anthropic => {
+            let text = anthropic_generate(target, messages, response_format.is_some(), sampling).await?;
+            Ok((text, None))
+        }
+        LlmProviderKind::Gemini => {
+            let text = gemini_generate(target, messages, response_format.is_some(), sampling).await?;
+            Ok((text, None))
+        }
+    }
+}
+
+/// The OpenAI-compatible buffered path — managed-local llama.cpp AND hosted
+/// OpenAI / OpenRouter / generic-compat providers.
+async fn openai_compat_capturing(
+    target: &LlmTarget,
     messages: &[Value],
     response_format: Option<&Value>,
     sampling: Sampling,
 ) -> Result<(String, Option<chasm_core::LlmMetrics>), String> {
     let client = http_client().clone();
-    let model = first_model_id(&client, endpoint).await;
-    let url = format!("{endpoint}/v1/chat/completions");
-    let response = client
-        .post(&url)
-        .json(&request_body_sampled(
-            model.as_deref(),
-            messages,
-            false,
-            response_format,
-            sampling,
-        ))
+    let model = match &target.model {
+        Some(m) => Some(m.clone()),
+        None => first_model_id(&client, &target.base_url).await,
+    };
+    let url = target.chat_completions_url();
+    let mut body = if target.local {
+        let format = response_format
+            .filter(|_| target.honours_json_schema())
+            .cloned();
+        request_body_sampled(model.as_deref(), messages, false, format.as_ref(), sampling)
+    } else {
+        hosted_request_body(model.as_deref().unwrap_or_default(), messages, false, sampling)
+    };
+    apply_openrouter_routing(&mut body, target);
+    let mut request = apply_provider_headers(client.post(&url).json(&body), target);
+    if !target.api_key.is_empty() {
+        request = request.bearer_auth(&target.api_key);
+    }
+    let response = request
         .send()
         .await
-        .map_err(|error| format!("llama.cpp request failed: {error}"))?;
+        .map_err(|error| format!("{}: request failed: {error}", target.label))?;
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        return Err(format!("llama.cpp returned {status}: {text}"));
+        let message = llm_api::format_http_error(&target.label, status.as_u16(), &text);
+        tracing::warn!(target: "chasm::llm", "{message}");
+        return Err(message);
     }
     let body: Value = response
         .json()
         .await
-        .map_err(|error| format!("llama.cpp response decode failed: {error}"))?;
+        .map_err(|error| format!("{}: response decode failed: {error}", target.label))?;
     let content = body
         .get("choices")
         .and_then(Value::as_array)
@@ -366,10 +631,74 @@ pub async fn chat_completion_capturing_sampled(
     Ok((content, metrics))
 }
 
+/// Buffered Anthropic Messages generation → assistant text (with the prefilled
+/// `{` restored when `structured`).
+async fn anthropic_generate(
+    target: &LlmTarget,
+    messages: &[Value],
+    structured: bool,
+    sampling: Sampling,
+) -> Result<String, String> {
+    if target.api_key.is_empty() {
+        return Err("Anthropic: no API key set (Settings → LLM).".to_string());
+    }
+    let client = http_client().clone();
+    let model = target.model.clone().unwrap_or_default();
+    let body = llm_api::build_anthropic_body(&model, messages, sampling.to_api(), structured);
+    let url = format!("{}/messages", target.base_url.trim_end_matches('/'));
+    let response = client
+        .post(&url)
+        .header("x-api-key", &target.api_key)
+        .header("anthropic-version", llm_api::ANTHROPIC_VERSION)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("Anthropic: request failed: {error}"))?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(llm_api::format_http_error("Anthropic", status.as_u16(), &text));
+    }
+    let value: Value =
+        serde_json::from_str(&text).map_err(|error| format!("Anthropic: bad JSON: {error}"))?;
+    llm_api::parse_anthropic_reply(&value, structured)
+}
+
+/// Buffered Gemini generateContent → concatenated candidate text.
+async fn gemini_generate(
+    target: &LlmTarget,
+    messages: &[Value],
+    structured: bool,
+    sampling: Sampling,
+) -> Result<String, String> {
+    if target.api_key.is_empty() {
+        return Err("Gemini: no API key set (Settings → LLM).".to_string());
+    }
+    let client = http_client().clone();
+    let model = target.model.clone().unwrap_or_default();
+    let body = llm_api::build_gemini_body(messages, sampling.to_api(), structured);
+    let url = llm_api::gemini_generate_url(&target.base_url, &model);
+    let response = client
+        .post(&url)
+        .header("x-goog-api-key", &target.api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("Gemini: request failed: {error}"))?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(llm_api::format_http_error("Gemini", status.as_u16(), &text));
+    }
+    let value: Value =
+        serde_json::from_str(&text).map_err(|error| format!("Gemini: bad JSON: {error}"))?;
+    llm_api::parse_gemini_reply(&value)
+}
+
 /// Builds the minimal KV-cache-priming request body used by the connect-time
 /// warm-up: the caller's messages verbatim, ONE predicted token, greedy, non-
-/// streaming, with `cache_prompt` on so koboldcpp keeps the ingested prefix in
-/// its slot for the first real turn to fast-forward over.
+/// streaming, with `cache_prompt` on so the LLM runtime keeps the ingested prefix
+/// in its slot for the first real turn to fast-forward over.
 fn warmup_request_body(model: Option<&str>, messages: &[Value]) -> Value {
     let mut body = json!({
         "messages": messages,
@@ -496,6 +825,71 @@ mod tests {
         assert_eq!(body["model"], json!("m"));
         // No model id resolved → the key is simply absent (server default).
         assert!(warmup_request_body(None, &messages).get("model").is_none());
+    }
+
+    #[test]
+    fn openrouter_routing_maps_preference() {
+        let target = |routing: &str| LlmTarget {
+            kind: LlmProviderKind::OpenAiCompat,
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            api_key: "k".to_string(),
+            model: Some("openai/gpt-oss-120b".to_string()),
+            label: "OpenRouter".to_string(),
+            routing: routing.to_string(),
+            local: false,
+        };
+        // speed (and the empty/default) → throughput
+        let mut b = json!({ "model": "m" });
+        apply_openrouter_routing(&mut b, &target("speed"));
+        assert_eq!(b["provider"], json!({ "sort": "throughput" }));
+        let mut b = json!({ "model": "m" });
+        apply_openrouter_routing(&mut b, &target(""));
+        assert_eq!(b["provider"], json!({ "sort": "throughput" }));
+        // price → price
+        let mut b = json!({ "model": "m" });
+        apply_openrouter_routing(&mut b, &target("price"));
+        assert_eq!(b["provider"], json!({ "sort": "price" }));
+        // balanced → no provider field
+        let mut b = json!({ "model": "m" });
+        apply_openrouter_routing(&mut b, &target("balanced"));
+        assert!(b.get("provider").is_none());
+        // never applied to a non-OpenRouter / local target
+        let mut b = json!({ "model": "m" });
+        apply_openrouter_routing(&mut b, &LlmTarget::local("http://127.0.0.1:5001"));
+        assert!(b.get("provider").is_none());
+    }
+
+    #[test]
+    fn hosted_body_omits_llamacpp_only_fields() {
+        // Hosted OpenAI-compatible providers (OpenAI / OpenRouter / compat) must NOT
+        // receive llama.cpp-only fields (a 400 on strict providers) or a forced
+        // response_format (many OpenRouter models reject json_object).
+        let settings = LlmSamplingSettings {
+            temperature: 0.4,
+            top_p: 0.9,
+            top_k: 50,
+            min_p: 0.05,
+            repeat_penalty: 1.15,
+            max_tokens: 256,
+            n_ctx: 8192,
+            seed: 42,
+        };
+        let body = hosted_request_body("gpt-4o", &[], true, Sampling::from_settings(&settings));
+        // Standard fields present.
+        assert_eq!(body["model"], json!("gpt-4o"));
+        assert_eq!(body["temperature"], json!(0.4));
+        assert_eq!(body["top_p"], json!(0.9));
+        assert_eq!(body["max_tokens"], json!(256));
+        assert_eq!(body["seed"], json!(42));
+        assert_eq!(body["stream"], json!(true));
+        // llama.cpp-only / non-standard fields ABSENT.
+        assert!(body.get("cache_prompt").is_none());
+        assert!(body.get("repeat_penalty").is_none());
+        assert!(body.get("top_k").is_none());
+        assert!(body.get("min_p").is_none());
+        assert!(body.get("n_ctx").is_none());
+        assert!(body.get("n_predict").is_none());
+        assert!(body.get("response_format").is_none());
     }
 
     #[test]

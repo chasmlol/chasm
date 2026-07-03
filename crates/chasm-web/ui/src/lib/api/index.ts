@@ -17,6 +17,8 @@ export * from "./books";
 export * from "./companions";
 export * from "./models";
 export * from "./config";
+export * from "./providers";
+export * from "./tts";
 export * from "./chat";
 export * from "./gamestate";
 export * from "./globals";
@@ -28,6 +30,8 @@ import { booksApi } from "./books";
 import { companionsApi } from "./companions";
 import { modelsApi } from "./models";
 import { configApi } from "./config";
+import { providersApi } from "./providers";
+import { ttsApi } from "./tts";
 import { chatApi } from "./chat";
 import { gamestateApi } from "./gamestate";
 import { globalsApi } from "./globals";
@@ -40,6 +44,8 @@ export {
   companionsApi,
   modelsApi,
   configApi,
+  providersApi,
+  ttsApi,
   chatApi,
   gamestateApi,
   globalsApi,
@@ -58,6 +64,8 @@ export const api = {
   companions: companionsApi,
   models: modelsApi,
   config: configApi,
+  providers: providersApi,
+  tts: ttsApi,
   chat: chatApi,
   gamestate: gamestateApi,
   globals: globalsApi,

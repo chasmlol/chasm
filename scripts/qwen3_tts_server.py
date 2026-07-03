@@ -1,14 +1,15 @@
 """Chasm's faster-qwen3-tts streaming TTS server (OpenAI-compatible).
 
-Serves NPC voice-cloned speech for the FNV bridge: koboldcpp handles LLM+STT,
-this handles TTS. Streams raw int16 PCM (or a streaming WAV) as the model
+Serves NPC voice-cloned speech for the FNV bridge: llama.cpp handles the LLM and
+the Parakeet server handles STT, while this handles TTS. Streams raw int16 PCM
+(or a streaming WAV) as the model
 generates, so the Rust backend can slice it into gapless mini-chunks for the game.
 
 Why chasm ships its own server instead of faster-qwen3-tts's `examples/openai_server.py`:
 the stock server doesn't expose `xvec_only`, so with our no-transcript NPC clips it
 would run ICL mode (needs an accurate transcript) and clone poorly. Our clips have no
-transcript, so we force `xvec_only=True` (ref_text ignored) — matching the old koboldcpp
-`x_vector_only_mode=True` baseline.
+transcript, so we force `xvec_only=True` (ref_text ignored) — the
+x-vector-only cloning baseline.
 
   GET  /health             -> {"status":"ok","model_loaded":bool}
   POST /v1/audio/speech     {model,input,voice,response_format}  (pcm|wav|mp3)

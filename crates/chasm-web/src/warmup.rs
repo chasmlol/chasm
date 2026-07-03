@@ -9,15 +9,15 @@
 //!   `/v1/audio/speech` request still pays CUDA-graph capture / kernel warm-up
 //!   (multi-second — the synth client even has a retry loop for it). Turn 1 paid
 //!   this; now a discarded warm-up utterance does.
-//! * **LLM (koboldcpp)** keeps a per-slot KV cache (`cache_prompt: true`), so
+//! * **LLM (llama.cpp)** keeps a per-slot KV cache (`cache_prompt: true`), so
 //!   turns 2+ fast-forward over the unchanged prompt prefix while turn 1
 //!   ingested the whole system prompt + history cold. Priming a 1-token
 //!   generation with the REAL first-turn prompt prefix (same live chat, same
 //!   first eligible speaker) pre-fills that cache.
 //! * **Retrieval** (`chasm-embed`) lazily loads two ONNX models; the embedder was
 //!   already warmed at connect, but the reranker's first inference wasn't.
-//! * **STT (koboldcpp Whisper)** pays its first-decode warm-up on the first
-//!   push-to-talk line; a short silent clip absorbs it.
+//! * **STT (the Parakeet STT server)** pays its first-decode warm-up on the
+//!   first push-to-talk line; a short silent clip absorbs it.
 //!
 //! Design constraints (all deliberate):
 //! * **Non-blocking**: runs as a spawned task; readiness signaling and turn
@@ -42,7 +42,7 @@ use serde_json::json;
 use crate::AppState;
 
 /// How long we wait for a runtime's port to come up before skipping its warm-up.
-/// koboldcpp takes ~10-20 s to load weights, the TTS server ~45 s on a slow disk;
+/// llama.cpp takes ~10-20 s to load weights, the TTS server ~45 s on a slow disk;
 /// these run in a background task so a generous ceiling costs nothing.
 const READY_TIMEOUT: Duration = Duration::from_secs(240);
 /// Poll interval while waiting for a runtime to come up.
@@ -103,7 +103,7 @@ pub(crate) async fn run_stack_warmup_with(
     // Retrieval first (CPU-only): embedder + reranker ONNX sessions + the spawn
     // catalog vectors. Runs before the GPU warm-ups so it never contends with them.
     parts.extend(warm_retrieval(&state).await);
-    // LLM before TTS: koboldcpp is typically up first (smaller load), and the two
+    // LLM before TTS: the LLM runtime is typically up first (smaller load), and the two
     // GPU warm-ups run sequentially so they don't thrash each other.
     parts.push(warm_llm(&state, deadlines).await);
     parts.push(warm_stt(&state, deadlines).await);
@@ -208,15 +208,23 @@ async fn warm_retrieval(state: &Arc<AppState>) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// LLM (koboldcpp) — prime the KV cache with the real first-turn prompt prefix
+// LLM (llama.cpp) — prime the KV cache with the real first-turn prompt prefix
 // ---------------------------------------------------------------------------
 
-/// Waits for koboldcpp, then runs a 1-token generation over the SAME prompt
+/// Waits for the LLM runtime, then runs a 1-token generation over the SAME prompt
 /// prefix the first real turn will send (`cache_prompt: true`), so turn 1
 /// fast-forwards over a warm KV cache instead of ingesting the whole system
 /// prompt + history cold. Falls back to a tiny generic prompt (which still warms
 /// the first-request compute path) when no live chat exists yet.
 async fn warm_llm(state: &Arc<AppState>, deadlines: WarmupDeadlines) -> String {
+    // Warm-up only makes sense for the managed-local llama.cpp (priming its KV
+    // cache). When a hosted API provider is active there is no local server to
+    // warm — skip it (and never fire a paid request just to warm a cache).
+    let settings = AppSettings::load(&state.config.settings_path);
+    let provider = chasm_core::normalize_llm_provider(&settings.llm.provider);
+    if provider != chasm_core::PROVIDER_LOCAL {
+        return format!("llm skipped ({provider} API — no local server to warm)");
+    }
     let endpoint = state.config.llm_endpoint.clone();
     let probe = format!("{endpoint}/v1/models");
     if !wait_for_http(&probe, deadlines).await {
@@ -278,28 +286,25 @@ fn bridge_turn_shape(state: &Arc<AppState>) -> (String, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// STT (koboldcpp Whisper) — absorb the first-decode warm-up with a silent clip
+// STT (local Parakeet) — absorb the first-decode warm-up with a silent clip
 // ---------------------------------------------------------------------------
 
 /// Transcribes ~1.3 s of silence so the first real push-to-talk line doesn't pay
-/// the STT engine's first-decode warm-up. Targets the active provider's endpoint
-/// (koboldcpp Whisper, or the dedicated Parakeet server when selected). Skipped
-/// when the Whisper path is active but no Whisper model is selected.
+/// the local Parakeet server's first-decode warm-up. Only warms the managed-local
+/// path; a hosted-API STT provider has no local server to warm.
 async fn warm_stt(state: &Arc<AppState>, deadlines: WarmupDeadlines) -> String {
     let settings = AppSettings::load(&state.config.settings_path);
-    let parakeet = crate::launcher::stt_uses_parakeet(&settings, &state.config);
-    let model = if parakeet {
-        // The Parakeet server ignores the model field; send its repo id.
-        chasm_core::PARAKEET_HF_REPO.to_string()
-    } else {
-        chasm_core::stt_effective_model(&settings.stt)
-    };
-    if model.is_empty() {
-        return "stt skipped (no model selected)".to_string();
+    if chasm_core::normalize_stt_provider(&settings.stt.provider) != chasm_core::PROVIDER_LOCAL {
+        return "stt skipped (hosted API provider — no local server to warm)".to_string();
     }
-    let endpoint = crate::effective_stt_endpoint(&state.config, &settings);
-    // koboldcpp serves STT on the LLM port; by the time we get here the LLM wait
-    // already succeeded (or failed), so only probe briefly.
+    if !crate::launcher::stt_uses_parakeet(&settings, &state.config) {
+        return "stt skipped (Parakeet engine not installed)".to_string();
+    }
+    // The Parakeet server ignores the model field; send its repo id.
+    let model = chasm_core::PARAKEET_HF_REPO.to_string();
+    let endpoint = state.config.parakeet_stt_endpoint.clone();
+    // By the time we get here the LLM wait already succeeded (or failed), so only
+    // probe the STT endpoint briefly.
     let brief = WarmupDeadlines {
         ready_timeout: deadlines.ready_poll.max(Duration::from_secs(3)),
         ..deadlines

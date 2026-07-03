@@ -17,9 +17,9 @@ use crate::AppState;
 /// model-swap never hangs when a service is down.
 const PORT_TIMEOUT: Duration = Duration::from_millis(1000);
 
-/// Default llama.cpp / koboldcpp host/port (the helper config's `llm.host`/
-/// `llm.port` / `llm.endpoint` override these). koboldcpp serves the LLM AND
-/// Whisper STT on this one port.
+/// Default llama.cpp host/port (the helper config's `llm.host`/
+/// `llm.port` / `llm.endpoint` override these). llama.cpp serves the LLM on this
+/// port; STT is the dedicated Parakeet server on its own port.
 const DEFAULT_LLAMA_HOST: &str = "127.0.0.1";
 const DEFAULT_LLAMA_PORT: u16 = 8080;
 
@@ -30,7 +30,7 @@ pub fn launch_command_string(cfg: &LauncherConfig) -> String {
     format!("{} \"{}\"", cfg.mo2_exe.display(), cfg.moshortcut_arg())
 }
 
-/// A resolved, runnable local-runtime command (koboldcpp / llama.cpp / TTS),
+/// A resolved, runnable local-runtime command (llama.cpp / Parakeet STT / TTS),
 /// built from the helper config JSON. `env` entries are merged into the child's
 /// environment; `cwd` (when set) is the working directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,8 +230,8 @@ fn build_tts_spec(config: &serde_json::Value) -> Option<RuntimeSpec> {
 // ---------------------------------------------------------------------------
 
 /// The port parsed from a `host:port` authority (default 5002, the TTS port, for
-/// unparseable input). Used for both the TTS port and — when killing koboldcpp to
-/// reload Whisper — the LLM/STT port (whose authority always carries a port).
+/// unparseable input). Used for both the TTS port and — when killing the LLM
+/// runtime to reload a model — the LLM port (whose authority always carries a port).
 fn port_from_addr(addr: &str) -> u16 {
     addr.rsplit(':')
         .next()
@@ -380,16 +380,15 @@ pub(crate) fn parakeet_installed(config: &chasm_core::AppConfig) -> bool {
     python.exists() && script.exists()
 }
 
-/// Whether the effective STT path is the Parakeet server: the provider is
-/// selected AND the engine is installed. When Parakeet is selected but not
-/// installed, everything (endpoint, spawn, whisper attach) falls back to the
-/// koboldcpp Whisper path so voice input never silently dies.
+/// Whether the effective local STT path is the Parakeet server: the STT provider
+/// is the managed-local option AND the engine is installed. Parakeet is now the
+/// ONLY managed local STT (the legacy Whisper-in-koboldcpp path was removed); a hosted-API STT
+/// provider doesn't use this server at all.
 pub(crate) fn stt_uses_parakeet(
     settings: &AppSettings,
     config: &chasm_core::AppConfig,
 ) -> bool {
-    chasm_core::normalize_stt_provider(&settings.stt.provider)
-        == chasm_core::STT_PARAKEET_PROVIDER
+    chasm_core::normalize_stt_provider(&settings.stt.provider) == chasm_core::PROVIDER_LOCAL
         && parakeet_installed(config)
 }
 
@@ -470,41 +469,41 @@ fn kill_parakeet_servers() {}
 
 /// Applies the currently-selected STT provider right now (called when the STT
 /// picker changes on save, mirroring [`apply_selected_tts_engine`]):
-///   * `parakeet` → spawn the Parakeet server if it isn't already up (installed
-///     check inside; not installed = log + leave the Whisper path in place).
-///   * `whisper`  → kill any running Parakeet server (frees its VRAM). The
-///     Whisper model itself rides koboldcpp; [`apply_selected_whisper_model`]
-///     handles that side when the model picker changes.
+///   * `local`  → spawn the managed Parakeet server if it isn't already up
+///     (installed check inside; not installed = log so the Runtimes page nudge is
+///     the fix).
+///   * an API provider → kill any running Parakeet server (frees its VRAM); the
+///     transcription request is served by the hosted API instead.
 /// Best-effort + blocking — run it off the async path.
 pub(crate) fn apply_selected_stt_provider(state: &Arc<AppState>) {
     let settings = AppSettings::load(&state.config.settings_path);
     let provider = chasm_core::normalize_stt_provider(&settings.stt.provider);
     let addr = parakeet_addr(&state.config);
-    if provider == chasm_core::STT_PARAKEET_PROVIDER {
+    if provider == chasm_core::PROVIDER_LOCAL {
         if tcp_reachable(&addr) {
-            tracing::info!("STT provider -> parakeet (already serving {addr})");
+            tracing::info!("STT provider -> local Parakeet (already serving {addr})");
             return;
         }
         let port = port_from_addr(&addr);
         match build_parakeet_spec(state, port) {
             Some(spec) => match spawn_runtime(&spec) {
-                Ok(()) => tracing::info!("STT provider -> parakeet: spawned server on {addr}"),
+                Ok(()) => tracing::info!("STT provider -> local Parakeet: spawned server on {addr}"),
                 Err(error) => {
-                    tracing::warn!("STT provider -> parakeet: could not spawn server: {error}")
+                    tracing::warn!("STT provider -> local Parakeet: could not spawn server: {error}")
                 }
             },
             None => tracing::warn!(
-                "STT provider -> parakeet selected but the engine is not installed; \
-                 voice input stays on koboldcpp Whisper until it is"
+                "STT provider -> local selected but the Parakeet engine is not installed \
+                 (Settings -> Runtimes)"
             ),
         }
     } else {
-        // Whisper selected: unload any Parakeet server so its VRAM is freed.
+        // A hosted API provider is selected: unload the local Parakeet server.
         kill_parakeet_servers();
         if tcp_reachable(&addr) {
             crate::kill_process_on_port(port_from_addr(&addr));
         }
-        tracing::info!("STT provider -> whisper (koboldcpp); Parakeet server stopped if it ran");
+        tracing::info!("STT provider -> {provider} API; local Parakeet server stopped if it ran");
     }
 }
 
@@ -601,6 +600,18 @@ fn kill_tts_servers() {
 #[cfg(not(windows))]
 fn kill_tts_servers() {}
 
+/// Stops the managed local TTS engine (kills the server + frees :5002), so
+/// switching the TTS provider to a hosted API frees the local model's VRAM.
+/// Best-effort + blocking — run it off the async path.
+pub(crate) fn stop_tts_engines(state: &Arc<AppState>) {
+    kill_tts_servers();
+    let tts_addr = authority_from_url(&state.config.tts_endpoint)
+        .unwrap_or_else(|| DEFAULT_STACK_TTS_ADDR.to_string());
+    if tcp_reachable(&tts_addr) {
+        crate::kill_process_on_port(port_from_addr(&tts_addr));
+    }
+}
+
 /// The engine currently serving :5002 for the picker's "Running" badge: the
 /// active-engine marker, but only when the TTS port is actually reachable (so a
 /// stale marker from a dead service doesn't claim to be running). A closed
@@ -613,11 +624,12 @@ pub(crate) fn tts_running_engine(state: &Arc<AppState>) -> Option<String> {
     read_active_tts_engine(state)
 }
 
-/// Whether koboldcpp (LLM + Whisper STT — one process, one port) is reachable
-/// right now. Mirrors the exact address [`start_ai_stack`] targets (helper config
-/// authority, else the managed default), so the model-status lights agree with
-/// what the launcher spawns. A closed localhost port refuses instantly.
-pub(crate) fn koboldcpp_running(state: &Arc<AppState>) -> bool {
+/// Whether the managed local LLM runtime (llama.cpp `llama-server` on :5001) is
+/// reachable right now. Mirrors the exact address [`start_ai_stack`] targets
+/// (helper config authority, else the managed default), so the model-status
+/// lights agree with what the launcher spawns. A closed localhost port refuses
+/// instantly.
+pub(crate) fn llm_runtime_running(state: &Arc<AppState>) -> bool {
     let settings = AppSettings::load(&state.config.settings_path);
     let config = load_helper_config(&helper_config_path(&settings.launcher));
     let llm_addr = config
@@ -664,34 +676,39 @@ pub(crate) fn apply_selected_tts_engine(state: &Arc<AppState>) {
 // connects, tear it down when it leaves). See [`crate::stack_lifecycle`].
 // ---------------------------------------------------------------------------
 
-/// Default koboldcpp (LLM + STT) authority used when the helper config can't be
-/// read or carries no port. koboldcpp serves the LLM and Whisper STT on one port.
+/// Default managed-LLM authority (llama.cpp `llama-server` on :5001) used when the
+/// helper config can't be read or carries no port.
 const DEFAULT_STACK_LLM_ADDR: &str = "127.0.0.1:5001";
 /// Default TTS authority used when the configured `tts_endpoint` is unparseable.
 const DEFAULT_STACK_TTS_ADDR: &str = "127.0.0.1:5002";
 
-/// Spawns the FULL AI stack (koboldcpp for LLM + Whisper STT, and the selected
-/// TTS engine) from the helper config, the same source the model-swap paths use.
-/// This is the un-gated launch (not the change-gated swap): each runtime is only
-/// spawned when nothing is already listening on its port, so calling this when a
-/// service is already up is a cheap no-op (never a double-spawn / two models in
-/// VRAM). Best-effort + blocking (reachability probes + spawn), so the lifecycle
-/// task runs it via `spawn_blocking`. Reads settings + config fresh.
+/// Spawns the FULL managed AI stack (llama.cpp for the LLM, the selected TTS
+/// engine, and the Parakeet STT server) from the helper config, the same source
+/// the model-swap paths use. This is the un-gated launch (not the change-gated
+/// swap): each runtime is only spawned when nothing is already listening on its
+/// port, so calling this when a service is already up is a cheap no-op (never a
+/// double-spawn / two models in VRAM). Any capability whose provider is a hosted
+/// API is SKIPPED — its requests go straight to the API, so no local server is
+/// needed. Best-effort + blocking, so the lifecycle task runs it via
+/// `spawn_blocking`. Reads settings + config fresh.
 pub(crate) fn start_ai_stack(state: &Arc<AppState>) {
     let settings = AppSettings::load(&state.config.settings_path);
     let config = load_helper_config(&helper_config_path(&settings.launcher));
 
-    // --- LLM runtime (koboldcpp default, llama-server opt-in) ---
+    // --- LLM runtime (managed llama.cpp) — skipped when a hosted API is chosen ---
+    let llm_provider = chasm_core::normalize_llm_provider(&settings.llm.provider);
     let llm_addr = config
         .as_ref()
         .and_then(llm_authority_from_config)
         .unwrap_or_else(|| DEFAULT_STACK_LLM_ADDR.to_string());
-    // Runtime-aware spec: llama-server when selected (falling back to koboldcpp
-    // if not ready), else the developer helper-config spec FIRST (a
-    // hand-configured install must keep working), then the chasm-MANAGED
-    // koboldcpp spec (the public-release path).
-    let llm_spec = managed_llm_runtime_spec(&settings, &state.config, config.as_ref());
-    if tcp_reachable(&llm_addr) {
+    let llm_spec = if llm_provider == chasm_core::PROVIDER_LOCAL {
+        managed_llm_runtime_spec(&settings, &state.config, config.as_ref())
+    } else {
+        None
+    };
+    if llm_provider != chasm_core::PROVIDER_LOCAL {
+        tracing::info!("AI stack: LLM provider is {llm_provider} API; not starting a local runtime");
+    } else if tcp_reachable(&llm_addr) {
         tracing::debug!("AI stack: LLM runtime already up on {llm_addr}; not spawning");
     } else if let Some(spec) = llm_spec {
         let runtime_name = Path::new(&spec.program)
@@ -706,14 +723,17 @@ pub(crate) fn start_ai_stack(state: &Arc<AppState>) {
         // No helper config AND nothing selected/downloaded. Surface clearly (one
         // line) instead of silently hanging on "starting".
         tracing::info!(
-            "AI stack: LLM not selected/downloaded (or the runtime not installed); LLM/STT not starting"
+            "AI stack: LLM model not selected/downloaded (or llama.cpp not installed); LLM not starting"
         );
     }
 
-    // --- TTS (the selected local engine) ---
+    // --- TTS (the selected local engine) — skipped when a hosted API is chosen ---
+    let tts_provider = chasm_core::normalize_tts_provider(&settings.tts.provider);
     let tts_addr = authority_from_url(&state.config.tts_endpoint)
         .unwrap_or_else(|| DEFAULT_STACK_TTS_ADDR.to_string());
-    if tcp_reachable(&tts_addr) {
+    if tts_provider != chasm_core::PROVIDER_LOCAL {
+        tracing::info!("AI stack: TTS provider is {tts_provider} API; not starting a local engine");
+    } else if tcp_reachable(&tts_addr) {
         tracing::debug!("AI stack: TTS already up on {tts_addr}; not spawning");
     } else {
         let engine = chasm_core::normalize_local_engine(&settings.tts.local_engine);
@@ -732,9 +752,9 @@ pub(crate) fn start_ai_stack(state: &Arc<AppState>) {
         }
     }
 
-    // --- Parakeet STT (only when selected; whisper rides koboldcpp above) ---
+    // --- STT: the managed local Parakeet server (skipped when a hosted API is chosen) ---
     let stt_provider = chasm_core::normalize_stt_provider(&settings.stt.provider);
-    if stt_provider == chasm_core::STT_PARAKEET_PROVIDER {
+    if stt_provider == chasm_core::PROVIDER_LOCAL {
         let stt_addr = parakeet_addr(&state.config);
         if tcp_reachable(&stt_addr) {
             tracing::debug!("AI stack: Parakeet STT already up on {stt_addr}; not spawning");
@@ -749,25 +769,27 @@ pub(crate) fn start_ai_stack(state: &Arc<AppState>) {
                     }
                 },
                 None => tracing::warn!(
-                    "AI stack: STT provider is parakeet but the engine is not installed; \
-                     voice input falls back to koboldcpp Whisper"
+                    "AI stack: local STT selected but the Parakeet engine is not installed \
+                     (Settings -> Runtimes); voice input will error until it is"
                 ),
             }
         }
+    } else {
+        tracing::info!("AI stack: STT provider is {stt_provider} API; not starting local Parakeet");
     }
 }
 
-/// Tears the FULL AI stack down: kills every koboldcpp process (LLM + STT) and
-/// every TTS engine server (faster-qwen3-tts + PocketTTS), freeing their VRAM.
-/// We kill by the known koboldcpp image name + the TTS server command-line match
-/// (belt) and by the LLM/TTS ports (suspenders) — both scoped to chasm's own
-/// stack, so an unrelated process is never touched. Best-effort; a no-op when
-/// nothing is running.
+/// Tears the FULL AI stack down: kills the llama.cpp LLM server, the Parakeet STT
+/// server, and every TTS engine server (faster-qwen3-tts + PocketTTS), freeing
+/// their VRAM. We kill by each server's command-line match (belt) and by the
+/// LLM/TTS/STT ports (suspenders) — both scoped to chasm's own stack, so an
+/// unrelated process is never touched. Best-effort; a no-op when nothing is
+/// running.
 pub(crate) fn stop_ai_stack(state: &Arc<AppState>) {
     let settings = AppSettings::load(&state.config.settings_path);
     let config = load_helper_config(&helper_config_path(&settings.launcher));
 
-    // koboldcpp: by image name, then free its port.
+    // LLM (llama.cpp): by command line, then free its port.
     kill_llm_servers();
     let llm_addr = config
         .as_ref()
@@ -817,8 +839,8 @@ fn llm_port(llm: &serde_json::Value) -> Option<u16> {
         .and_then(|p| p.parse::<u16>().ok())
 }
 
-/// The koboldcpp/llama.cpp reachability authority (`host:port`) derived from the
-/// config (also the Whisper STT port — koboldcpp serves both on one port).
+/// The llama.cpp reachability authority (`host:port`) derived from the config.
+/// STT is a separate Parakeet server on its own port, not this one.
 fn llm_authority_from_config(config: &serde_json::Value) -> Option<String> {
     let llm = runtime_config(config, "llm")?;
     let host = json_str(llm.get("host")).unwrap_or_else(|| DEFAULT_LLAMA_HOST.to_string());
@@ -827,61 +849,14 @@ fn llm_authority_from_config(config: &serde_json::Value) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Whisper model (koboldcpp `--whispermodel`) resolution + swap
-// ---------------------------------------------------------------------------
-
-/// The Whisper models directory: where koboldcpp's `.bin` Whisper builds live.
-/// Resolved from the helper config's `localRuntimes.llm` `--whispermodel` arg's
-/// parent dir (so it tracks the real koboldcpp install), falling back to the
-/// koboldcpp dir's `models` subfolder next to its `command`/`cwd`, then to a
-/// sensible default. Env override: `CHASM_WHISPER_MODELS_DIR`.
-pub(crate) fn whisper_models_dir(settings: &AppSettings) -> std::path::PathBuf {
-    if let Some(dir) = std::env::var_os("CHASM_WHISPER_MODELS_DIR") {
-        return std::path::PathBuf::from(dir);
-    }
-    let config = load_helper_config(&helper_config_path(&settings.launcher));
-    // 1) Parent of the configured --whispermodel path.
-    if let Some(path) = config.as_ref().and_then(whisper_path_from_config) {
-        if let Some(parent) = Path::new(&path).parent() {
-            if !parent.as_os_str().is_empty() {
-                return parent.to_path_buf();
-            }
-        }
-    }
-    // 2) <koboldcpp cwd or command dir>/models.
-    if let Some(llm) = config.as_ref().and_then(|c| runtime_config(c, "llm")) {
-        let base = json_str(llm.get("cwd")).or_else(|| {
-            json_str(first_present(llm, &["command", "executable", "path"]))
-                .and_then(|cmd| Path::new(&cmd).parent().map(|p| p.display().to_string()))
-        });
-        if let Some(base) = base {
-            return Path::new(&base).join("models");
-        }
-    }
-    // 3) Last-ditch default: a managed per-user dir under chasm's home, so STT can
-    //    download and find its Whisper `.bin` with no helper config at all.
-    chasm_core::chasm_home().join("models").join("stt")
-}
-
-/// Extracts the configured `--whispermodel` path from the helper config's
-/// `localRuntimes.llm.args` (koboldcpp loads Whisper from this flag at launch).
-fn whisper_path_from_config(config: &serde_json::Value) -> Option<String> {
-    let llm = runtime_config(config, "llm")?;
-    let args = llm.get("args")?.as_array()?;
-    let pos = args
-        .iter()
-        .position(|v| v.as_str() == Some("--whispermodel"))?;
-    json_str(args.get(pos + 1))
-}
-
-// ---------------------------------------------------------------------------
-// LLM model swap (picker-authoritative; relaunch koboldcpp with the new --model)
+// LLM model swap (picker-authoritative; relaunch llama.cpp with the new --model)
 // ---------------------------------------------------------------------------
 
 /// Rewrites the `--model <path>` argument inside `localRuntimes.llm.args` of the
 /// helper config JSON at `path` to `model_path`, preserving every other key +
-/// arg (pretty-printed back). koboldcpp loads its weights from this `--model`
-/// flag at launch, so this is what makes a model swap stick across the relaunch.
+/// arg (pretty-printed back). A developer helper-config runtime loads its weights
+/// from this `--model` flag at launch, so this is what makes a model swap stick
+/// across the relaunch.
 ///
 /// Only rewrites when the value actually changes (so repeated saves don't churn
 /// the file). Returns `Ok(true)` when the file was changed, `Ok(false)` when it
@@ -928,23 +903,16 @@ fn set_llm_model_arg(path: &str, model_path: &str) -> std::io::Result<bool> {
     Ok(true)
 }
 
-/// Kills every running koboldcpp process by image name, so switching the active
-/// LLM fully unloads the previous model from VRAM. Belt-and-suspenders beyond the
-/// port-based kill (which only frees `:5001` and can miss a process that hasn't
-/// bound the port yet, e.g. still loading weights). Best-effort; a no-op when
-/// nothing matches.
+/// Kills chasm's running llama.cpp `llama-server` (the managed LLM runtime on
+/// :5001), so switching the active LLM fully unloads the previous model from VRAM.
+/// Belt-and-suspenders beyond the port-based kill (which only frees `:5001` and
+/// can miss a process that hasn't bound the port yet, e.g. still loading weights).
+/// Best-effort; a no-op when nothing matches.
 #[cfg(windows)]
 fn kill_llm_servers() {
     use std::os::windows::process::CommandExt;
     use std::process::Command;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let _ = Command::new("taskkill")
-        .args(["/F", "/IM", "koboldcpp.exe"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
     // llama-server: only chasm's own instance (the one serving :5001), never an
     // unrelated llama-server the user runs — match the command line, not the name.
     let _ = Command::new("powershell")
@@ -962,10 +930,10 @@ fn kill_llm_servers() {
 #[cfg(not(windows))]
 fn kill_llm_servers() {}
 
-/// Applies the currently-selected LLM model right now: point the helper config's
-/// koboldcpp `--model` at the selected GGUF, then unload the running model
-/// (kill koboldcpp + free `:5001`) and relaunch koboldcpp on the new weights.
-/// koboldcpp loads `--model` only at launch, so a full reload is expected here -
+/// Applies the currently-selected LLM model right now: point the LLM runtime's
+/// model arg at the selected GGUF, then unload the running model
+/// (kill the LLM server + free `:5001`) and relaunch it on the new weights.
+/// llama-server loads its model only at launch, so a full reload is expected here -
 /// the previous model IS unloaded before the new one loads (never two in VRAM).
 ///
 /// Called from the LLM settings save when the model selection changed, so the
@@ -993,21 +961,21 @@ pub(crate) fn apply_selected_llm_model(state: &Arc<AppState>) {
         return;
     }
 
-    // Point koboldcpp's --model at the selected GGUF in the helper config so the
-    // relaunch (and every future Play) loads it.
+    // Point the helper config's `--model` at the selected GGUF so a developer
+    // helper-config install's relaunch (and every future Play) loads it. The
+    // managed llama.cpp spec reads the selection from settings directly.
     let config_path = helper_config_path(&settings.launcher);
     match set_llm_model_arg(&config_path, &gguf.display().to_string()) {
         Ok(_) => {}
         Err(error) => {
-            tracing::warn!("could not set koboldcpp --model in helper config: {error}");
+            tracing::warn!("could not set llama.cpp --model in helper config: {error}");
             return;
         }
     }
 
     // Build the (now-updated) spawn spec + reachability address for the SELECTED
-    // runtime (llama-server when chosen; else helper-config spec FIRST, then the
-    // managed koboldcpp spec). No spec at all means the runtime isn't downloaded
-    // yet — nothing to relaunch.
+    // runtime (helper-config spec FIRST, then the managed llama-server spec). No
+    // spec at all means the runtime isn't downloaded yet — nothing to relaunch.
     let config = load_helper_config(&config_path);
     let Some(spec) = managed_llm_runtime_spec(&settings, &state.config, config.as_ref()) else {
         tracing::info!(
@@ -1045,41 +1013,6 @@ pub(crate) fn apply_selected_llm_model(state: &Arc<AppState>) {
     }
 }
 
-/// Applies the currently-selected LLM RUNTIME right now (called when the
-/// Runtimes picker changes on save): unload whatever serves :5001 (koboldcpp or
-/// llama-server, by name/command-line + by port) and respawn the newly selected
-/// runtime on the same selected model. Mirrors [`apply_selected_llm_model`].
-/// Best-effort + blocking — run it off the async path.
-pub(crate) fn apply_selected_llm_runtime(state: &Arc<AppState>) {
-    let settings = AppSettings::load(&state.config.settings_path);
-    let runtime = chasm_core::normalize_llm_runtime(&settings.runtime.llm_runtime);
-    let config = load_helper_config(&helper_config_path(&settings.launcher));
-    let llm_addr = config
-        .as_ref()
-        .and_then(llm_authority_from_config)
-        .unwrap_or_else(|| DEFAULT_STACK_LLM_ADDR.to_string());
-
-    let Some(spec) = managed_llm_runtime_spec(&settings, &state.config, config.as_ref()) else {
-        tracing::info!(
-            "LLM runtime -> {runtime}, but no spawnable spec (runtime or model not \
-             downloaded); it will load on the next stack start"
-        );
-        return;
-    };
-
-    // Unload the running runtime (both engines by name/command-line + the port)
-    // before loading the new one, so two models never share VRAM.
-    kill_llm_servers();
-    if tcp_reachable(&llm_addr) {
-        crate::kill_process_on_port(port_from_addr(&llm_addr));
-    }
-    std::thread::sleep(Duration::from_millis(800));
-    match spawn_runtime(&spec) {
-        Ok(()) => tracing::info!("applied LLM runtime '{runtime}' on save ({llm_addr})"),
-        Err(error) => tracing::warn!("could not apply LLM runtime '{runtime}': {error}"),
-    }
-}
-
 /// The download status of each LLM model keyed by id, read from the on-disk GGUFs
 /// in `models_dir` (mirrors the web layer's `llm_model_statuses`, duplicated here
 /// so the launcher's model-swap path doesn't depend on it). Only the `downloaded`
@@ -1109,197 +1042,32 @@ fn llm_model_statuses_for(
 }
 
 // ---------------------------------------------------------------------------
-// Whisper model swap (rewrite --whispermodel + force a koboldcpp relaunch)
+// Managed LLM runtime status (llama.cpp llama-server auto-download)
 // ---------------------------------------------------------------------------
 
-/// Applies the selected Whisper model so the NEXT koboldcpp launch uses it AND
-/// the previously-loaded model is guaranteed gone:
-///   1. Rewrite `--whispermodel <path>` in the helper config's `localRuntimes.llm.args`.
-///   2. Best-effort rewrite of the `--whispermodel "<path>"` line in
-///      `koboldcpp/start_kobold.bat` (so the manual start script matches).
-///   3. Kill koboldcpp on the LLM/STT port so the model unloads now; the next Play
-///      relaunches koboldcpp with the new `--whispermodel`.
-///
-/// TRADEOFF (documented for the user): koboldcpp loads `--whispermodel` only at
-/// process start and has no per-slot hot-swap for the Whisper model, so the only
-/// way to GUARANTEE the old model is freed from VRAM is to restart the process -
-/// which also reloads the (large) LLM. We accept that one-time reload cost in
-/// exchange for a correct unload. `model_file` is a Whisper `.bin` filename
-/// (a [`chasm_core::WhisperModel::file`]); it is resolved against
-/// [`whisper_models_dir`]. Best-effort + blocking - run it off the async path.
-pub(crate) fn apply_selected_whisper_model(state: &Arc<AppState>, model_file: &str) {
-    let settings = AppSettings::load(&state.config.settings_path);
-    let models_dir = whisper_models_dir(&settings);
-    let model_path = models_dir.join(model_file);
-    let model_path_str = model_path.display().to_string();
-
-    // 1) Helper config JSON.
-    let config_path = helper_config_path(&settings.launcher);
-    if let Err(error) = write_whisper_model_in_config(&config_path, &model_path_str) {
-        tracing::warn!("could not set --whispermodel in helper config: {error}");
-    }
-
-    // 2) start_kobold.bat (next to the koboldcpp command/cwd), best-effort.
-    if let Some(bat) = kobold_start_bat(&settings) {
-        if let Err(error) = rewrite_whispermodel_in_bat(&bat, &model_path_str) {
-            tracing::debug!("could not update start_kobold.bat (ignored): {error}");
-        }
-    }
-
-    // 3) Kill koboldcpp so the old whisper model is freed; next Play relaunches it
-    //    with the new model. This unloads the LLM too (koboldcpp is one process).
-    let llm_addr = authority_from_url(&state.config.llm_endpoint)
-        .or_else(|| authority_from_url(&state.config.stt_endpoint));
-    if let Some(addr) = llm_addr {
-        if tcp_reachable(&addr) {
-            let port = port_from_addr(&addr);
-            tracing::info!(
-                "Whisper model -> {model_file}; stopping koboldcpp on :{port} so it reloads with the new --whispermodel"
-            );
-            crate::kill_process_on_port(port);
-        }
-    }
-}
-
-/// Rewrites (or inserts) `--whispermodel <path>` in the helper config's
-/// `localRuntimes.llm.args`, preserving every other key. Only writes when the
-/// value actually changes. Missing file / no `llm` section means Ok (nothing to do).
-fn write_whisper_model_in_config(path: &str, model_path: &str) -> std::io::Result<()> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    let mut value: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    let Some(args) = value
-        .get_mut("localRuntimes")
-        .and_then(|v| v.get_mut("llm"))
-        .and_then(|v| v.get_mut("args"))
-        .and_then(|v| v.as_array_mut())
-    else {
-        return Ok(()); // no args array to update
-    };
-
-    // Find the existing flag's value slot, else append the flag + value.
-    if let Some(pos) = args.iter().position(|v| v.as_str() == Some("--whispermodel")) {
-        if let Some(slot) = args.get_mut(pos + 1) {
-            if slot.as_str() == Some(model_path) {
-                return Ok(()); // already correct
-            }
-            *slot = serde_json::Value::String(model_path.to_string());
-        } else {
-            args.push(serde_json::Value::String(model_path.to_string()));
-        }
-    } else {
-        args.push(serde_json::Value::String("--whispermodel".to_string()));
-        args.push(serde_json::Value::String(model_path.to_string()));
-    }
-
-    let mut json = serde_json::to_string_pretty(&value)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    json.push('\n');
-    std::fs::write(path, json)
-}
-
-/// Resolves `koboldcpp/start_kobold.bat` from the helper config's koboldcpp cwd /
-/// command dir, returning it only if it exists.
-fn kobold_start_bat(settings: &AppSettings) -> Option<std::path::PathBuf> {
-    let config = load_helper_config(&helper_config_path(&settings.launcher))?;
-    let llm = runtime_config(&config, "llm")?;
-    let base = json_str(llm.get("cwd")).or_else(|| {
-        json_str(first_present(llm, &["command", "executable", "path"]))
-            .and_then(|cmd| Path::new(&cmd).parent().map(|p| p.display().to_string()))
-    })?;
-    let bat = Path::new(&base).join("start_kobold.bat");
-    bat.exists().then_some(bat)
-}
-
-// ---------------------------------------------------------------------------
-// koboldcpp runtime auto-download (the exe that runs the LLM + Whisper STT)
-// ---------------------------------------------------------------------------
-
-/// Install status of the koboldcpp runtime (the exe koboldcpp serves the LLM AND
-/// Whisper STT from). `Installed` once the exe exists at the resolved path;
-/// `Downloading` while the `koboldcpp.downloading` marker is present; `Missing`
-/// otherwise (so a model download can kick off the runtime fetch).
+/// Install status of the managed local LLM runtime (llama.cpp `llama-server`).
+/// `Installed` once the exe exists at the resolved path; `Downloading` while the
+/// `.downloading` marker is present; `Missing` otherwise (so a model download can
+/// kick off the runtime fetch).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KoboldcppStatus {
+pub(crate) enum RuntimeStatus {
     Installed,
     Downloading,
     Missing,
 }
 
-impl KoboldcppStatus {
+impl RuntimeStatus {
     /// The status string the UI keys its pill class + label off (matching the
     /// `install-pill is-…` classes already used for engines/models).
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            KoboldcppStatus::Installed => "installed",
-            KoboldcppStatus::Downloading => "downloading",
-            KoboldcppStatus::Missing => "missing",
+            RuntimeStatus::Installed => "installed",
+            RuntimeStatus::Downloading => "downloading",
+            RuntimeStatus::Missing => "missing",
         }
     }
 }
 
-/// Resolves the koboldcpp exe path the launcher should use, preferring the path
-/// the helper config already points its `localRuntimes.llm.command` at (so existing
-/// users keep their install), then a managed default under the workspace
-/// (`<workspace>/koboldcpp/koboldcpp.exe`) where the auto-download lands. Env
-/// override: `CHASM_KOBOLDCPP_EXE`.
-pub(crate) fn koboldcpp_exe_path(
-    settings: &AppSettings,
-    config: &chasm_core::AppConfig,
-) -> std::path::PathBuf {
-    if let Some(env) = std::env::var_os("CHASM_KOBOLDCPP_EXE") {
-        return std::path::PathBuf::from(env);
-    }
-    // 1) The koboldcpp command the helper config already launches, when it looks
-    //    like a koboldcpp exe (so we never clobber a hand-configured install).
-    if let Some(helper) = load_helper_config(&helper_config_path(&settings.launcher)) {
-        if let Some(llm) = runtime_config(&helper, "llm") {
-            if let Some(cmd) = json_str(first_present(llm, &["command", "executable", "path"])) {
-                let lower = cmd.to_ascii_lowercase();
-                if lower.contains("koboldcpp") && lower.ends_with(".exe") {
-                    return std::path::PathBuf::from(cmd);
-                }
-            }
-        }
-    }
-    // 2) Managed default: chasm downloads koboldcpp here when no install exists.
-    koboldcpp_managed_default(config)
-}
-
-/// The chasm-managed koboldcpp install path (`<workspace>/koboldcpp/koboldcpp.exe`),
-/// where the auto-download writes the exe + its `.downloading`/`.done`/`.failed`
-/// markers. Kept separate so the download endpoint + the status check agree on the
-/// location without re-reading the helper config.
-pub(crate) fn koboldcpp_managed_default(
-    config: &chasm_core::AppConfig,
-) -> std::path::PathBuf {
-    config
-        .workspace_root
-        .join("koboldcpp")
-        .join("koboldcpp.exe")
-}
-
-/// Builds the chasm-MANAGED koboldcpp [`RuntimeSpec`] for a public-release install
-/// that has NO developer helper config. This is the fallback `start_ai_stack` uses
-/// when the helper-config spec is absent, and it is what makes the local LLM + STT
-/// run for a downloaded-from-the-panel user.
-///
-/// Resolution (all from settings + on-disk state, no helper config):
-///   * program = [`koboldcpp_exe_path`]'s managed default, but only if the exe
-///     exists (koboldcpp downloaded). Missing exe ⇒ `None` (don't launch).
-///   * `--model` = the SELECTED + downloaded LLM GGUF (settings `llm.model` resolved
-///     via [`selected_llm_model_id`] + [`llm_model_gguf_path`]). No selection / not
-///     downloaded ⇒ `None` (the caller logs "LLM not selected/downloaded").
-///   * `--whispermodel` = the SELECTED + present Whisper `.bin` (settings `stt.model`
-///     under [`whisper_models_dir`]) — included ONLY when selected + present; STT is
-///     optional, so its absence never blocks the LLM from starting.
-///   * args mirror the real koboldcpp config: `--usecublas --model <gguf>
-///     --gpulayers 999 --contextsize 8192 [--whispermodel <bin>] --port 5001
-///     --host 127.0.0.1`. cwd = the exe's dir.
 /// Finds a vision projector (`*mmproj*.gguf`) in the LLM models dir for the
 /// selected model. Preference: the candidate sharing the longest common prefix
 /// with the model file's name (case-insensitive) — so `gemma-4-12b-it-mmproj-F16`
@@ -1325,12 +1093,12 @@ fn find_vision_projector(models_dir: &Path, model_gguf: &Path) -> Option<std::pa
 }
 
 // ---------------------------------------------------------------------------
-// llama.cpp (llama-server) managed runtime — the opt-in alternative to koboldcpp
+// llama.cpp (llama-server) — the managed local LLM runtime
 // ---------------------------------------------------------------------------
 
 /// Resolves the llama-server exe path: `CHASM_LLAMACPP_EXE` override, else the
 /// managed download location under the data tree (`<data>/models/llamacpp/`,
-/// beside the koboldcpp/LLM/STT model dirs the desktop app already uses).
+/// beside the LLM/STT model dirs the desktop app already uses).
 pub(crate) fn llamacpp_exe_path(config: &chasm_core::AppConfig) -> std::path::PathBuf {
     if let Some(env) = std::env::var_os("CHASM_LLAMACPP_EXE") {
         return std::path::PathBuf::from(env);
@@ -1349,15 +1117,15 @@ pub(crate) fn llamacpp_managed_default(config: &chasm_core::AppConfig) -> std::p
         .join("llama-server.exe")
 }
 
-/// The llama.cpp runtime status, mirroring [`koboldcpp_status`] (same enum —
-/// installed / downloading / missing) off the `llamacpp.*` markers.
-pub(crate) fn llamacpp_status(config: &chasm_core::AppConfig) -> KoboldcppStatus {
+/// The managed llama.cpp runtime status (installed / downloading / missing) off
+/// the `llamacpp.*` markers beside the `llama-server.exe`.
+pub(crate) fn llamacpp_status(config: &chasm_core::AppConfig) -> RuntimeStatus {
     let exe = llamacpp_exe_path(config);
     if exe.exists() {
-        return KoboldcppStatus::Installed;
+        return RuntimeStatus::Installed;
     }
     let Some(dir) = exe.parent() else {
-        return KoboldcppStatus::Missing;
+        return RuntimeStatus::Missing;
     };
     let marker = dir.join("llamacpp.downloading");
     crate::flip_marker_if_stale(
@@ -1366,32 +1134,29 @@ pub(crate) fn llamacpp_status(config: &chasm_core::AppConfig) -> KoboldcppStatus
         &[dir.join("llamacpp.log")],
     );
     if marker.exists() {
-        KoboldcppStatus::Downloading
+        RuntimeStatus::Downloading
     } else {
-        KoboldcppStatus::Missing
+        RuntimeStatus::Missing
     }
 }
 
-/// Builds the chasm-MANAGED llama-server [`RuntimeSpec`] for the SAME selected
-/// model the koboldcpp spec would load, on the SAME port (5001) — so nothing
-/// downstream (endpoints, bridge, warmup) changes when the runtime is swapped.
+/// Builds the chasm-MANAGED llama-server [`RuntimeSpec`] for the selected model,
+/// on port 5001 — the port the whole stack (endpoints, bridge, warmup) expects.
 ///
-/// Key differences from koboldcpp, and the whole point of offering llama-server:
+/// Notable flags:
 ///   * `--parallel 2` = two server slots, each keeping its OWN prompt cache. In a
 ///     group scene, speaker A's system prompt + history stay cached in slot 0
 ///     while speaker B generates in slot 1 (llama-server routes each request to
 ///     the slot with the most similar cached prompt), so a speaker swap costs a
-///     delta prefill instead of the full ~0.4-0.6 s reprocess koboldcpp's single
-///     KV slot pays.
+///     delta prefill instead of a full ~0.4-0.6 s reprocess of the prompt.
 ///   * `--ctx-size 16384` — the total KV budget is split across slots, so 16384
-///     keeps koboldcpp's 8192 context PER SLOT.
+///     gives 8192 context PER SLOT.
 ///   * `--cache-reuse 256` — chunked KV reuse for partially-matching prompts
 ///     (history windows shift as the conversation grows).
-///   * `--reasoning-budget 0` mirrors koboldcpp's `--reasoningeffort none` (no
-///     hidden thinking preamble delaying first audio).
+///   * `--reasoning-budget 0` — no hidden thinking preamble delaying first audio.
 ///   * `--jinja` uses the model's own chat template for /v1/chat/completions.
 /// Missing exe / no selected+downloaded model ⇒ `None` (caller logs + falls back
-/// to koboldcpp — never breaks the stack).
+/// to the helper-config spec — never breaks the stack).
 fn build_managed_llamacpp_spec(
     settings: &AppSettings,
     config: &chasm_core::AppConfig,
@@ -1401,8 +1166,7 @@ fn build_managed_llamacpp_spec(
         return None;
     }
 
-    // Same model resolution as the managed koboldcpp spec: the SELECTED +
-    // downloaded GGUF, no default selection.
+    // Model resolution: the SELECTED + downloaded GGUF, no default selection.
     let model_status = llm_model_statuses_for(&config.llm_models_dir);
     let selected = chasm_core::selected_llm_model_id(&settings.llm.model, &model_status);
     if selected.is_empty() {
@@ -1428,7 +1192,7 @@ fn build_managed_llamacpp_spec(
         "-ngl".to_string(),
         "999".to_string(),
         // 2 slots × 8192 ctx each (--ctx-size is the TOTAL budget, split across
-        // slots) = koboldcpp's per-conversation context, twice over.
+        // slots) = 8192 per-conversation context per slot.
         "-c".to_string(),
         "16384".to_string(),
         "-np".to_string(),
@@ -1436,7 +1200,7 @@ fn build_managed_llamacpp_spec(
         // Chunked KV reuse for shifted prefixes (min chunk 256 tokens).
         "--cache-reuse".to_string(),
         "256".to_string(),
-        // No thinking preamble (mirrors koboldcpp --reasoningeffort none).
+        // No thinking preamble delaying first audio.
         "--reasoning-budget".to_string(),
         "0".to_string(),
         // Use the GGUF's own chat template.
@@ -1447,8 +1211,7 @@ fn build_managed_llamacpp_spec(
         "on".to_string(),
     ];
 
-    // Vision projector: same auto-attach as the koboldcpp spec (llama-server
-    // takes the identical projector GGUF via --mmproj).
+    // Vision projector: auto-attach the projector GGUF via --mmproj.
     if let Some(mmproj) = find_vision_projector(&config.llm_models_dir, &gguf) {
         tracing::info!("llama-server: attaching vision projector {}", mmproj.display());
         args.push("--mmproj".to_string());
@@ -1463,232 +1226,27 @@ fn build_managed_llamacpp_spec(
     })
 }
 
-/// The managed LLM runtime spec for the CURRENTLY SELECTED runtime, with the
-/// fallback chain that keeps the stack alive:
-///   * runtime = llamacpp → the llama-server spec; if it can't be built (exe not
-///     downloaded / no model), LOG and fall back to the koboldcpp chain.
-///   * runtime = koboldcpp (default) → the developer helper-config spec first
-///     (unchanged precedence), then the managed koboldcpp spec.
-/// Also logs which STT will be live when llama-server (which has no Whisper)
-/// serves the LLM, so voice input never dies silently.
+/// The managed LLM runtime spec. llama.cpp `llama-server` is the only managed
+/// runtime now, so this prefers a developer helper-config spec (a hand-configured
+/// install must keep working) and otherwise builds the managed llama-server spec.
+/// `None` when nothing is spawnable (runtime exe or model not present), so the
+/// caller logs rather than spawning a broken process.
 fn managed_llm_runtime_spec(
     settings: &AppSettings,
     config: &chasm_core::AppConfig,
     helper: Option<&serde_json::Value>,
 ) -> Option<RuntimeSpec> {
-    let runtime = chasm_core::normalize_llm_runtime(&settings.runtime.llm_runtime);
-    if runtime == chasm_core::LLM_RUNTIME_LLAMACPP {
-        if let Some(spec) = build_managed_llamacpp_spec(settings, config) {
-            let provider = chasm_core::normalize_stt_provider(&settings.stt.provider);
-            if stt_uses_parakeet(settings, config) {
-                tracing::info!(
-                    "LLM runtime: llama-server (no Whisper); STT is the Parakeet server"
-                );
-            } else if provider == chasm_core::STT_PARAKEET_PROVIDER {
-                tracing::warn!(
-                    "LLM runtime: llama-server has no Whisper and the selected Parakeet \
-                     engine is NOT installed — voice input will be unavailable until \
-                     Parakeet is installed (Settings → STT) or the runtime is koboldcpp"
-                );
-            } else {
-                tracing::warn!(
-                    "LLM runtime: llama-server has no Whisper — voice input is unavailable \
-                     with STT provider 'whisper'. Select Parakeet (Settings → STT) or \
-                     switch the runtime back to koboldcpp"
-                );
-            }
-            return Some(spec);
-        }
-        tracing::warn!(
-            "LLM runtime: llama.cpp selected but llama-server is not ready (exe or model \
-             missing); falling back to koboldcpp"
-        );
-    }
     helper
         .and_then(build_llm_spec)
-        .or_else(|| build_managed_koboldcpp_spec(settings, config))
-}
-
-fn build_managed_koboldcpp_spec(
-    settings: &AppSettings,
-    config: &chasm_core::AppConfig,
-) -> Option<RuntimeSpec> {
-    // koboldcpp must be downloaded.
-    let exe = koboldcpp_exe_path(settings, config);
-    if !exe.exists() {
-        return None;
-    }
-
-    // The LLM must be selected AND its GGUF present — there is no default selection.
-    let model_status = llm_model_statuses_for(&config.llm_models_dir);
-    let selected = chasm_core::selected_llm_model_id(&settings.llm.model, &model_status);
-    if selected.is_empty() {
-        return None;
-    }
-    let gguf = chasm_core::llm_model_gguf_path(&config.llm_models_dir, &selected)?;
-    if !gguf.exists() {
-        return None;
-    }
-
-    let cwd = exe
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| p.display().to_string());
-
-    let mut args: Vec<String> = vec![
-        "--usecublas".to_string(),
-        "--model".to_string(),
-        gguf.display().to_string(),
-        "--gpulayers".to_string(),
-        "999".to_string(),
-        "--contextsize".to_string(),
-        "8192".to_string(),
-    ];
-
-    // Vision projector: when a matching mmproj GGUF sits in the models dir,
-    // attach it so a vision-capable model actually gets its vision tower.
-    // Without --mmproj, koboldcpp reports "vision": false and SILENTLY drops
-    // OpenAI-compat image parts (the persona screenshot among them).
-    if let Some(mmproj) = find_vision_projector(&config.llm_models_dir, &gguf) {
-        tracing::info!("koboldcpp: attaching vision projector {}", mmproj.display());
-        args.push("--mmproj".to_string());
-        args.push(mmproj.display().to_string());
-    }
-
-    // Thinking models: suppress the reasoning preamble entirely. It is never
-    // shown to anyone, and at typical eval speeds each ~70-token thinking
-    // block adds a full second before the first spoken word reaches TTS
-    // (measured via the per-turn stage traces).
-    args.push("--reasoningeffort".to_string());
-    args.push("none".to_string());
-
-    // Gemma-family models use sliding-window attention; koboldcpp's SWA cache
-    // CANNOT fast-forward, so every turn re-ingested the whole prompt. A
-    // full-size KV cache (--noswa) re-enables prefix caching: measured 0.53s
-    // cold -> 0.15s on appended turns. Costs some VRAM; worth it universally.
-    args.push("--noswa".to_string());
-
-    // Whisper STT is optional: add --whispermodel only when a model is selected AND
-    // its .bin is on disk, so STT never blocks the LLM from starting. When the
-    // Parakeet provider is active (selected + installed), skip it entirely — the
-    // dedicated Parakeet server handles STT, so loading Whisper would only waste
-    // VRAM. (Parakeet selected but NOT installed keeps Whisper as the fallback.)
-    let whisper_file = if stt_uses_parakeet(settings, config) {
-        String::new()
-    } else {
-        chasm_core::stt_effective_model(&settings.stt)
-    };
-    if !whisper_file.is_empty() {
-        let whisper_path = whisper_models_dir(settings).join(&whisper_file);
-        if whisper_path.exists() {
-            args.push("--whispermodel".to_string());
-            args.push(whisper_path.display().to_string());
-        } else {
-            tracing::info!(
-                "managed koboldcpp: Whisper model '{whisper_file}' selected but not downloaded ({}); starting LLM without STT",
-                whisper_path.display()
-            );
-        }
-    }
-
-    args.push("--port".to_string());
-    args.push("5001".to_string());
-    args.push("--host".to_string());
-    args.push("127.0.0.1".to_string());
-
-    Some(RuntimeSpec {
-        program: exe.display().to_string(),
-        args,
-        cwd,
-        env: Vec::new(),
-    })
-}
-
-/// The koboldcpp runtime status: `Installed` when the resolved exe exists,
-/// `Downloading` when a `koboldcpp.downloading` marker sits beside it (an
-/// in-flight auto-download), else `Missing`. A present exe always wins (existing
-/// users are never asked to re-download).
-pub(crate) fn koboldcpp_status(
-    settings: &AppSettings,
-    config: &chasm_core::AppConfig,
-) -> KoboldcppStatus {
-    let exe = koboldcpp_exe_path(settings, config);
-    if exe.exists() {
-        return KoboldcppStatus::Installed;
-    }
-    let Some(dir) = exe.parent() else {
-        return KoboldcppStatus::Missing;
-    };
-    let marker = dir.join("koboldcpp.downloading");
-    // Flip a stalled download marker to failed (progress = koboldcpp.log + the
-    // .exe.part curl is writing), so a dead spawn can't show "Downloading" forever.
-    crate::flip_marker_if_stale(
-        &marker,
-        &dir.join("koboldcpp.failed"),
-        &[dir.join("koboldcpp.log"), exe.with_extension("exe.part")],
-    );
-    if marker.exists() {
-        KoboldcppStatus::Downloading
-    } else {
-        KoboldcppStatus::Missing
-    }
-}
-
-/// Rewrites the `--whispermodel "<old>"` argument in a koboldcpp `.bat` launch
-/// script to point at `model_path`, preserving the rest of the line. Matches the
-/// flag whether or not its value is quoted; writes the new value quoted. A no-op
-/// (Ok) when the flag isn't present.
-fn rewrite_whispermodel_in_bat(bat: &Path, model_path: &str) -> std::io::Result<()> {
-    let text = std::fs::read_to_string(bat)?;
-    let mut out_lines: Vec<String> = Vec::with_capacity(text.lines().count());
-    let mut changed = false;
-    for line in text.lines() {
-        if let Some(idx) = line.find("--whispermodel") {
-            let (prefix, rest) = line.split_at(idx + "--whispermodel".len());
-            // `rest` begins with the separator + the (maybe quoted) path, possibly
-            // followed by more args / a `^` continuation. Replace just the path token.
-            let trimmed = rest.trim_start();
-            let lead_ws = &rest[..rest.len() - trimmed.len()];
-            let (_, tail) = split_first_token(trimmed);
-            let new_line = format!("{prefix}{lead_ws}\"{model_path}\"{tail}");
-            out_lines.push(new_line);
-            changed = true;
-        } else {
-            out_lines.push(line.to_string());
-        }
-    }
-    if !changed {
-        return Ok(());
-    }
-    let mut joined = out_lines.join("\r\n");
-    if text.ends_with('\n') {
-        joined.push_str("\r\n");
-    }
-    std::fs::write(bat, joined)
-}
-
-/// Splits off the first whitespace-delimited token, honouring a leading
-/// double-quoted span (so a quoted path with spaces is one token). Returns
-/// `(token, remainder)` where `remainder` keeps its leading separator/whitespace.
-fn split_first_token(s: &str) -> (&str, &str) {
-    if let Some(stripped) = s.strip_prefix('"') {
-        if let Some(end) = stripped.find('"') {
-            // token spans the quotes; remainder is everything after the closing quote
-            return (&s[..end + 2], &s[end + 2..]);
-        }
-    }
-    match s.find(|c: char| c.is_whitespace()) {
-        Some(idx) => (&s[..idx], &s[idx..]),
-        None => (s, ""),
-    }
+        .or_else(|| build_managed_llamacpp_spec(settings, config))
 }
 
 // NOTE: the retrieval warm-up (embedder + reranker + catalog vectors) moved to
 // `crate::warmup::spawn_stack_warmup`, which folds it into the full connect-time
-// stack warm-up (LLM KV prefix, Whisper, TTS first-inference) with one summary
-// log line.
+// stack warm-up (LLM KV prefix, Parakeet STT, TTS first-inference) with one
+// summary log line.
 
-/// Spawns a configured local runtime (koboldcpp / TTS service) detached +
+/// Spawns a configured local runtime (llama.cpp / TTS service) detached +
 /// hidden, with its cwd + merged env applied and stdio nulled.
 #[cfg(windows)]
 fn spawn_runtime(spec: &RuntimeSpec) -> std::io::Result<()> {
@@ -1891,25 +1449,21 @@ mod tests {
         })
     }
 
-    /// A sample config mirroring the real koboldcpp helper config: the `llm`
-    /// section uses an `args` array (passed verbatim) that includes
-    /// `--whispermodel`, since koboldcpp serves LLM + Whisper STT in one process.
-    fn kobold_config() -> serde_json::Value {
+    /// A sample developer helper config whose `llm` section runs a llama.cpp
+    /// `llama-server` on :5001 (an `args` array passed verbatim).
+    fn llm_helper_config() -> serde_json::Value {
         serde_json::json!({
             "localRuntimes": {
                 "llm": {
-                    "runner": "koboldcpp",
+                    "runner": "llamacpp",
                     "endpoint": "http://127.0.0.1:5001",
                     "host": "127.0.0.1",
                     "port": 5001,
-                    "command": "C:\\kobold\\koboldcpp.exe",
-                    "cwd": "C:\\kobold",
+                    "command": "C:\\llama\\llama-server.exe",
+                    "cwd": "C:\\llama",
                     "args": [
-                        "--usecublas",
                         "--model", "C:\\models\\gemma.gguf",
-                        "--gpulayers", "999",
-                        "--contextsize", "8192",
-                        "--whispermodel", "C:\\kobold\\models\\whisper-small-q5_1.bin",
+                        "--host", "127.0.0.1",
                         "--port", "5001"
                     ]
                 }
@@ -2002,22 +1556,6 @@ mod tests {
     }
 
     #[test]
-    fn whisper_path_parsed_from_kobold_config() {
-        // koboldcpp serves STT via --whispermodel in the llm args; the parser pulls
-        // the value, and the models dir is its parent.
-        let config = kobold_config();
-        assert_eq!(
-            whisper_path_from_config(&config).as_deref(),
-            Some("C:\\kobold\\models\\whisper-small-q5_1.bin")
-        );
-        // Missing flag → None.
-        let no_flag = serde_json::json!({
-            "localRuntimes": { "llm": { "args": ["--model", "x.gguf", "--port", "5001"] } }
-        });
-        assert!(whisper_path_from_config(&no_flag).is_none());
-    }
-
-    #[test]
     fn tts_spec_maps_program_args_cwd_env_from_json() {
         let config = serde_json::json!({
             "localRuntimes": { "tts": {
@@ -2051,9 +1589,9 @@ mod tests {
             llm_authority_from_config(&config).as_deref(),
             Some("127.0.0.1:8080")
         );
-        // koboldcpp config: the LLM/STT authority is the single :5001 port.
+        // Developer helper config: the LLM authority is the configured :5001 port.
         assert_eq!(
-            llm_authority_from_config(&kobold_config()).as_deref(),
+            llm_authority_from_config(&llm_helper_config()).as_deref(),
             Some("127.0.0.1:5001")
         );
 
@@ -2077,75 +1615,8 @@ mod tests {
         assert!(build_llm_spec(&config2).is_none());
     }
 
-    #[test]
-    fn write_whisper_model_in_config_updates_arg_in_place() {
-        let dir = std::env::temp_dir().join(format!("sb-whisper-cfg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("nvbridge.config.json");
-        let path_str = path.to_string_lossy().to_string();
-        // Seed with a koboldcpp-shaped config (args array incl. --whispermodel).
-        std::fs::write(
-            &path,
-            serde_json::to_string_pretty(&kobold_config()).unwrap(),
-        )
-        .unwrap();
-
-        write_whisper_model_in_config(&path_str, "D:\\w\\ggml-large-v3-turbo.bin").unwrap();
-        let after: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let args = after["localRuntimes"]["llm"]["args"].as_array().unwrap();
-        let pos = args
-            .iter()
-            .position(|v| v.as_str() == Some("--whispermodel"))
-            .unwrap();
-        assert_eq!(
-            args[pos + 1].as_str(),
-            Some("D:\\w\\ggml-large-v3-turbo.bin")
-        );
-        // Other args preserved (still has --model + --port).
-        assert!(args.iter().any(|v| v.as_str() == Some("--model")));
-        assert!(args.iter().any(|v| v.as_str() == Some("--port")));
-
-        // Inserts the flag when absent.
-        let no_flag = serde_json::json!({
-            "localRuntimes": { "llm": { "args": ["--model", "x.gguf", "--port", "5001"] } }
-        });
-        std::fs::write(&path, serde_json::to_string_pretty(&no_flag).unwrap()).unwrap();
-        write_whisper_model_in_config(&path_str, "D:\\w\\ggml-base.bin").unwrap();
-        let after2: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let args2 = after2["localRuntimes"]["llm"]["args"].as_array().unwrap();
-        let pos2 = args2
-            .iter()
-            .position(|v| v.as_str() == Some("--whispermodel"))
-            .unwrap();
-        assert_eq!(args2[pos2 + 1].as_str(), Some("D:\\w\\ggml-base.bin"));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn rewrite_whispermodel_in_bat_replaces_quoted_path() {
-        let dir = std::env::temp_dir().join(format!("sb-whisper-bat-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let bat = dir.join("start_kobold.bat");
-        // A realistic multi-line .bat with a quoted --whispermodel + trailing ^.
-        let original = "@echo off\r\n\"C:\\kobold\\koboldcpp.exe\" ^\r\n  --model \"C:\\m\\g.gguf\" ^\r\n  --whispermodel \"C:\\kobold\\models\\whisper-small-q5_1.bin\" ^\r\n  --port 5001\r\n";
-        std::fs::write(&bat, original).unwrap();
-
-        rewrite_whispermodel_in_bat(&bat, "D:\\w\\ggml-large-v3-turbo.bin").unwrap();
-        let after = std::fs::read_to_string(&bat).unwrap();
-        assert!(after.contains("--whispermodel \"D:\\w\\ggml-large-v3-turbo.bin\" ^"));
-        // The old path is gone; the rest of the line (the ^ continuation) survives.
-        assert!(!after.contains("whisper-small-q5_1.bin"));
-        assert!(after.contains("--model \"C:\\m\\g.gguf\""));
-        assert!(after.contains("--port 5001"));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Builds a throwaway `AppConfig` rooted at `workspace` for the koboldcpp
-    /// resolution tests (only `workspace_root` is read by those paths).
+    /// Builds a throwaway `AppConfig` rooted at `workspace` for the runtime
+    /// resolution tests (only `workspace_root` / `data_root` are read by those paths).
     fn test_config(workspace: &Path) -> chasm_core::AppConfig {
         chasm_core::AppConfig {
             bind_addr: "127.0.0.1:0".to_string(),
@@ -2164,101 +1635,70 @@ mod tests {
     }
 
     #[test]
-    fn koboldcpp_status_tracks_exe_and_marker() {
-        let dir = std::env::temp_dir().join(format!("sb-kobold-{}", std::process::id()));
+    fn llamacpp_status_tracks_exe_and_marker() {
+        let dir = std::env::temp_dir().join(format!("sb-llamacpp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // No helper config / no managed exe → Missing. Point helper_config at a
-        // missing file so the resolver skips any real config on the host and falls
-        // through to the managed default under our temp workspace.
-        let mut settings = AppSettings::default();
-        settings.launcher.helper_config = dir.join("no-such-config.json").display().to_string();
+        std::env::remove_var("CHASM_LLAMACPP_EXE");
         let config = test_config(&dir);
-        // Make sure no env override leaks in from the host.
-        std::env::remove_var("CHASM_KOBOLDCPP_EXE");
-        let exe = koboldcpp_exe_path(&settings, &config);
-        assert_eq!(exe, dir.join("koboldcpp").join("koboldcpp.exe"));
-        assert_eq!(koboldcpp_status(&settings, &config), KoboldcppStatus::Missing);
+        let exe = llamacpp_exe_path(&config);
+        assert_eq!(
+            exe,
+            dir.join("models").join("llamacpp").join("llama-server.exe")
+        );
+        assert_eq!(llamacpp_status(&config), RuntimeStatus::Missing);
 
         // A `.downloading` marker beside the exe → Downloading.
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
-        std::fs::write(dir.join("koboldcpp").join("koboldcpp.downloading"), "").unwrap();
-        assert_eq!(
-            koboldcpp_status(&settings, &config),
-            KoboldcppStatus::Downloading
-        );
+        std::fs::write(exe.parent().unwrap().join("llamacpp.downloading"), "").unwrap();
+        assert_eq!(llamacpp_status(&config), RuntimeStatus::Downloading);
 
         // The exe present → Installed (wins over the marker).
         std::fs::write(&exe, "binary").unwrap();
-        assert_eq!(
-            koboldcpp_status(&settings, &config),
-            KoboldcppStatus::Installed
-        );
+        assert_eq!(llamacpp_status(&config), RuntimeStatus::Installed);
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn managed_koboldcpp_spec_needs_exe_and_selected_downloaded_llm() {
-        let dir = std::env::temp_dir().join(format!("sb-kobold-mgd-{}", std::process::id()));
+    fn managed_llamacpp_spec_needs_exe_and_selected_downloaded_llm() {
+        let dir = std::env::temp_dir().join(format!("sb-llamacpp-mgd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::remove_var("CHASM_KOBOLDCPP_EXE");
-        // Pin the Whisper dir into our temp workspace so the test never reads/writes
-        // the host's real chasm home and stays deterministic.
-        let whisper_dir = dir.join("whisper");
-        std::env::set_var("CHASM_WHISPER_MODELS_DIR", &whisper_dir);
+        std::env::remove_var("CHASM_LLAMACPP_EXE");
 
         let mut settings = AppSettings::default();
-        // No real helper config on the host.
-        settings.launcher.helper_config = dir.join("no-such-config.json").display().to_string();
         let config = test_config(&dir);
 
-        // 1) koboldcpp not installed → None.
-        assert!(build_managed_koboldcpp_spec(&settings, &config).is_none());
+        // 1) llama-server not installed → None.
+        assert!(build_managed_llamacpp_spec(&settings, &config).is_none());
 
-        // Install a fake koboldcpp exe.
-        let exe = config.workspace_root.join("koboldcpp").join("koboldcpp.exe");
+        // Install a fake llama-server exe at the managed default.
+        let exe = llamacpp_managed_default(&config);
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
         std::fs::write(&exe, "binary").unwrap();
 
         // 2) Exe present but no LLM selected/downloaded → None (no default selection).
-        assert!(build_managed_koboldcpp_spec(&settings, &config).is_none());
+        assert!(build_managed_llamacpp_spec(&settings, &config).is_none());
 
         // Download a fake GGUF for the first registry model + select it.
         let model = &chasm_core::LLM_MODELS[0];
-        let gguf =
-            chasm_core::llm_model_gguf_path(&config.llm_models_dir, model.id).unwrap();
+        let gguf = chasm_core::llm_model_gguf_path(&config.llm_models_dir, model.id).unwrap();
         std::fs::create_dir_all(gguf.parent().unwrap()).unwrap();
         std::fs::write(&gguf, "weights").unwrap();
         settings.llm.model = model.id.to_string();
 
-        // 3) Exe + selected + downloaded LLM, no Whisper → spec WITHOUT --whispermodel.
-        let spec = build_managed_koboldcpp_spec(&settings, &config).expect("managed spec");
+        // 3) Exe + selected + downloaded LLM → a valid llama-server spec.
+        let spec = build_managed_llamacpp_spec(&settings, &config).expect("managed spec");
         assert_eq!(spec.program, exe.display().to_string());
-        assert_eq!(spec.cwd.as_deref(), exe.parent().map(|p| p.to_str().unwrap()));
-        assert!(spec.args.iter().any(|a| a == "--usecublas"));
-        let m = spec.args.iter().position(|a| a == "--model").unwrap();
+        let m = spec.args.iter().position(|a| a == "-m").unwrap();
         assert_eq!(spec.args[m + 1], gguf.display().to_string());
-        assert!(spec.args.iter().any(|a| a == "--gpulayers"));
-        assert!(spec.args.iter().any(|a| a == "--contextsize"));
         let p = spec.args.iter().position(|a| a == "--port").unwrap();
         assert_eq!(spec.args[p + 1], "5001");
-        assert!(!spec.args.iter().any(|a| a == "--whispermodel"));
+        // Two prompt-cache slots (the whole point of llama-server).
+        let np = spec.args.iter().position(|a| a == "-np").unwrap();
+        assert_eq!(spec.args[np + 1], "2");
 
-        // 4) Select + download a Whisper .bin → spec gains --whispermodel.
-        let whisper = &chasm_core::WHISPER_MODELS[0];
-        std::fs::create_dir_all(&whisper_dir).unwrap();
-        std::fs::write(whisper_dir.join(whisper.file), "ggml").unwrap();
-        settings.stt.model = whisper.file.to_string();
-        let spec = build_managed_koboldcpp_spec(&settings, &config).expect("managed spec");
-        let w = spec.args.iter().position(|a| a == "--whispermodel").unwrap();
-        assert_eq!(
-            spec.args[w + 1],
-            whisper_dir.join(whisper.file).display().to_string()
-        );
-
-        std::env::remove_var("CHASM_WHISPER_MODELS_DIR");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

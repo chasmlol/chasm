@@ -341,7 +341,7 @@
         }
 
         // Map the lifecycle phase from /connection/status to the rail's dot +
-        // label. `starting` shows a warming-up state (koboldcpp ~12s, TTS model
+        // label. `starting` shows a warming-up state (llama.cpp ~12s, TTS model
         // ~45s); `connected` is the steady green; everything else reads as offline.
         function render(phase, connected) {
             var isConnected = phase === "connected" || (!phase && connected);

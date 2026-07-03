@@ -38,9 +38,9 @@ A chasm integration has **two halves**:
 │  (a plugin / script mod  │                                    │  axum server on 127.0.0.1  │
 │   inside the game)       │  ◀─────────────────────────────── │  :7341                     │
 │                          │       NDJSON / JSON responses      │                            │
-│  • detects the player    │                                    │  • LLM (koboldcpp)         │
+│  • detects the player    │                                    │  • LLM (llama.cpp)         │
 │    talking to an NPC     │                                    │  • TTS (streaming)         │
-│  • gathers who/where     │                                    │  • STT (whisper/parakeet)  │
+│  • gathers who/where     │                                    │  • STT (Parakeet)          │
 │  • plays back audio      │                                    │  • retrieval (lore/actions)│
 │  • executes actions      │                                    │  • per-game profile        │
 └─────────────────────────┘                                    └──────────────────────────┘
