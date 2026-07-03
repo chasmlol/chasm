@@ -10,6 +10,7 @@ pub mod actions;
 pub mod admin;
 pub mod chasm;
 pub mod config;
+pub mod events;
 pub mod npc;
 pub mod protocol;
 pub mod replay;
@@ -75,6 +76,7 @@ pub async fn run_with_client(
         for (dir, label) in [
             (native_inbox(root), "native inbox"),
             (native_event_dir(root), "save-state events"),
+            (events::game_event_dir(root), "game events"),
         ] {
             match make_watcher(&dir, tx.clone()) {
                 Ok(w) => {
@@ -145,6 +147,12 @@ async fn poll_native_root(
     client: &dyn ChasmClient,
     root: &Path,
 ) -> anyhow::Result<()> {
+    // The plugin's gameplay event-log batches (control/gameevents → chasm).
+    // These run BEFORE the save-state events: on save the plugin flushes its
+    // pending events and then writes the save event, and the checkpoint must
+    // ingest those events first so they belong to the saved timeline.
+    events::process_game_events(config, client, root).await;
+
     // The plugin's save/load checkpoint events (control/events → control/acks).
     saves::process_save_state_events(config, client, root).await;
 
@@ -1023,6 +1031,7 @@ fn ensure_native_root(root: &Path) -> anyhow::Result<()> {
         native_processed(root),
         root.join("control").join("actions"),
         native_event_dir(root),
+        events::game_event_dir(root),
         root.join("control").join("acks"),
     ] {
         std::fs::create_dir_all(&dir)

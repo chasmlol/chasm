@@ -64,6 +64,7 @@ pub trait ChasmClient: Send + Sync {
     async fn recognize(&self, body: &Value) -> anyhow::Result<String>;
     async fn generate_headless(&self, body: &Value) -> anyhow::Result<Value>;
     async fn save_sync_event(&self, body: &Value) -> anyhow::Result<Value>;
+    async fn event_log_ingest(&self, body: &Value) -> anyhow::Result<Value>;
     /// Streamed NPC turn — yields each NDJSON event. Boxed so the trait stays
     /// dyn-compatible (each impl's concrete stream type is private).
     fn generate_stream_events<'a>(
@@ -209,6 +210,11 @@ impl HttpChasmClient {
         self.post_json("/save-sync/events", body).await
     }
 
+    /// `POST /event-log/events`: relay a gameplay event-log batch.
+    pub async fn event_log_ingest(&self, body: &Value) -> anyhow::Result<Value> {
+        self.post_json("/event-log/events", body).await
+    }
+
     async fn post_json(&self, endpoint: &str, body: &Value) -> anyhow::Result<Value> {
         let resp = self
             .request(Method::POST, endpoint)
@@ -336,6 +342,9 @@ impl ChasmClient for HttpChasmClient {
     }
     async fn save_sync_event(&self, body: &Value) -> anyhow::Result<Value> {
         self.save_sync_event(body).await
+    }
+    async fn event_log_ingest(&self, body: &Value) -> anyhow::Result<Value> {
+        self.event_log_ingest(body).await
     }
     fn generate_stream_events<'a>(
         &'a self,

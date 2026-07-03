@@ -389,6 +389,9 @@ mod tests {
         async fn save_sync_event(&self, _body: &Value) -> anyhow::Result<Value> {
             Ok(Value::Null)
         }
+        async fn event_log_ingest(&self, _body: &Value) -> anyhow::Result<Value> {
+            Ok(Value::Null)
+        }
         fn generate_stream_events<'a>(
             &'a self,
             _id: &str,

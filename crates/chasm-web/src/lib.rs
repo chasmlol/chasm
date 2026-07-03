@@ -41,6 +41,7 @@ use tracing::info;
 mod books;
 mod capture;
 mod connection;
+mod event_log;
 mod fnv_bridge;
 mod game_bridge;
 mod gamemaster;
@@ -490,7 +491,10 @@ pub fn router(config: AppConfig) -> Router {
                 .route("/generate", post(generate::generate_headless))
                 .route("/generate/stream", post(generate::generate_headless_stream))
                 // Game save/load checkpoint + restore.
-                .route("/save-sync/events", post(save_sync::save_sync_event)),
+                .route("/save-sync/events", post(save_sync::save_sync_event))
+                // Gameplay event-log ingest (the bridge relays the plugin's
+                // control/gameevents batches here).
+                .route("/event-log/events", post(event_log::ingest_events)),
         )
         // --- Game transport (HTTP successor to the NVBridge file folder) -----
         // A SEPARATE namespace from the file bridge and the /app UI: one streaming

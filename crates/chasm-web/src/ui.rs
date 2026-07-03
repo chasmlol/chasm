@@ -160,6 +160,10 @@ pub(crate) fn api_router() -> Router<Arc<AppState>> {
                 .layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024)),
         )
         .route("/companions/:slot/op", post(companions::companion_op))
+        // --- events (READ-ONLY game event log; the store + rollback live in
+        // crate::event_log next to save_sync, so the handler is registered from
+        // there like the trace viewer below) -----------------------------------
+        .route("/events", get(crate::event_log::events_view))
         // --- profiles (list + activate the active game profile) --------------
         .route("/profiles", get(profiles::list_profiles))
         .route("/profiles/select", post(profiles::select_profile))

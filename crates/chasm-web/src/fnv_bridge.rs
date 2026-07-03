@@ -205,6 +205,14 @@ impl ChasmClient for InProcessChasmClient {
         Ok(result)
     }
 
+    async fn event_log_ingest(&self, body: &Value) -> anyhow::Result<Value> {
+        let Json(result) =
+            crate::event_log::ingest_events(State(self.state.clone()), Json(body.clone()))
+                .await
+                .map_err(unwrap_web)?;
+        Ok(result)
+    }
+
     fn generate_stream_events<'a>(
         &'a self,
         id: &str,

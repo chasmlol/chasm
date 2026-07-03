@@ -1730,7 +1730,20 @@ fn handle_save_sync_event(
                 "options": options.to_json(),
             }));
         }
-        return create_save_sync_checkpoint(data_root, world_root, chat_roots, &forwarded);
+        let result = create_save_sync_checkpoint(data_root, world_root, chat_roots, &forwarded)?;
+        // The game event log checkpoints alongside the chat state, keyed by the
+        // same checkpoint id, so a later load rolls both back together. Never
+        // fatal: a failed event-log snapshot must not void the chat checkpoint.
+        if let Ok(checkpoint_id) = resolve_checkpoint_id(body) {
+            if let Err(e) = crate::event_log::checkpoint_event_log(
+                data_root,
+                &checkpoint_id,
+                options.retention_limit,
+            ) {
+                tracing::warn!("event-log checkpoint {checkpoint_id}: {e}");
+            }
+        }
+        return Ok(result);
     }
 
     if matches!(event.as_str(), "load" | "loaded" | "restore" | "reload") {
@@ -1777,7 +1790,12 @@ fn handle_save_sync_event(
         if let Value::Object(map) = &mut forwarded {
             map.insert("checkpointId".into(), json!(checkpoint_id));
         }
-        return restore_save_sync_checkpoint(data_root, world_root, chat_roots, &forwarded);
+        let result = restore_save_sync_checkpoint(data_root, world_root, chat_roots, &forwarded)?;
+        // Roll the game event log back with the chat state (see the save arm).
+        if let Err(e) = crate::event_log::restore_event_log(data_root, &checkpoint_id) {
+            tracing::warn!("event-log restore {checkpoint_id}: {e}");
+        }
+        return Ok(result);
     }
 
     Err(web_err("event must be one of: save, load."))
@@ -1789,14 +1807,14 @@ fn handle_save_sync_event(
 
 /// Current time as an ISO-8601 UTC string with millisecond precision and a `Z`
 /// suffix, matching JS `new Date().toISOString()`.
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     format_iso_millis(now.as_millis() as i64)
 }
 
-fn epoch_millis() -> i64 {
+pub(crate) fn epoch_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -1980,6 +1998,33 @@ mod tests {
         let restored = fs::read_to_string(&chat_path).unwrap();
         assert!(restored.contains("Howdy."));
         assert!(!restored.contains("Charlie"));
+    }
+
+    #[test]
+    fn save_and_load_carry_the_event_log_along() {
+        // End-to-end through handle_save_sync_event: the event log checkpoints
+        // with the chat state and rolls back with it on load.
+        let root = TempRoot::new("event-log");
+        seed_live_chat(root.path());
+
+        let evt = |id: &str, summary: &str| json!({ "id": id, "type": "combat", "summary": summary });
+        crate::event_log::append_events(root.path(), &[evt("a", "Shot a gecko")]).unwrap();
+        handle_save_sync_event(root.path(), root.path(), &chat_roots(root.path()), &save_body()).unwrap();
+
+        // The doomed branch after the save.
+        crate::event_log::append_events(root.path(), &[evt("b", "Died horribly")]).unwrap();
+
+        let load_body = json!({ "event": "load", "gameId": "fallout-new-vegas", "saveId": "Save7" });
+        let result =
+            handle_save_sync_event(root.path(), root.path(), &chat_roots(root.path()), &load_body).unwrap();
+        assert_eq!(result["status"], "restored");
+
+        let log = fs::read_to_string(
+            root.path().join("headless").join("event-log").join("current.jsonl"),
+        )
+        .unwrap();
+        assert!(log.contains("Shot a gecko"));
+        assert!(!log.contains("Died horribly"));
     }
 
     #[test]
