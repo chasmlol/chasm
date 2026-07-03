@@ -31,3 +31,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+
+[features]
+# GPU retrieval by default (see apps/chasm/Cargo.toml).
+default = ["cuda"]
+cuda = ["chasm-web/cuda"]

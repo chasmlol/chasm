@@ -36,7 +36,7 @@ use chasm_core::{
     ActionView, ActivatedActionView, CatalogItemView, InjectedEntryView, InjectedView, MessageView,
     ParticipantView, PromptAssemblyView, PromptComponentView, ScopedCatalogView,
 };
-use chasm_embed::{search, EmbeddingCache, Retriever};
+use chasm_embed::{EmbeddingCache, Retriever};
 use chasm_st_compat::{ActionEntry, CatalogItem, LiveChatRepository, LoreEntry, QuestEntry};
 
 mod action_book_injection;
@@ -145,10 +145,16 @@ fn retrieve_ids(
     if query.trim().is_empty() || candidates.is_empty() || limit == 0 {
         return Vec::new();
     }
+    // Embed the query THROUGH the cache: its in-process memo means the same
+    // turn text is embedded once, not once per retrieval subsystem.
+    let Ok(query_vec) = ctx.cache.get_or_embed(ctx.retriever, query) else {
+        return Vec::new();
+    };
     // `top_k` bounds the rerank stage; cap the per-source contribution to `limit`.
     let top_k = ctx.top_k.max(limit);
-    match search(
+    match chasm_embed::search_with_query_vec(
         ctx.retriever,
+        &query_vec,
         query,
         candidates,
         ctx.candidates,
@@ -1164,6 +1170,31 @@ pub fn assemble_prompt_with_retrieval(
 ///   `generation-time` placeholder is shown instead, like the other
 ///   per-request inputs.
 #[allow(clippy::too_many_arguments)]
+
+/// TEMPORARY perf probe: when `CHASM_RETRIEVAL_TIMING` is set, appends
+/// "<phase>	<micros>" lines to %TEMP%/chasm-retrieval-timing.log.
+struct PhaseTimer {
+    enabled: bool,
+    last: std::time::Instant,
+}
+impl PhaseTimer {
+    fn new() -> Self {
+        Self { enabled: std::env::var_os("CHASM_RETRIEVAL_TIMING").is_some(), last: std::time::Instant::now() }
+    }
+    fn mark(&mut self, phase: &str) {
+        if !self.enabled { return; }
+        let micros = self.last.elapsed().as_micros();
+        self.last = std::time::Instant::now();
+        if let Some(dir) = std::env::var_os("TEMP") {
+            let path = std::path::Path::new(&dir).join("chasm-retrieval-timing.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                use std::io::Write as _;
+                let _ = writeln!(f, "{phase}	{micros}");
+            }
+        }
+    }
+}
+
 pub fn assemble_prompt_with_retrieval_collect(
     repo: &LiveChatRepository,
     participant: &ParticipantView,
@@ -1174,6 +1205,7 @@ pub fn assemble_prompt_with_retrieval_collect(
     ctx: Option<RetrievalCtx>,
     global_scenario: Option<&str>,
 ) -> (PromptAssemblyView, InjectedView) {
+    let mut timer = PhaseTimer::new();
     let mut notes: Vec<String> = Vec::new();
     let mut builder = Builder::new();
     let mut injected = InjectedView::default();
@@ -1276,6 +1308,7 @@ pub fn assemble_prompt_with_retrieval_collect(
     }
 
     // --- Activated lore -----------------------------------------------------
+    timer.mark("card+scenario+persona");
     let lorebooks = match card.as_ref().and_then(|card| card.world.clone()) {
         Some(world) => match repo.read_lorebook(&world) {
             Ok(Some(book)) => vec![book],
@@ -1308,6 +1341,7 @@ pub fn assemble_prompt_with_retrieval_collect(
         .collect();
 
     // Keyword/constant matches (the existing path).
+    timer.mark("lorebook_load");
     let mut keyword_ids: Vec<usize> = eligible_lore
         .iter()
         .filter(|(_, entry)| {
@@ -1322,6 +1356,7 @@ pub fn assemble_prompt_with_retrieval_collect(
         .map(|(index, _)| *index)
         .collect();
 
+    timer.mark("lore_keyword");
     // Snapshot the constant/keyword set BEFORE the vector merge so each injected
     // entry can be tagged with why it activated (constant vs keyword vs vector).
     let lore_keyword_set: std::collections::BTreeSet<usize> = keyword_ids.iter().copied().collect();
@@ -1356,6 +1391,7 @@ pub fn assemble_prompt_with_retrieval_collect(
 
     // Carry the entry index alongside each item so the recorded injected set can
     // name the activation reason; sort + truncate identically to before.
+    timer.mark("lore_semantic");
     let mut lore_items: Vec<(usize, &LoreEntry)> = keyword_ids
         .iter()
         .filter_map(|index| all_lore.get(*index).copied().map(|entry| (*index, entry)))
@@ -1400,6 +1436,7 @@ pub fn assemble_prompt_with_retrieval_collect(
     // window already shown verbatim), retrieve the entries most relevant to the
     // scan text, and emit a `Relevant past chat context:` block formatted like
     // generation.js (`formatChatVectorPrompt`: "<name|role>: <content>").
+    timer.mark("lore_format");
     let chat_block = ctx
         .as_ref()
         .filter(|ctx| ctx.chat_memory_enabled && ctx.chat_memory_limit > 0)
@@ -1466,6 +1503,7 @@ pub fn assemble_prompt_with_retrieval_collect(
     }
 
     // --- Activated Quest Book entries ---------------------------------------
+    timer.mark("chat_memory");
     let quest_books = repo.list_quest_books().unwrap_or_else(|error| {
         notes.push(format!("Quest book read failed: {error}"));
         Vec::new()
@@ -1497,6 +1535,7 @@ pub fn assemble_prompt_with_retrieval_collect(
         .map(|(index, _)| index)
         .collect();
 
+    timer.mark("action_keyword_gate");
     // Snapshot the keyword/constant set before the vector merge (reason tagging).
     let quest_keyword_set: std::collections::BTreeSet<usize> =
         quest_selected.iter().copied().collect();
@@ -1573,12 +1612,14 @@ pub fn assemble_prompt_with_retrieval_collect(
     }
 
     // --- Activated Action Book entries --------------------------------------
+    timer.mark("quest_books");
     let action_books = repo.list_action_books().unwrap_or_else(|error| {
         notes.push(format!("Action book read failed: {error}"));
         Vec::new()
     });
     // Keep each book's catalogs (with items) so scoped-catalog (spawn) actions can
     // resolve candidates → FormIDs; the flatten below would otherwise drop them.
+    timer.mark("action_book_read");
     let mut catalog_map: std::collections::HashMap<String, Vec<CatalogItem>> =
         std::collections::HashMap::new();
     let mut all_actions: Vec<ActionEntry> = Vec::new();
@@ -1616,6 +1657,7 @@ pub fn assemble_prompt_with_retrieval_collect(
     // Bias toward over-inclusion — the model can still choose not to act, but a
     // never-injected action can never be chosen.
     let action_note = if let Some(ctx) = ctx.as_ref().filter(|ctx| ctx.action_semantic_enabled) {
+        timer.mark("action_gates_pre_semantic");
         let candidates = build_candidates(
             ctx,
             all_actions
@@ -1659,6 +1701,7 @@ pub fn assemble_prompt_with_retrieval_collect(
         .collect();
     action_items.sort_by(|(_, left), (_, right)| order_desc(left.order, right.order));
     action_items.truncate(ACTION_LIMIT);
+    timer.mark("action_books+semantic");
     // Per-action spawn candidate names (action_id -> ["Deathclaw", ...]), rendered
     // in the prompt so the model picks a valid entity. Built from the same resolved
     // catalogs relayed to the helper.
@@ -1862,6 +1905,7 @@ pub fn assemble_prompt_with_retrieval_collect(
         components: builder.components,
         notes,
     };
+    timer.mark("spawn_catalogs+format");
     (view, injected)
 }
 

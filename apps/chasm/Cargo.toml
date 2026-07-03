@@ -15,3 +15,10 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+
+[features]
+# GPU retrieval by default: the settings' execution="gpu" silently degraded to
+# CPU without this (measured 0.35-0.6s of CPU ONNX inference per turn; ~40ms
+# on CUDA). ort falls back to CPU at session build when no usable GPU exists.
+default = ["cuda"]
+cuda = ["chasm-embed/cuda", "chasm-web/cuda"]

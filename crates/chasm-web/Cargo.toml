@@ -37,3 +37,9 @@ tokio = { workspace = true, features = ["sync"] }
 tower-http.workspace = true
 tracing.workspace = true
 urlencoding.workspace = true
+
+[features]
+default = []
+# GPU (CUDA EP) retrieval for the ONNX embed/rerank models; safe runtime
+# fallback to CPU when the GPU/driver is unusable.
+cuda = ["chasm-embed/cuda"]

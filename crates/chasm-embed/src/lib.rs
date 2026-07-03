@@ -528,12 +528,29 @@ pub fn search(
     top_k: usize,
     min_score: f32,
 ) -> Result<Vec<(String, f32)>> {
+    let query_vec = retriever.embed(query)?;
+    search_with_query_vec(retriever, &query_vec, query, candidates, top_n, top_k, min_score)
+}
+
+/// [`search`] with a PRECOMPUTED query vector. Every retrieval subsystem (lore,
+/// chat memory, quests, actions) queries with the same turn text; embedding it
+/// once per turn instead of once per subsystem removes 3-4 CPU ONNX inferences
+/// from every prompt assembly.
+pub fn search_with_query_vec(
+    retriever: &Retriever,
+    query_vec: &[f32],
+    query: &str,
+    candidates: &[(String, Vec<f32>, String)],
+    top_n: usize,
+    top_k: usize,
+    min_score: f32,
+) -> Result<Vec<(String, f32)>> {
     if candidates.is_empty() || top_n == 0 || top_k == 0 {
         return Ok(Vec::new());
     }
 
     // Stage 1: cosine recall.
-    let query_vec = retriever.embed(query)?;
+    let query_vec = query_vec.to_vec();
     let mut scored: Vec<(usize, f32)> = candidates
         .iter()
         .enumerate()
@@ -587,13 +604,17 @@ pub fn search(
 // Persistent embedding cache
 // ---------------------------------------------------------------------------
 
-/// Directory-backed embedding cache. Vectors are stored as JSON files named by
-/// `sha256(model_id + text)`, so the same content embeds exactly once and the
-/// cache survives restarts. Keying on the model id means switching models won't
-/// return stale vectors.
+/// Directory-backed embedding cache with an in-process memory layer. Vectors
+/// are stored as JSON files named by `sha256(model_id + text)`, so the same
+/// content embeds exactly once and the cache survives restarts; hot vectors are
+/// additionally memoized in RAM, because re-reading hundreds of small vector
+/// files per TURN (lore candidates + chat-memory history) measured ~0.35s of
+/// prompt-assembly time on Windows. Keying on the model id means switching
+/// models won't return stale vectors.
 #[derive(Clone)]
 pub struct EmbeddingCache {
     dir: PathBuf,
+    memory: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<f32>>>>>,
 }
 
 impl EmbeddingCache {
@@ -602,26 +623,46 @@ impl EmbeddingCache {
         let dir = dir.into();
         fs::create_dir_all(&dir)
             .with_context(|| format!("creating embedding cache dir {}", dir.display()))?;
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            memory: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+        })
+    }
+
+    /// Memoizes `vec` under `key` (best-effort: a poisoned lock skips the memo).
+    fn remember(&self, key: &str, vec: &std::sync::Arc<Vec<f32>>) {
+        if let Ok(mut memory) = self.memory.lock() {
+            memory.insert(key.to_string(), std::sync::Arc::clone(vec));
+        }
     }
 
     /// Returns the cached vector for `text` (keyed by `sha256(model_id + text)`),
-    /// embedding and storing it on a miss.
+    /// checking RAM first, then disk, embedding and storing on a full miss.
     pub fn get_or_embed(&self, retriever: &Retriever, text: &str) -> Result<Vec<f32>> {
         let key = cache_key(retriever.model_id(), text);
+        if let Ok(memory) = self.memory.lock() {
+            if let Some(vec) = memory.get(&key) {
+                return Ok(vec.as_ref().clone());
+            }
+        }
         let path = self.dir.join(format!("{key}.json"));
         if let Ok(bytes) = fs::read(&path) {
             if let Ok(vec) = serde_json::from_slice::<Vec<f32>>(&bytes) {
-                return Ok(vec);
+                let vec = std::sync::Arc::new(vec);
+                self.remember(&key, &vec);
+                return Ok(vec.as_ref().clone());
             }
             // Corrupt entry: fall through and re-embed/overwrite.
         }
-        let vec = retriever.embed(text)?;
-        if let Ok(json) = serde_json::to_vec(&vec) {
+        let vec = std::sync::Arc::new(retriever.embed(text)?);
+        if let Ok(json) = serde_json::to_vec(vec.as_ref()) {
             // Best-effort write; a failed cache write must not fail the call.
             let _ = fs::write(&path, json);
         }
-        Ok(vec)
+        self.remember(&key, &vec);
+        Ok(vec.as_ref().clone())
     }
 
     /// Pre-warms the cache for `texts`, embedding only the misses in batches.

@@ -277,7 +277,7 @@ pub async fn generate_stream_core(
         // One streamed turn per selected speaker, in order. Each turn is
         // persisted before the next so later speakers see earlier lines.
         for speaker in &speakers {
-            let plan = match prepare_speaker_turn(&state, &ctx, speaker) {
+            let plan = match prepare_speaker_turn_traced(&state, &ctx, speaker, trace_id.as_deref()) {
                 Ok(plan) => plan,
                 Err(error) => {
                     yield ndjson(&json!({
@@ -293,9 +293,15 @@ pub async fn generate_stream_core(
             yield ndjson(&json!({ "type": "speaker.start", "speaker": plan.speaker }));
 
             // Collect the model output; `collected` keeps the full raw output
-            // for finalize_turn, which re-parses it. Speech is emitted as one
-            // delta after the loop (qwen3-tts streams the audio itself).
+            // for finalize_turn, which re-parses it. LLM -> TTS streaming at
+            // SENTENCE granularity: each completed sentence is emitted as its
+            // own speech.delta the moment it exists, so the bridge synthesizes
+            // sentence 1 while the model is still writing sentence 2 — first
+            // audio no longer scales with reply length. Sentences (not raw
+            // tokens or char counts) are the smallest unit qwen3-tts can speak
+            // with natural prosody.
             let mut collected = String::new();
+            let mut spoken_len: usize = 0;
             let response_format = plan.structured.then(crate::llm::structured_response_format);
             match crate::llm::chat_completion_stream(&endpoint, &plan.chat_messages, response_format.as_ref(), trace_id.as_deref(), sampling)
                 .await
@@ -308,6 +314,18 @@ pub async fn generate_stream_core(
                                     continue;
                                 }
                                 collected.push_str(&token);
+                                let speech = extracted_speech(plan.structured, &collected);
+                                while let Some(end) = next_sentence_end(&speech, spoken_len) {
+                                    let segment = speech[spoken_len..end].trim();
+                                    if !segment.is_empty() {
+                                        yield ndjson(&json!({
+                                            "type": "speech.delta",
+                                            "text": segment,
+                                            "speaker": plan.speaker,
+                                        }));
+                                    }
+                                    spoken_len = end;
+                                }
                             }
                             Err(error) => {
                                 yield ndjson(&json!({
@@ -328,10 +346,10 @@ pub async fn generate_stream_core(
                 }
             }
 
-            // The WHOLE line as one speech delta; faster-qwen3-tts streams the
-            // audio out as it synthesizes, so playback still starts promptly.
+            // The remainder (final sentence / anything after the last completed
+            // sentence boundary) as the closing delta.
             let full = extracted_speech(plan.structured, &collected);
-            let rest = full.as_str();
+            let rest = full.get(spoken_len.min(full.len())..).unwrap_or("").trim_start();
             if !rest.is_empty() {
                 yield ndjson(&json!({
                     "type": "speech.delta",
@@ -822,6 +840,15 @@ fn prepare_speaker_turn(
     ctx: &TurnContext,
     speaker: &orchestrator::SelectedSpeaker,
 ) -> WebResult<TurnPlan> {
+    prepare_speaker_turn_traced(state, ctx, speaker, None)
+}
+
+fn prepare_speaker_turn_traced(
+    state: &Arc<AppState>,
+    ctx: &TurnContext,
+    speaker: &orchestrator::SelectedSpeaker,
+    trace_id: Option<&str>,
+) -> WebResult<TurnPlan> {
     let speaker_participant_id = speaker.participant.participant_id.clone();
     let speaker_character_id = if speaker.participant.character_id.is_empty() {
         None
@@ -889,6 +916,7 @@ fn prepare_speaker_turn(
         &ctx.scenario_macros,
         &other_npc_names(&ctx.live_chat, &speaker_participant_id),
     );
+    trace_generate_stage(trace_id, "gen_assemble_enter");
     let (assembled, injected) = chasm_prompt::assemble_prompt_with_retrieval_collect(
         &state.repository,
         &speaker_view,
@@ -899,6 +927,7 @@ fn prepare_speaker_turn(
         retrieval_ctx,
         Some(""),
     );
+    trace_generate_stage(trace_id, "gen_assemble_done");
 
     let scene_roster = build_scene_roster(state, ctx, &speaker_participant_id, &speaker_name);
     let chat_messages = build_chat_messages(
@@ -1225,6 +1254,72 @@ fn build_chat_messages(
     }
 
     messages
+}
+
+/// Finds the byte index just past the next COMPLETE sentence in `speech`,
+/// starting the scan at `from`. A sentence is complete when a terminator
+/// (`.` `!` `?` `…`, plus any closing quotes/parens) is followed by whitespace
+/// and at least one more non-whitespace character — i.e. the next sentence has
+/// visibly started. The final sentence therefore never matches (the remainder
+/// path emits it), and mid-number periods ("2.5") never match. Common honorific
+/// abbreviations ("Mr. House") and single-letter initials are guarded.
+fn next_sentence_end(speech: &str, from: usize) -> Option<usize> {
+    const CLOSERS: [char; 5] = ['"', '\'', ')', '\u{201d}', '\u{2019}'];
+    const ABBREVIATIONS: [&str; 14] = [
+        "mr", "mrs", "ms", "dr", "st", "lt", "sgt", "col", "gen", "capt", "prof", "jr", "sr", "vs",
+    ];
+    let tail = speech.get(from..)?;
+    let mut chars = tail.char_indices().peekable();
+    while let Some((offset, ch)) = chars.next() {
+        if !matches!(ch, '.' | '!' | '?' | '\u{2026}') {
+            continue;
+        }
+        // Absorb runs of terminators ("?!", "...") and trailing closers.
+        let mut end = offset + ch.len_utf8();
+        while let Some(&(next_offset, next_ch)) = chars.peek() {
+            if matches!(next_ch, '.' | '!' | '?' | '\u{2026}') || CLOSERS.contains(&next_ch) {
+                end = next_offset + next_ch.len_utf8();
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        // Confirmed complete only when whitespace + a following word exist.
+        let after = &tail[end..];
+        let mut after_chars = after.chars();
+        let Some(first_after) = after_chars.next() else {
+            return None; // end of text: leave it for the remainder delta
+        };
+        if !first_after.is_whitespace() {
+            continue; // "2.5", "e.g", mid-token punctuation
+        }
+        match after.trim_start().chars().next() {
+            None => return None,
+            // A real sentence start is capitalized (or a digit/quote); a
+            // lowercase continuation means the terminator was mid-sentence
+            // (quoted speech like «"Well..." she said»).
+            Some(next_start) if next_start.is_lowercase() => continue,
+            Some(_) => {}
+        }
+        if ch == '.' {
+            // Abbreviation guard: the word directly before the period.
+            let before = &tail[..offset];
+            let word: String = before
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric())
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            let lower = word.to_lowercase();
+            if ABBREVIATIONS.contains(&lower.as_str()) || (word.len() == 1 && word.chars().all(|c| c.is_uppercase())) {
+                continue;
+            }
+        }
+        return Some(from + end);
+    }
+    None
 }
 
 /// Per-speaker response instruction, mirroring the Node `responseInstructions`.
@@ -2833,6 +2928,32 @@ mod tests {
         // 1-on-1: no other NPCs.
         let solo = group_chat(&[("npc-pete", "Easy Pete")]);
         assert!(other_npc_names(&solo, "npc-pete").is_empty());
+    }
+
+    #[test]
+    fn sentence_boundaries_stream_correctly() {
+        // Basic: two complete sentences, third unfinished.
+        let s = "Howdy there. Watch the geckos! And also";
+        let first = next_sentence_end(s, 0).unwrap();
+        assert_eq!(s[..first].trim(), "Howdy there.");
+        let second = next_sentence_end(s, first).unwrap();
+        assert_eq!(s[first..second].trim(), "Watch the geckos!");
+        assert_eq!(next_sentence_end(s, second), None, "unfinished tail waits");
+
+        // The final sentence never fires mid-stream (remainder path owns it).
+        assert_eq!(next_sentence_end("One sentence only.", 0), None);
+
+        // Abbreviations and initials do not split.
+        let s = "Mr. House runs the Strip. Ask J. Smith later.";
+        let first = next_sentence_end(s, 0).unwrap();
+        assert_eq!(s[..first].trim(), "Mr. House runs the Strip.");
+        assert_eq!(next_sentence_end(s, first), None);
+
+        // Decimals do not split; ellipses + quotes absorb into the boundary.
+        assert_eq!(next_sentence_end("It costs 2.5 caps total", 0), None);
+        let s = "\"Well...\" she said. More text";
+        let first = next_sentence_end(s, 0).unwrap();
+        assert!(s[..first].ends_with("said."));
     }
 
     #[test]
