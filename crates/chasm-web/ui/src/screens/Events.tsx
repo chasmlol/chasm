@@ -14,6 +14,7 @@ import { EmptyState, Field, PageBody, PageHeader } from "@/components/ui/page";
 /** Canonical chip ordering; unknown types are appended after these. */
 const EVENT_TYPE_ORDER = [
   "combat",
+  "shooting",
   "death",
   "location",
   "item",
@@ -33,6 +34,8 @@ const MUTED_BADGE =
 const TYPE_BADGE: Record<string, string> = {
   combat:
     "border-[var(--color-danger)]/40 bg-[var(--color-danger)]/10 text-[var(--color-danger)]",
+  shooting:
+    "border-[var(--color-danger)]/30 bg-[var(--color-danger)]/5 text-[var(--color-danger)]",
   death:
     "border-[var(--color-danger)]/40 bg-[var(--color-danger)]/10 text-[var(--color-danger)]",
   location:
