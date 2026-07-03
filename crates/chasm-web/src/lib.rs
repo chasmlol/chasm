@@ -3510,6 +3510,61 @@ struct AppVersionResponse {
     download_url: Option<String>,
     /// The release page URL, or `null`.
     release_url: Option<String>,
+    /// `"nightly"` when the commit-based nightly comparison drove the result,
+    /// `"release"` when the semver fallback did (local/dev builds).
+    channel: String,
+    /// Short commit this build was made from (CI stamps it), or `null` for
+    /// local builds.
+    current_commit: Option<String>,
+    /// Short commit the rolling `nightly` tag currently points at, or `null`.
+    latest_commit: Option<String>,
+}
+
+/// Commit the running binary was built from — stamped by the nightly CI
+/// workflow (`CHASM_BUILD_COMMIT: ${{ github.sha }}`); `None` for local builds.
+const BUILD_COMMIT: Option<&str> = option_env!("CHASM_BUILD_COMMIT");
+
+/// Short (7-char) form of a commit sha.
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
+}
+
+/// The commit sha the `nightly` tag points at, via the git ref API (the
+/// workflow force-pushes the lightweight tag to the exact commit it built).
+async fn fetch_nightly_commit() -> Option<String> {
+    let resp = crate::llm::http_client()
+        .get("https://api.github.com/repos/chasmlol/chasm/git/ref/tags/nightly")
+        .header("User-Agent", "chasm")
+        .header("Accept", "application/vnd.github+json")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body.get("object")?
+        .get("sha")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// A release fetched by exact tag (used for `nightly` on both repos).
+async fn fetch_release_by_tag(repo: &str, tag: &str) -> Option<GithubRelease> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
+    let resp = crate::llm::http_client()
+        .get(&url)
+        .header("User-Agent", "chasm")
+        .header("Accept", "application/vnd.github+json")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<GithubRelease>().await.ok()
 }
 
 /// The subset of the GitHub "latest release" JSON we care about.
@@ -3533,6 +3588,41 @@ struct GithubAsset {
 async fn app_version() -> Json<AppVersionResponse> {
     let current = env!("CARGO_PKG_VERSION").to_string();
 
+    // NIGHTLY channel (CI builds): this build carries the commit it was built
+    // from; a new nightly exists whenever the rolling tag points elsewhere.
+    // Version numbers can't drive this — every nightly reports the same
+    // CARGO_PKG_VERSION.
+    if let Some(build_commit) = BUILD_COMMIT.filter(|c| !c.is_empty()) {
+        let nightly_sha = fetch_nightly_commit().await;
+        let nightly_release = fetch_release_by_tag("chasmlol/chasm", "nightly").await;
+        let (download_url, release_url) = match nightly_release {
+            Some(release) => (
+                release
+                    .assets
+                    .into_iter()
+                    .find(|a| a.name.to_ascii_lowercase().ends_with(".exe"))
+                    .map(|a| a.browser_download_url),
+                release.html_url,
+            ),
+            None => (None, None),
+        };
+        let current_short = short_sha(build_commit);
+        let latest_short = nightly_sha.as_deref().map(short_sha);
+        let update_available = matches!(&latest_short, Some(latest) if *latest != current_short);
+        return Json(AppVersionResponse {
+            current,
+            latest: latest_short.as_ref().map(|s| format!("nightly ({s})")),
+            update_available,
+            download_url,
+            release_url,
+            channel: "nightly".to_string(),
+            current_commit: Some(current_short),
+            latest_commit: latest_short,
+        });
+    }
+
+    // RELEASE fallback (local/dev builds without a stamped commit): highest
+    // semver-tagged release vs the running version.
     let fetched = fetch_latest_release().await;
     let (latest, download_url, release_url) = match fetched {
         Some(release) => {
@@ -3563,6 +3653,9 @@ async fn app_version() -> Json<AppVersionResponse> {
         update_available,
         download_url,
         release_url,
+        channel: "release".to_string(),
+        current_commit: None,
+        latest_commit: None,
     })
 }
 
@@ -3610,6 +3703,20 @@ fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
+/// Whether a process with the given image name is running (Windows tasklist).
+#[cfg(windows)]
+fn process_running(image: &str) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {image}"), "/NH", "/FO", "CSV"])
+        .output()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .to_ascii_lowercase()
+                .contains(&image.to_ascii_lowercase())
+        })
+        .unwrap_or(false)
+}
+
 /// `POST /api/app/update/install` — one-click self-update. Downloads the latest
 /// release's installer `.exe` to the temp dir, then spawns a DETACHED helper that
 /// (after a short grace so this HTTP response flushes) closes the running app,
@@ -3623,7 +3730,22 @@ async fn app_update_install() -> Json<serde_json::Value> {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    let Some(release) = fetch_latest_release().await else {
+    // The update also swaps the bridge mod DLL, which the game holds locked.
+    // Refuse up front instead of silently failing (or killing a live game).
+    if process_running("FalloutNV.exe") {
+        return Json(serde_json::json!({
+            "started": false,
+            "error": "Fallout: New Vegas is running — close the game first (the update replaces the bridge mod)."
+        }));
+    }
+
+    // Prefer the rolling nightly build; fall back to the newest versioned
+    // release for installs that predate the nightly pipeline.
+    let release = match fetch_release_by_tag("chasmlol/chasm", "nightly").await {
+        Some(r) => Some(r),
+        None => fetch_latest_release().await,
+    };
+    let Some(release) = release else {
         return Json(serde_json::json!({"started": false, "error": "could not reach GitHub"}));
     };
     let Some(url) = release
@@ -3668,15 +3790,70 @@ async fn app_update_install() -> Json<serde_json::Value> {
         );
     }
 
+    // Bridge mod: download the nightly NVBridge zip too, so one click updates
+    // the app AND the game mod. Only when an MO2 NVBridge mod folder exists —
+    // users without the game setup still get the app update.
+    let mo2_mod_dir = std::env::var_os("LOCALAPPDATA").map(|base| {
+        std::path::Path::new(&base)
+            .join("ModOrganizer")
+            .join("New Vegas")
+            .join("mods")
+            .join("NVBridge")
+    });
+    let mut bridge_step = String::new();
+    let mut bridge_planned = false;
+    if let Some(mo2_dir) = mo2_mod_dir.filter(|d| d.is_dir()) {
+        let bridge_zip_url = fetch_release_by_tag("chasmlol/chasm-bridge-fnv", "nightly")
+            .await
+            .and_then(|r| {
+                r.assets
+                    .into_iter()
+                    .find(|a| a.name.to_ascii_lowercase().ends_with(".zip"))
+                    .map(|a| a.browser_download_url)
+            });
+        if let Some(zip_url) = bridge_zip_url {
+            let zip_path = std::env::temp_dir().join("chasm-update-nvbridge.zip");
+            let downloaded = match crate::llm::http_client()
+                .get(&zip_url)
+                .header("User-Agent", "chasm")
+                .timeout(std::time::Duration::from_secs(600))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => match r.bytes().await {
+                    Ok(b) => std::fs::write(&zip_path, &b).is_ok(),
+                    Err(_) => false,
+                },
+                _ => false,
+            };
+            if downloaded {
+                // Expand to temp then copy over the MO2 mod: Expand-Archive
+                // (always present) + robocopy /E (overwrite, keep extra user
+                // files like generated facegen). Exit code quirk: robocopy
+                // returns 1 on success, so mask it with `& exit /b 0` style.
+                let staging = std::env::temp_dir().join("chasm-update-nvbridge");
+                bridge_step = format!(
+                    "powershell -NoProfile -Command \"Remove-Item -Recurse -Force '{staging}' -ErrorAction SilentlyContinue; Expand-Archive -Force '{zip}' '{staging}'\" >nul 2>&1\r\n\
+                     robocopy \"{staging}\\NVBridge\" \"{dst}\" /E /NFL /NDL /NJH /NJS >nul 2>&1\r\n",
+                    staging = staging.display(),
+                    zip = zip_path.display(),
+                    dst = mo2_dir.display(),
+                );
+                bridge_planned = true;
+            }
+        }
+    }
+
     // Write a detached updater .bat: wait for this response to flush, close the
-    // running app so its exe isn't locked, silently install, then relaunch the
-    // (now-updated) exe in place.
+    // running app so its exe isn't locked, update the bridge mod in MO2, then
+    // silently install and relaunch the (now-updated) exe in place.
     let current_exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let bat = std::env::temp_dir().join("chasm-update.bat");
     let script = format!(
-        "@echo off\r\ntimeout /t 2 /nobreak >nul\r\ntaskkill /IM chasm-desktop.exe /F >nul 2>&1\r\n\"{}\" /S\r\nstart \"\" \"{}\"\r\n",
+        "@echo off\r\ntimeout /t 2 /nobreak >nul\r\ntaskkill /IM chasm-desktop.exe /F >nul 2>&1\r\n{}\"{}\" /S\r\nstart \"\" \"{}\"\r\n",
+        bridge_step,
         installer.display(),
         current_exe
     );
@@ -3691,7 +3868,7 @@ async fn app_update_install() -> Json<serde_json::Value> {
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
         .spawn()
     {
-        Ok(_) => Json(serde_json::json!({"started": true})),
+        Ok(_) => Json(serde_json::json!({"started": true, "bridge_update": bridge_planned})),
         Err(e) => Json(
             serde_json::json!({"started": false, "error": format!("could not start updater: {e}")}),
         ),

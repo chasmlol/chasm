@@ -49,7 +49,9 @@ export function Updates() {
             <div className="min-w-0">
               <p className="text-sm font-medium">Current version</p>
               <p className="mt-0.5 font-mono text-[13px] text-[var(--muted-foreground)]">
-                {data ? `v${data.current}` : "…"}
+                {data
+                  ? `v${data.current}${data.current_commit ? ` (${data.current_commit})` : ""}`
+                  : "…"}
               </p>
             </div>
             <Button
@@ -77,20 +79,26 @@ export function Updates() {
             <div className="flex flex-col gap-3 rounded-lg border border-[var(--color-npc)]/40 bg-[var(--color-npc)]/5 p-4">
               <div className="flex items-center gap-2 text-sm font-medium text-[var(--color-npc)]">
                 <Download className="size-4" />
-                Update available: v{data.latest}
+                Update available:{" "}
+                {data.channel === "nightly" ? data.latest : `v${data.latest}`}
               </div>
 
               {started ? (
                 <p className="text-[13px] text-[var(--muted-foreground)]">
-                  Downloading and installing v{data.latest}… chasm will close and
-                  reopen on its own in a moment. If it doesn’t reopen, launch chasm
+                  Downloading and installing{" "}
+                  {data.channel === "nightly" ? data.latest : `v${data.latest}`}…
+                  {install.data?.bridge_update
+                    ? " The NVBridge mod in MO2 is being updated too."
+                    : ""}{" "}
+                  chasm will close and reopen on its own in a moment. If it doesn’t reopen, launch chasm
                   again from your Start menu.
                 </p>
               ) : (
                 <>
                   <p className="text-[13px] text-[var(--muted-foreground)]">
                     chasm will download the update, install it, and restart
-                    automatically.
+                    automatically. The NVBridge game mod in MO2 is updated in the
+                    same step — close Fallout: New Vegas before updating.
                   </p>
                   <div>
                     <Button

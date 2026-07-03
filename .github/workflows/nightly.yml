@@ -43,6 +43,10 @@ jobs:
 
       - name: Build installer (tauri + NSIS)
         working-directory: apps/chasm-desktop
+        env:
+          # Stamped into the binary (option_env!) so the in-app updater can
+          # compare its own commit against the rolling nightly tag.
+          CHASM_BUILD_COMMIT: ${{ github.sha }}
         run: npx --yes @tauri-apps/cli@^2 build
 
       - name: Collect installer

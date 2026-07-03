@@ -80,12 +80,18 @@ export interface AppVersion {
   update_available: boolean;
   download_url: string | null;
   release_url: string | null;
+  /** "nightly" (commit-tracked CI build) or "release" (semver fallback). */
+  channel: "nightly" | "release" | string;
+  current_commit: string | null;
+  latest_commit: string | null;
 }
 
 /** Mirrors `POST /api/app/update/install` — the one-click self-update trigger. */
 export interface AppUpdateResult {
   started: boolean;
   error?: string;
+  /** Whether the updater will also refresh the NVBridge mod in MO2. */
+  bridge_update?: boolean;
 }
 
 /** Mirrors `GET /connection/status`. */
