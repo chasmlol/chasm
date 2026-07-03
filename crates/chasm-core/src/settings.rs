@@ -24,6 +24,9 @@ pub struct AppSettings {
     pub tts: TtsSettings,
     pub stt: SttSettings,
     pub retrieval: RetrievalSettings,
+    /// Managed local-runtime selection (the Runtimes settings page). Serde
+    /// default so older settings files keep loading (empty → koboldcpp).
+    pub runtime: RuntimeSettings,
     /// Game launcher (Mod Organizer 2 + headless FNV launch) overrides.
     pub launcher: LauncherSettings,
     /// Per-request tracing (the Tracing settings page).
@@ -44,6 +47,7 @@ impl Default for AppSettings {
             tts: TtsSettings::default(),
             stt: SttSettings::default(),
             retrieval: RetrievalSettings::default(),
+            runtime: RuntimeSettings::default(),
             launcher: LauncherSettings::default(),
             tracing: TracingSettings::default(),
             interface: InterfaceSettings::default(),
@@ -198,6 +202,48 @@ pub struct LauncherSettings {
     /// downloads via this key require a Nexus **Premium** account — free keys can
     /// authenticate the API but not generate direct download links.
     pub nexus_api_key: String,
+}
+
+/// Managed local-runtime selection (the Settings → Runtimes screen). Separate
+/// from [`LlmSettings`] (which picks the MODEL) so the runtime that serves the
+/// model can change independently.
+///
+/// `#[serde(default)]` + an empty-string default so older settings files (no
+/// `runtime` key) load fine and keep behaving exactly as before (empty
+/// normalizes to koboldcpp — the historical runtime).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimeSettings {
+    /// Selected managed LLM runtime value (matches [`LLM_RUNTIMES`]):
+    /// `"koboldcpp"` (default) or `"llamacpp"`. Empty/unknown → koboldcpp.
+    pub llm_runtime: String,
+}
+
+/// The default managed LLM runtime — koboldcpp, which also hosts Whisper STT.
+pub const LLM_RUNTIME_DEFAULT: &str = "koboldcpp";
+
+/// The llama.cpp runtime value: `llama-server` serving the same OpenAI-compatible
+/// chat API on the same port, with MULTIPLE prompt-cache slots (`--parallel`) so
+/// group-scene speaker swaps keep per-speaker KV caches instead of paying a full
+/// prompt reprocess on every swap (koboldcpp has a single KV slot). llama-server
+/// has NO Whisper: with this runtime, voice input needs the Parakeet STT provider.
+pub const LLM_RUNTIME_LLAMACPP: &str = "llamacpp";
+
+/// Available managed LLM runtimes (value, label).
+pub const LLM_RUNTIMES: &[(&str, &str)] = &[
+    (LLM_RUNTIME_DEFAULT, "KoboldCpp"),
+    (LLM_RUNTIME_LLAMACPP, "llama.cpp (llama-server)"),
+];
+
+/// Normalizes a saved/posted LLM runtime to a known value, defaulting to
+/// koboldcpp for empty/unknown values (so existing installs are unaffected).
+pub fn normalize_llm_runtime(runtime: &str) -> String {
+    let candidate = runtime.trim();
+    if LLM_RUNTIMES.iter().any(|(value, _)| *value == candidate) {
+        candidate.to_string()
+    } else {
+        LLM_RUNTIME_DEFAULT.to_string()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -817,8 +863,9 @@ const DEFAULT_MAX_TAGS_PER_REPLY: u8 = 2;
 // STT reference data
 // ---------------------------------------------------------------------------
 
-/// The only STT provider value wired up: the local koboldcpp Whisper server
-/// (OpenAI-compatible `/v1/audio/transcriptions`).
+/// The default STT provider: the local koboldcpp Whisper server
+/// (OpenAI-compatible `/v1/audio/transcriptions`). Nothing changes for an
+/// existing install unless the user explicitly selects Parakeet.
 pub const STT_DEFAULT_PROVIDER: &str = "whisper";
 
 /// Default Whisper transcription model — the GGML `.bin` filename koboldcpp
@@ -827,12 +874,37 @@ pub const STT_DEFAULT_PROVIDER: &str = "whisper";
 /// the two in sync. Matches the current `whisper-small-q5_1.bin` build.
 pub const STT_WHISPER_DEFAULT_MODEL: &str = WHISPER_MODELS[2].file; // small (q5_1)
 
-/// Available STT providers (value, label). Single entry: the local koboldcpp
-/// Whisper server (the Parakeet server is gone).
-pub const STT_PROVIDERS: &[(&str, &str)] = &[("whisper", "Whisper (koboldcpp, local)")];
+/// The Parakeet STT provider value — a dedicated local ASR server (NVIDIA
+/// Parakeet TDT 0.6B v3 via nano-parakeet on CUDA) serving the same
+/// OpenAI-compatible `/v1/audio/transcriptions` on its own port, so voice input
+/// never queues behind an LLM generation in koboldcpp's single slot.
+pub const STT_PARAKEET_PROVIDER: &str = "parakeet";
 
-/// Normalizes a saved/posted STT provider to a known value, defaulting to
-/// Whisper for empty/unknown values (e.g. legacy `parakeet`/`sillytavern`).
+/// The HuggingFace repo the Parakeet server loads (nano-parakeet downloads the
+/// `.nemo` from here into the HF cache on install/first run).
+pub const PARAKEET_HF_REPO: &str = "nvidia/parakeet-tdt-0.6b-v3";
+
+/// The engine id of the Parakeet server's managed venv under `engines/<id>`
+/// (mirrors the TTS engines' `engines/pockettts` / `engines/faster-qwen3-tts`).
+pub const PARAKEET_ENGINE_ID: &str = "parakeet";
+
+/// The picker id of the Parakeet card on the STT settings screen (listed below
+/// the Whisper models).
+pub const STT_PARAKEET_PICKER_ID: &str = "parakeet";
+
+/// Available STT providers (value, label): the local koboldcpp Whisper server
+/// (default) and the dedicated local Parakeet server.
+pub const STT_PROVIDERS: &[(&str, &str)] = &[
+    ("whisper", "Whisper (koboldcpp, local)"),
+    (
+        STT_PARAKEET_PROVIDER,
+        "Parakeet TDT 0.6B v3 (dedicated local server)",
+    ),
+];
+
+/// Normalizes a saved/posted STT provider to a known value (`whisper` /
+/// `parakeet`), defaulting to Whisper for empty/unknown values (e.g. legacy
+/// `sillytavern`).
 pub fn normalize_stt_provider(provider: &str) -> String {
     let candidate = provider.trim();
     if STT_PROVIDERS.iter().any(|(value, _)| *value == candidate) {
@@ -2944,14 +3016,29 @@ mod tests {
         // No default model for a public release — the user must pick one.
         assert_eq!(stt.model, "");
         let view = stt_panel_view(&stt, Vec::new(), RetrievalHostView::default());
-        assert_eq!(view.providers.len(), 1);
-        assert!(view.providers[0].selected);
+        assert_eq!(view.providers.len(), 2);
+        assert!(view.providers[0].selected); // whisper is the default
+        assert!(!view.providers[1].selected);
         // No model selected by default.
         assert_eq!(view.model, "");
-        // Legacy provider values (parakeet/sillytavern) normalize to whisper.
-        assert_eq!(normalize_stt_provider("parakeet"), "whisper");
+        // Parakeet is a real provider now; unknown/legacy values still → whisper.
+        assert_eq!(normalize_stt_provider("parakeet"), "parakeet");
         assert_eq!(normalize_stt_provider("sillytavern"), "whisper");
         assert_eq!(normalize_stt_provider("whisper"), "whisper");
+        assert_eq!(normalize_stt_provider(""), "whisper");
+    }
+
+    #[test]
+    fn llm_runtime_normalizes_with_kobold_default() {
+        // Empty/unknown (incl. every pre-Runtimes settings file) → koboldcpp.
+        assert_eq!(normalize_llm_runtime(""), "koboldcpp");
+        assert_eq!(normalize_llm_runtime("  "), "koboldcpp");
+        assert_eq!(normalize_llm_runtime("nonsense"), "koboldcpp");
+        assert_eq!(normalize_llm_runtime("koboldcpp"), "koboldcpp");
+        assert_eq!(normalize_llm_runtime("llamacpp"), "llamacpp");
+        // An old settings JSON with no `runtime` key deserializes to the default.
+        let old: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(normalize_llm_runtime(&old.runtime.llm_runtime), "koboldcpp");
     }
 
     #[test]

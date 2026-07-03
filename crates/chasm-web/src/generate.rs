@@ -3247,6 +3247,7 @@ mod tests {
             voices_dir: root.join("voices"),
             llm_models_dir: root.join("models-llm"),
             stt_endpoint: "http://127.0.0.1:9/v1/audio/transcriptions".into(),
+            parakeet_stt_endpoint: "http://127.0.0.1:9/v1/audio/transcriptions".into(),
             llm_endpoint: "http://127.0.0.1:9".into(),
             tts_endpoint: "http://127.0.0.1:9".into(),
         };

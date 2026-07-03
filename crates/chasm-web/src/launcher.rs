@@ -359,6 +359,155 @@ fn build_pockettts_spec(state: &Arc<AppState>, port: u16) -> Option<RuntimeSpec>
     })
 }
 
+// ---------------------------------------------------------------------------
+// Parakeet STT engine (dedicated OpenAI-compatible ASR server on its own port)
+// ---------------------------------------------------------------------------
+
+/// Whether the Parakeet STT engine is installed: the chasm-managed
+/// `engines/parakeet` venv python + `scripts/parakeet_stt_server.py` both exist
+/// (the same install shape as the TTS engines). Cheap fs checks, safe per request.
+pub(crate) fn parakeet_installed(config: &chasm_core::AppConfig) -> bool {
+    let python = config
+        .engines_dir
+        .join(chasm_core::PARAKEET_ENGINE_ID)
+        .join(".venv")
+        .join("Scripts")
+        .join("python.exe");
+    let script = config
+        .workspace_root
+        .join("scripts")
+        .join("parakeet_stt_server.py");
+    python.exists() && script.exists()
+}
+
+/// Whether the effective STT path is the Parakeet server: the provider is
+/// selected AND the engine is installed. When Parakeet is selected but not
+/// installed, everything (endpoint, spawn, whisper attach) falls back to the
+/// koboldcpp Whisper path so voice input never silently dies.
+pub(crate) fn stt_uses_parakeet(
+    settings: &AppSettings,
+    config: &chasm_core::AppConfig,
+) -> bool {
+    chasm_core::normalize_stt_provider(&settings.stt.provider)
+        == chasm_core::STT_PARAKEET_PROVIDER
+        && parakeet_installed(config)
+}
+
+/// The Parakeet server's reachability authority (`host:port`), from the
+/// configured transcription endpoint (default `127.0.0.1:5003`).
+fn parakeet_addr(config: &chasm_core::AppConfig) -> String {
+    authority_from_url(&config.parakeet_stt_endpoint)
+        .unwrap_or_else(|| "127.0.0.1:5003".to_string())
+}
+
+/// Whether the Parakeet STT server is reachable right now (for the stack lights).
+pub(crate) fn parakeet_running(state: &Arc<AppState>) -> bool {
+    tcp_reachable(&parakeet_addr(&state.config))
+}
+
+/// Builds the Parakeet STT [`RuntimeSpec`]: the `engines/parakeet` venv python
+/// running `scripts/parakeet_stt_server.py` on the Parakeet port. Mirrors
+/// [`build_pockettts_spec`]. Returns `None` when the venv or script is missing
+/// (engine not installed) so the caller logs + falls back to Whisper instead of
+/// spawning a broken server.
+fn build_parakeet_spec(state: &Arc<AppState>, port: u16) -> Option<RuntimeSpec> {
+    let python = state
+        .config
+        .engines_dir
+        .join(chasm_core::PARAKEET_ENGINE_ID)
+        .join(".venv")
+        .join("Scripts")
+        .join("python.exe");
+    if !python.exists() {
+        return None;
+    }
+    let script = state
+        .config
+        .workspace_root
+        .join("scripts")
+        .join("parakeet_stt_server.py");
+    if !script.exists() {
+        return None;
+    }
+    Some(RuntimeSpec {
+        program: python.display().to_string(),
+        args: vec![
+            script.display().to_string(),
+            "--host".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            port.to_string(),
+            "--model".to_string(),
+            chasm_core::PARAKEET_HF_REPO.to_string(),
+        ],
+        cwd: Some(state.config.workspace_root.display().to_string()),
+        env: Vec::new(),
+    })
+}
+
+/// Kills every running Parakeet STT server by command-line match (mirrors
+/// [`kill_tts_servers`]), so deselecting Parakeet fully unloads its model from
+/// VRAM. Best-effort; a no-op when nothing matches.
+#[cfg(windows)]
+fn kill_parakeet_servers() {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" | \
+             Where-Object { $_.CommandLine -like '*parakeet_stt_server.py*' } | \
+             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+#[cfg(not(windows))]
+fn kill_parakeet_servers() {}
+
+/// Applies the currently-selected STT provider right now (called when the STT
+/// picker changes on save, mirroring [`apply_selected_tts_engine`]):
+///   * `parakeet` → spawn the Parakeet server if it isn't already up (installed
+///     check inside; not installed = log + leave the Whisper path in place).
+///   * `whisper`  → kill any running Parakeet server (frees its VRAM). The
+///     Whisper model itself rides koboldcpp; [`apply_selected_whisper_model`]
+///     handles that side when the model picker changes.
+/// Best-effort + blocking — run it off the async path.
+pub(crate) fn apply_selected_stt_provider(state: &Arc<AppState>) {
+    let settings = AppSettings::load(&state.config.settings_path);
+    let provider = chasm_core::normalize_stt_provider(&settings.stt.provider);
+    let addr = parakeet_addr(&state.config);
+    if provider == chasm_core::STT_PARAKEET_PROVIDER {
+        if tcp_reachable(&addr) {
+            tracing::info!("STT provider -> parakeet (already serving {addr})");
+            return;
+        }
+        let port = port_from_addr(&addr);
+        match build_parakeet_spec(state, port) {
+            Some(spec) => match spawn_runtime(&spec) {
+                Ok(()) => tracing::info!("STT provider -> parakeet: spawned server on {addr}"),
+                Err(error) => {
+                    tracing::warn!("STT provider -> parakeet: could not spawn server: {error}")
+                }
+            },
+            None => tracing::warn!(
+                "STT provider -> parakeet selected but the engine is not installed; \
+                 voice input stays on koboldcpp Whisper until it is"
+            ),
+        }
+    } else {
+        // Whisper selected: unload any Parakeet server so its VRAM is freed.
+        kill_parakeet_servers();
+        if tcp_reachable(&addr) {
+            crate::kill_process_on_port(port_from_addr(&addr));
+        }
+        tracing::info!("STT provider -> whisper (koboldcpp); Parakeet server stopped if it ran");
+    }
+}
+
 /// Whether the faster-qwen3-tts engine is set up. Two ways it can be installed:
 ///   1. The chasm-managed `engines/faster-qwen3-tts` venv (the public-release path):
 ///      its `.venv/Scripts/python.exe` + `scripts/qwen3_tts_server.py` both exist.
@@ -532,30 +681,32 @@ pub(crate) fn start_ai_stack(state: &Arc<AppState>) {
     let settings = AppSettings::load(&state.config.settings_path);
     let config = load_helper_config(&helper_config_path(&settings.launcher));
 
-    // --- koboldcpp (LLM + Whisper STT) ---
+    // --- LLM runtime (koboldcpp default, llama-server opt-in) ---
     let llm_addr = config
         .as_ref()
         .and_then(llm_authority_from_config)
         .unwrap_or_else(|| DEFAULT_STACK_LLM_ADDR.to_string());
-    // Helper-config spec FIRST (a developer's hand-configured install must keep
-    // working), then the chasm-MANAGED spec (the public-release path: downloaded
-    // koboldcpp + the selected/downloaded LLM, no helper config needed).
-    let llm_spec = config
-        .as_ref()
-        .and_then(build_llm_spec)
-        .or_else(|| build_managed_koboldcpp_spec(&settings, &state.config));
+    // Runtime-aware spec: llama-server when selected (falling back to koboldcpp
+    // if not ready), else the developer helper-config spec FIRST (a
+    // hand-configured install must keep working), then the chasm-MANAGED
+    // koboldcpp spec (the public-release path).
+    let llm_spec = managed_llm_runtime_spec(&settings, &state.config, config.as_ref());
     if tcp_reachable(&llm_addr) {
-        tracing::debug!("AI stack: koboldcpp already up on {llm_addr}; not spawning");
+        tracing::debug!("AI stack: LLM runtime already up on {llm_addr}; not spawning");
     } else if let Some(spec) = llm_spec {
+        let runtime_name = Path::new(&spec.program)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "llm".to_string());
         match spawn_runtime(&spec) {
-            Ok(()) => tracing::info!("AI stack: spawned koboldcpp (LLM+STT) on {llm_addr}"),
-            Err(error) => tracing::warn!("AI stack: could not spawn koboldcpp: {error}"),
+            Ok(()) => tracing::info!("AI stack: spawned {runtime_name} (LLM) on {llm_addr}"),
+            Err(error) => tracing::warn!("AI stack: could not spawn {runtime_name}: {error}"),
         }
     } else {
         // No helper config AND nothing selected/downloaded. Surface clearly (one
         // line) instead of silently hanging on "starting".
         tracing::info!(
-            "AI stack: LLM not selected/downloaded (or koboldcpp not installed); LLM/STT not starting"
+            "AI stack: LLM not selected/downloaded (or the runtime not installed); LLM/STT not starting"
         );
     }
 
@@ -578,6 +729,30 @@ pub(crate) fn start_ai_stack(state: &Arc<AppState>) {
                 }
             },
             None => tracing::warn!("AI stack: TTS engine '{engine}' not installed; TTS not started"),
+        }
+    }
+
+    // --- Parakeet STT (only when selected; whisper rides koboldcpp above) ---
+    let stt_provider = chasm_core::normalize_stt_provider(&settings.stt.provider);
+    if stt_provider == chasm_core::STT_PARAKEET_PROVIDER {
+        let stt_addr = parakeet_addr(&state.config);
+        if tcp_reachable(&stt_addr) {
+            tracing::debug!("AI stack: Parakeet STT already up on {stt_addr}; not spawning");
+        } else {
+            match build_parakeet_spec(state, port_from_addr(&stt_addr)) {
+                Some(spec) => match spawn_runtime(&spec) {
+                    Ok(()) => {
+                        tracing::info!("AI stack: spawned Parakeet STT server on {stt_addr}")
+                    }
+                    Err(error) => {
+                        tracing::warn!("AI stack: could not spawn Parakeet STT server: {error}")
+                    }
+                },
+                None => tracing::warn!(
+                    "AI stack: STT provider is parakeet but the engine is not installed; \
+                     voice input falls back to koboldcpp Whisper"
+                ),
+            }
         }
     }
 }
@@ -609,7 +784,14 @@ pub(crate) fn stop_ai_stack(state: &Arc<AppState>) {
     if tcp_reachable(&tts_addr) {
         crate::kill_process_on_port(port_from_addr(&tts_addr));
     }
-    tracing::info!("AI stack: stopped (koboldcpp + TTS killed)");
+
+    // Parakeet STT: by server command-line match, then free its port.
+    kill_parakeet_servers();
+    let stt_addr = parakeet_addr(&state.config);
+    if tcp_reachable(&stt_addr) {
+        crate::kill_process_on_port(port_from_addr(&stt_addr));
+    }
+    tracing::info!("AI stack: stopped (LLM runtime + TTS + Parakeet killed)");
 }
 
 /// Stringifies a JSON arg value: strings verbatim, numbers/bools via `to_string`,
@@ -763,6 +945,18 @@ fn kill_llm_servers() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+    // llama-server: only chasm's own instance (the one serving :5001), never an
+    // unrelated llama-server the user runs — match the command line, not the name.
+    let _ = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" | \
+             Where-Object { $_.CommandLine -like '*--port 5001*' } | \
+             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
 }
 
 #[cfg(not(windows))]
@@ -810,18 +1004,15 @@ pub(crate) fn apply_selected_llm_model(state: &Arc<AppState>) {
         }
     }
 
-    // Build the (now-updated) spawn spec + reachability address. Helper-config spec
-    // FIRST (developer install), then the chasm-MANAGED spec (public-release path).
-    // No spec at all means koboldcpp isn't downloaded yet — nothing to relaunch.
+    // Build the (now-updated) spawn spec + reachability address for the SELECTED
+    // runtime (llama-server when chosen; else helper-config spec FIRST, then the
+    // managed koboldcpp spec). No spec at all means the runtime isn't downloaded
+    // yet — nothing to relaunch.
     let config = load_helper_config(&config_path);
-    let Some(spec) = config
-        .as_ref()
-        .and_then(build_llm_spec)
-        .or_else(|| build_managed_koboldcpp_spec(&settings, &state.config))
-    else {
+    let Some(spec) = managed_llm_runtime_spec(&settings, &state.config, config.as_ref()) else {
         tracing::info!(
-            "LLM --model set to {} but koboldcpp not installed / no spawnable command; \
-             it will load on the next start",
+            "LLM --model set to {} but the LLM runtime is not installed / no spawnable \
+             command; it will load on the next start",
             gguf.display()
         );
         return;
@@ -845,10 +1036,47 @@ pub(crate) fn apply_selected_llm_model(state: &Arc<AppState>) {
     std::thread::sleep(Duration::from_millis(800));
     match spawn_runtime(&spec) {
         Ok(()) => tracing::info!(
-            "applied LLM model '{selected}' on save: relaunched koboldcpp ({llm_addr}) on {}",
+            "applied LLM model '{selected}' on save: relaunched the LLM runtime ({llm_addr}) on {}",
             gguf.display()
         ),
-        Err(error) => tracing::warn!("could not relaunch koboldcpp for '{selected}': {error}"),
+        Err(error) => {
+            tracing::warn!("could not relaunch the LLM runtime for '{selected}': {error}")
+        }
+    }
+}
+
+/// Applies the currently-selected LLM RUNTIME right now (called when the
+/// Runtimes picker changes on save): unload whatever serves :5001 (koboldcpp or
+/// llama-server, by name/command-line + by port) and respawn the newly selected
+/// runtime on the same selected model. Mirrors [`apply_selected_llm_model`].
+/// Best-effort + blocking — run it off the async path.
+pub(crate) fn apply_selected_llm_runtime(state: &Arc<AppState>) {
+    let settings = AppSettings::load(&state.config.settings_path);
+    let runtime = chasm_core::normalize_llm_runtime(&settings.runtime.llm_runtime);
+    let config = load_helper_config(&helper_config_path(&settings.launcher));
+    let llm_addr = config
+        .as_ref()
+        .and_then(llm_authority_from_config)
+        .unwrap_or_else(|| DEFAULT_STACK_LLM_ADDR.to_string());
+
+    let Some(spec) = managed_llm_runtime_spec(&settings, &state.config, config.as_ref()) else {
+        tracing::info!(
+            "LLM runtime -> {runtime}, but no spawnable spec (runtime or model not \
+             downloaded); it will load on the next stack start"
+        );
+        return;
+    };
+
+    // Unload the running runtime (both engines by name/command-line + the port)
+    // before loading the new one, so two models never share VRAM.
+    kill_llm_servers();
+    if tcp_reachable(&llm_addr) {
+        crate::kill_process_on_port(port_from_addr(&llm_addr));
+    }
+    std::thread::sleep(Duration::from_millis(800));
+    match spawn_runtime(&spec) {
+        Ok(()) => tracing::info!("applied LLM runtime '{runtime}' on save ({llm_addr})"),
+        Err(error) => tracing::warn!("could not apply LLM runtime '{runtime}': {error}"),
     }
 }
 
@@ -1096,6 +1324,187 @@ fn find_vision_projector(models_dir: &Path, model_gguf: &Path) -> Option<std::pa
     best.map(|(_, path)| path)
 }
 
+// ---------------------------------------------------------------------------
+// llama.cpp (llama-server) managed runtime — the opt-in alternative to koboldcpp
+// ---------------------------------------------------------------------------
+
+/// Resolves the llama-server exe path: `CHASM_LLAMACPP_EXE` override, else the
+/// managed download location under the data tree (`<data>/models/llamacpp/`,
+/// beside the koboldcpp/LLM/STT model dirs the desktop app already uses).
+pub(crate) fn llamacpp_exe_path(config: &chasm_core::AppConfig) -> std::path::PathBuf {
+    if let Some(env) = std::env::var_os("CHASM_LLAMACPP_EXE") {
+        return std::path::PathBuf::from(env);
+    }
+    llamacpp_managed_default(config)
+}
+
+/// The chasm-managed llama.cpp install path (`<data>/models/llamacpp/llama-server.exe`),
+/// where `scripts/download-llamacpp.ps1` extracts the release build + writes its
+/// `.downloading`/`.done`/`.failed` markers.
+pub(crate) fn llamacpp_managed_default(config: &chasm_core::AppConfig) -> std::path::PathBuf {
+    config
+        .data_root
+        .join("models")
+        .join("llamacpp")
+        .join("llama-server.exe")
+}
+
+/// The llama.cpp runtime status, mirroring [`koboldcpp_status`] (same enum —
+/// installed / downloading / missing) off the `llamacpp.*` markers.
+pub(crate) fn llamacpp_status(config: &chasm_core::AppConfig) -> KoboldcppStatus {
+    let exe = llamacpp_exe_path(config);
+    if exe.exists() {
+        return KoboldcppStatus::Installed;
+    }
+    let Some(dir) = exe.parent() else {
+        return KoboldcppStatus::Missing;
+    };
+    let marker = dir.join("llamacpp.downloading");
+    crate::flip_marker_if_stale(
+        &marker,
+        &dir.join("llamacpp.failed"),
+        &[dir.join("llamacpp.log")],
+    );
+    if marker.exists() {
+        KoboldcppStatus::Downloading
+    } else {
+        KoboldcppStatus::Missing
+    }
+}
+
+/// Builds the chasm-MANAGED llama-server [`RuntimeSpec`] for the SAME selected
+/// model the koboldcpp spec would load, on the SAME port (5001) — so nothing
+/// downstream (endpoints, bridge, warmup) changes when the runtime is swapped.
+///
+/// Key differences from koboldcpp, and the whole point of offering llama-server:
+///   * `--parallel 2` = two server slots, each keeping its OWN prompt cache. In a
+///     group scene, speaker A's system prompt + history stay cached in slot 0
+///     while speaker B generates in slot 1 (llama-server routes each request to
+///     the slot with the most similar cached prompt), so a speaker swap costs a
+///     delta prefill instead of the full ~0.4-0.6 s reprocess koboldcpp's single
+///     KV slot pays.
+///   * `--ctx-size 16384` — the total KV budget is split across slots, so 16384
+///     keeps koboldcpp's 8192 context PER SLOT.
+///   * `--cache-reuse 256` — chunked KV reuse for partially-matching prompts
+///     (history windows shift as the conversation grows).
+///   * `--reasoning-budget 0` mirrors koboldcpp's `--reasoningeffort none` (no
+///     hidden thinking preamble delaying first audio).
+///   * `--jinja` uses the model's own chat template for /v1/chat/completions.
+/// Missing exe / no selected+downloaded model ⇒ `None` (caller logs + falls back
+/// to koboldcpp — never breaks the stack).
+fn build_managed_llamacpp_spec(
+    settings: &AppSettings,
+    config: &chasm_core::AppConfig,
+) -> Option<RuntimeSpec> {
+    let exe = llamacpp_exe_path(config);
+    if !exe.exists() {
+        return None;
+    }
+
+    // Same model resolution as the managed koboldcpp spec: the SELECTED +
+    // downloaded GGUF, no default selection.
+    let model_status = llm_model_statuses_for(&config.llm_models_dir);
+    let selected = chasm_core::selected_llm_model_id(&settings.llm.model, &model_status);
+    if selected.is_empty() {
+        return None;
+    }
+    let gguf = chasm_core::llm_model_gguf_path(&config.llm_models_dir, &selected)?;
+    if !gguf.exists() {
+        return None;
+    }
+
+    let cwd = exe
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.display().to_string());
+
+    let mut args: Vec<String> = vec![
+        "-m".to_string(),
+        gguf.display().to_string(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        "5001".to_string(),
+        "-ngl".to_string(),
+        "999".to_string(),
+        // 2 slots × 8192 ctx each (--ctx-size is the TOTAL budget, split across
+        // slots) = koboldcpp's per-conversation context, twice over.
+        "-c".to_string(),
+        "16384".to_string(),
+        "-np".to_string(),
+        "2".to_string(),
+        // Chunked KV reuse for shifted prefixes (min chunk 256 tokens).
+        "--cache-reuse".to_string(),
+        "256".to_string(),
+        // No thinking preamble (mirrors koboldcpp --reasoningeffort none).
+        "--reasoning-budget".to_string(),
+        "0".to_string(),
+        // Use the GGUF's own chat template.
+        "--jinja".to_string(),
+    ];
+
+    // Vision projector: same auto-attach as the koboldcpp spec (llama-server
+    // takes the identical projector GGUF via --mmproj).
+    if let Some(mmproj) = find_vision_projector(&config.llm_models_dir, &gguf) {
+        tracing::info!("llama-server: attaching vision projector {}", mmproj.display());
+        args.push("--mmproj".to_string());
+        args.push(mmproj.display().to_string());
+    }
+
+    Some(RuntimeSpec {
+        program: exe.display().to_string(),
+        args,
+        cwd,
+        env: Vec::new(),
+    })
+}
+
+/// The managed LLM runtime spec for the CURRENTLY SELECTED runtime, with the
+/// fallback chain that keeps the stack alive:
+///   * runtime = llamacpp → the llama-server spec; if it can't be built (exe not
+///     downloaded / no model), LOG and fall back to the koboldcpp chain.
+///   * runtime = koboldcpp (default) → the developer helper-config spec first
+///     (unchanged precedence), then the managed koboldcpp spec.
+/// Also logs which STT will be live when llama-server (which has no Whisper)
+/// serves the LLM, so voice input never dies silently.
+fn managed_llm_runtime_spec(
+    settings: &AppSettings,
+    config: &chasm_core::AppConfig,
+    helper: Option<&serde_json::Value>,
+) -> Option<RuntimeSpec> {
+    let runtime = chasm_core::normalize_llm_runtime(&settings.runtime.llm_runtime);
+    if runtime == chasm_core::LLM_RUNTIME_LLAMACPP {
+        if let Some(spec) = build_managed_llamacpp_spec(settings, config) {
+            let provider = chasm_core::normalize_stt_provider(&settings.stt.provider);
+            if stt_uses_parakeet(settings, config) {
+                tracing::info!(
+                    "LLM runtime: llama-server (no Whisper); STT is the Parakeet server"
+                );
+            } else if provider == chasm_core::STT_PARAKEET_PROVIDER {
+                tracing::warn!(
+                    "LLM runtime: llama-server has no Whisper and the selected Parakeet \
+                     engine is NOT installed — voice input will be unavailable until \
+                     Parakeet is installed (Settings → STT) or the runtime is koboldcpp"
+                );
+            } else {
+                tracing::warn!(
+                    "LLM runtime: llama-server has no Whisper — voice input is unavailable \
+                     with STT provider 'whisper'. Select Parakeet (Settings → STT) or \
+                     switch the runtime back to koboldcpp"
+                );
+            }
+            return Some(spec);
+        }
+        tracing::warn!(
+            "LLM runtime: llama.cpp selected but llama-server is not ready (exe or model \
+             missing); falling back to koboldcpp"
+        );
+    }
+    helper
+        .and_then(build_llm_spec)
+        .or_else(|| build_managed_koboldcpp_spec(settings, config))
+}
+
 fn build_managed_koboldcpp_spec(
     settings: &AppSettings,
     config: &chasm_core::AppConfig,
@@ -1156,8 +1565,15 @@ fn build_managed_koboldcpp_spec(
     args.push("--noswa".to_string());
 
     // Whisper STT is optional: add --whispermodel only when a model is selected AND
-    // its .bin is on disk, so STT never blocks the LLM from starting.
-    let whisper_file = chasm_core::stt_effective_model(&settings.stt);
+    // its .bin is on disk, so STT never blocks the LLM from starting. When the
+    // Parakeet provider is active (selected + installed), skip it entirely — the
+    // dedicated Parakeet server handles STT, so loading Whisper would only waste
+    // VRAM. (Parakeet selected but NOT installed keeps Whisper as the fallback.)
+    let whisper_file = if stt_uses_parakeet(settings, config) {
+        String::new()
+    } else {
+        chasm_core::stt_effective_model(&settings.stt)
+    };
     if !whisper_file.is_empty() {
         let whisper_path = whisper_models_dir(settings).join(&whisper_file);
         if whisper_path.exists() {
@@ -1737,6 +2153,7 @@ mod tests {
             voices_dir: workspace.join("voices"),
             llm_models_dir: workspace.join("models").join("llm"),
             stt_endpoint: "http://127.0.0.1:5001".to_string(),
+            parakeet_stt_endpoint: "http://127.0.0.1:5003/v1/audio/transcriptions".to_string(),
             llm_endpoint: "http://127.0.0.1:5001".to_string(),
             tts_endpoint: "http://127.0.0.1:5002".to_string(),
         }

@@ -20,6 +20,7 @@ import { Llm } from "@/screens/settings/Llm";
 import { Tts } from "@/screens/settings/Tts";
 import { Stt } from "@/screens/settings/Stt";
 import { Retrieval } from "@/screens/settings/Retrieval";
+import { Runtimes } from "@/screens/settings/Runtimes";
 import { Bridge } from "@/screens/settings/Bridge";
 import { Tracing } from "@/screens/settings/Tracing";
 import { Updates } from "@/screens/settings/Updates";
@@ -65,6 +66,7 @@ export function App() {
             <Route path="tts" element={<Tts />} />
             <Route path="stt" element={<Stt />} />
             <Route path="retrieval" element={<Retrieval />} />
+            <Route path="runtimes" element={<Runtimes />} />
             <Route path="bridge" element={<Bridge />} />
             <Route path="tracing" element={<Tracing />} />
             <Route path="updates" element={<Updates />} />

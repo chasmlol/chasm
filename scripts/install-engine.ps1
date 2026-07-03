@@ -137,6 +137,26 @@ try {
             # If an NVIDIA GPU is present, swap the CPU torch for a verified CUDA build.
             Install-TorchCuda $py
         }
+        'parakeet' {
+            # Parakeet TDT 0.6B v3 STT via nano-parakeet (pure-PyTorch TDT
+            # inference; deps: torch, numpy, soundfile, sentencepiece,
+            # huggingface-hub). nano-parakeet pulls a CPU torch by default; we
+            # swap it for a verified CUDA build below. torchaudio only for
+            # resampling non-16kHz clips; python-multipart for the OpenAI
+            # multipart transcription form.
+            & $script:uv pip install --python $py nano-parakeet torchaudio soundfile numpy fastapi uvicorn python-multipart *>> $log
+            if ($LASTEXITCODE -ne 0) { throw "pip install nano-parakeet failed (exit $LASTEXITCODE)" }
+            # If an NVIDIA GPU is present, swap the CPU torch for a verified CUDA build.
+            Install-TorchCuda $py
+            # torchaudio must match the (possibly swapped) torch build or it fails to
+            # import; reinstall it against the same index torch came from.
+            $torchVer = (& $py -c "import torch; print(torch.__version__)").Trim()
+            if ($torchVer -match '\+(cu\d+)$') {
+                $tag = $Matches[1]
+                & $script:uv pip install --python $py --reinstall-package torchaudio torchaudio --index-url "https://download.pytorch.org/whl/$tag" *>> $log
+                if ($LASTEXITCODE -ne 0) { Log "[warn] torchaudio $tag reinstall failed; resampling may fall back to CPU torch import errors" }
+            }
+        }
         default { throw "unknown engine: $Engine" }
     }
 
@@ -163,6 +183,14 @@ try {
             Log "[model] prefetch Qwen/Qwen3-TTS-12Hz-1.7B-Base"
             & $py -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-TTS-12Hz-1.7B-Base')" *>> $log
             if ($LASTEXITCODE -ne 0) { throw "model prefetch failed for Qwen3-TTS (exit $LASTEXITCODE)" }
+        }
+        'parakeet' {
+            # nano-parakeet loads exactly one file: the .nemo build of the repo.
+            # Prefetch it (NOT a full snapshot — the repo also carries safetensors
+            # etc. the runtime never reads) so ".installed" means fully ready.
+            Log "[model] prefetch nvidia/parakeet-tdt-0.6b-v3 (.nemo)"
+            & $py -c "from huggingface_hub import hf_hub_download; hf_hub_download('nvidia/parakeet-tdt-0.6b-v3', 'parakeet-tdt-0.6b-v3.nemo')" *>> $log
+            if ($LASTEXITCODE -ne 0) { throw "model prefetch failed for Parakeet (exit $LASTEXITCODE)" }
         }
     }
 

@@ -40,6 +40,14 @@ pub const DEFAULT_LLM_ENDPOINT: &str = "http://127.0.0.1:5001";
 /// koboldcpp handles LLM + STT. Env-overridable via `CHASM_TTS_ENDPOINT`.
 pub const DEFAULT_TTS_ENDPOINT: &str = "http://127.0.0.1:5002";
 
+/// Default endpoint of the dedicated Parakeet STT service (OpenAI-compatible
+/// `/v1/audio/transcriptions`), used when the STT provider is `parakeet`. Its
+/// own process + port so voice input never queues behind an LLM generation
+/// (koboldcpp's Whisper shares the LLM's single slot). Env-overridable via
+/// `CHASM_PARAKEET_STT_ENDPOINT`.
+pub const DEFAULT_PARAKEET_STT_ENDPOINT: &str =
+    "http://127.0.0.1:5003/v1/audio/transcriptions";
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub bind_addr: String,
@@ -55,6 +63,10 @@ pub struct AppConfig {
     /// Local OpenAI-compatible STT (koboldcpp Whisper) transcription endpoint
     /// (`{...}/v1/audio/transcriptions`).
     pub stt_endpoint: String,
+    /// Local OpenAI-compatible Parakeet transcription endpoint, used instead of
+    /// [`Self::stt_endpoint`] when the STT provider is `parakeet`. Defaults to
+    /// [`DEFAULT_PARAKEET_STT_ENDPOINT`]; override via `CHASM_PARAKEET_STT_ENDPOINT`.
+    pub parakeet_stt_endpoint: String,
     /// Base URL of the local OpenAI-compatible LLM (llama.cpp). The chat
     /// endpoint is `{llm_endpoint}/v1/chat/completions`.
     pub llm_endpoint: String,
@@ -92,6 +104,10 @@ impl AppConfig {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_STT_ENDPOINT.to_string());
+        let parakeet_stt_endpoint = env::var("CHASM_PARAKEET_STT_ENDPOINT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_PARAKEET_STT_ENDPOINT.to_string());
         let llm_endpoint = env::var("CHASM_LLM_ENDPOINT")
             .ok()
             .map(|value| value.trim_end_matches('/').to_string())
@@ -113,6 +129,7 @@ impl AppConfig {
             voices_dir,
             llm_models_dir,
             stt_endpoint,
+            parakeet_stt_endpoint,
             llm_endpoint,
             tts_endpoint,
         }

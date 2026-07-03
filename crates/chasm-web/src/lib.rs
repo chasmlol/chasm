@@ -1167,9 +1167,26 @@ fn pad_wav_to_min_duration(bytes: &[u8], min_ms: u32) -> Vec<u8> {
     out
 }
 
+/// The transcription endpoint the active STT provider serves: the dedicated
+/// Parakeet server when the provider is `parakeet` AND the engine is installed,
+/// else the koboldcpp Whisper endpoint. Falling back on "selected but not
+/// installed" means voice input keeps working (on Whisper) instead of dying
+/// against a port nothing listens on.
+pub(crate) fn effective_stt_endpoint(
+    config: &chasm_core::AppConfig,
+    settings: &AppSettings,
+) -> String {
+    if launcher::stt_uses_parakeet(settings, config) {
+        config.parakeet_stt_endpoint.clone()
+    } else {
+        config.stt_endpoint.clone()
+    }
+}
+
 /// Speech recognition — mirrors ST `/speech/recognize`. Forwards the base64 WAV
-/// payload the FNV helper sends to the local Parakeet OpenAI-compatible server
-/// (`/v1/audio/transcriptions`, multipart `file` upload) and returns the
+/// payload the FNV helper sends to the active local OpenAI-compatible STT server
+/// (koboldcpp Whisper, or the dedicated Parakeet server when selected;
+/// `/v1/audio/transcriptions`, multipart `file` upload) and returns the
 /// transcription in the same JSON shape ST returns so the helper parses
 /// `recognition.text` unchanged.
 async fn speech_recognize(
@@ -1250,27 +1267,32 @@ async fn speech_recognize(
         form = form.text("prompt", prompt.clone());
     }
 
+    let endpoint = effective_stt_endpoint(&state.config, &settings);
+    tracing::debug!("speech recognize: provider={resolved_provider} endpoint={endpoint}");
     let client = reqwest::Client::new();
     let start = std::time::Instant::now();
     let response = client
-        .post(&state.config.stt_endpoint)
+        .post(&endpoint)
         .timeout(std::time::Duration::from_millis(timeout_ms))
         .multipart(form)
         .send()
         .await
-        .map_err(|error| anyhow::anyhow!("Parakeet speech-to-text request failed: {error}"))?;
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "{resolved_provider} speech-to-text request failed ({endpoint}): {error}"
+            )
+        })?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         let snippet: String = body.chars().take(1000).collect();
         return Err(WebError(anyhow::anyhow!(
-            "Parakeet speech-to-text request failed (status {status}): {snippet}"
+            "{resolved_provider} speech-to-text request failed (status {status}): {snippet}"
         )));
     }
-    let provider_result: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|error| anyhow::anyhow!("Parakeet returned an unreadable response: {error}"))?;
+    let provider_result: serde_json::Value = response.json().await.map_err(|error| {
+        anyhow::anyhow!("{resolved_provider} returned an unreadable response: {error}")
+    })?;
     let duration_ms = start.elapsed().as_millis() as u64;
 
     let text = extract_transcript_text(&provider_result);
@@ -1980,14 +2002,43 @@ pub(crate) fn engine_statuses(
         .collect()
 }
 
+/// Install status of the Parakeet STT engine's `engines/parakeet` dir, using the
+/// same markers [`engine_statuses`] reads for the TTS engines (`.installing` /
+/// `.failed` / `.installed`, stalled-marker backstop included). The `.installed`
+/// marker is only trusted when the venv actually resolves (belt and suspenders).
+pub(crate) fn parakeet_engine_status(state: &AppState) -> String {
+    let dir = state
+        .config
+        .engines_dir
+        .join(chasm_core::PARAKEET_ENGINE_ID);
+    flip_marker_if_stale(
+        &dir.join(".installing"),
+        &dir.join(".failed"),
+        &[dir.join("install.log")],
+    );
+    if dir.join(".installing").exists() {
+        "installing"
+    } else if dir.join(".failed").exists() {
+        "failed"
+    } else if launcher::parakeet_installed(&state.config) {
+        "installed"
+    } else {
+        "not_installed"
+    }
+    .to_string()
+}
+
 /// Kicks off a local-engine install: writes an `.installing` marker and spawns
 /// the detached install script (which writes `.installed`/`.failed` on finish).
 /// Returns `false` for an unknown engine; a no-op (already installed/installing)
 /// returns `true`. Shared by the settings endpoint + onboarding "Use recommended".
 pub(crate) fn start_engine_install(state: &AppState, id: &str) -> std::io::Result<bool> {
+    // TTS engines + the Parakeet STT engine share the same venv install shape
+    // (engines/<id>/.venv via scripts/install-engine.ps1).
     let known = TTS_LOCAL_ENGINES
         .iter()
-        .any(|(engine_id, _)| engine_id == &id);
+        .any(|(engine_id, _)| engine_id == &id)
+        || id == chasm_core::PARAKEET_ENGINE_ID;
     if !known {
         return Ok(false);
     }
@@ -2315,6 +2366,70 @@ pub(crate) fn ensure_koboldcpp(state: &AppState) {
                 format!("spawn failed: {error}"),
             );
             tracing::warn!("could not start koboldcpp download: {error}");
+        }
+    }
+}
+
+/// Ensures the llama.cpp runtime exists: when `llamacpp_status` is Missing,
+/// spawns `scripts/download-llamacpp.ps1` detached (markers `llamacpp.downloading`
+/// / `.done` / `.failed` beside the exe). Mirrors [`ensure_koboldcpp`].
+pub(crate) fn ensure_llamacpp(state: &AppState) {
+    let status = crate::launcher::llamacpp_status(&state.config);
+    if status != crate::launcher::KoboldcppStatus::Missing {
+        return;
+    }
+    let exe = crate::launcher::llamacpp_exe_path(&state.config);
+    let Some(dir) = exe.parent() else {
+        return;
+    };
+    if let Err(error) = fs::create_dir_all(dir) {
+        tracing::warn!("could not create llamacpp dir {}: {error}", dir.display());
+        return;
+    }
+    let _ = fs::remove_file(dir.join("llamacpp.failed"));
+    let script = state
+        .config
+        .workspace_root
+        .join("scripts")
+        .join("download-llamacpp.ps1");
+    if !script.exists() {
+        let _ = fs::write(
+            dir.join("llamacpp.failed"),
+            format!("downloader missing: {}", script.display()),
+        );
+        tracing::warn!(
+            "llamacpp download: downloader missing at {}; wrote .failed",
+            script.display()
+        );
+        return;
+    }
+    if let Err(error) = fs::write(dir.join("llamacpp.downloading"), "") {
+        tracing::warn!("could not write llamacpp.downloading marker: {error}");
+        return;
+    }
+    let spawned = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            &script.display().to_string(),
+            "-ExePath",
+            &exe.display().to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match spawned {
+        Ok(_) => tracing::info!(
+            "llama.cpp missing; started runtime download -> {}",
+            exe.display()
+        ),
+        Err(error) => {
+            let _ = fs::remove_file(dir.join("llamacpp.downloading"));
+            let _ = fs::write(dir.join("llamacpp.failed"), format!("spawn failed: {error}"));
+            tracing::warn!("could not start llama.cpp download: {error}");
         }
     }
 }
@@ -3235,13 +3350,23 @@ async fn stack_status(State(state): State<Arc<AppState>>) -> Json<StackStatusRes
     let settings = AppSettings::load(&state.config.settings_path);
 
     let kobold_up = launcher::koboldcpp_running(&state);
-    // koboldcpp missing → its runtime auto-download may be in flight; surface that
-    // as "busy" so the LLM/STT lights read "coming up", not "broken".
-    let kobold_downloading = launcher::koboldcpp_status(&settings, &state.config)
-        == launcher::KoboldcppStatus::Downloading;
+    // Runtime missing → its auto-download may be in flight; surface that as
+    // "busy" so the LLM/STT lights read "coming up", not "broken". Tracks the
+    // SELECTED runtime's markers (koboldcpp or llama.cpp).
+    let runtime_llamacpp = chasm_core::normalize_llm_runtime(&settings.runtime.llm_runtime)
+        == chasm_core::LLM_RUNTIME_LLAMACPP;
+    let kobold_downloading = if runtime_llamacpp {
+        launcher::llamacpp_status(&state.config) == launcher::KoboldcppStatus::Downloading
+    } else {
+        launcher::koboldcpp_status(&settings, &state.config)
+            == launcher::KoboldcppStatus::Downloading
+    };
     let tts_up = launcher::tts_running_engine(&state).is_some();
 
-    // STT rides koboldcpp but only works when a Whisper model is present.
+    // STT: the dedicated Parakeet server when selected + installed, else the
+    // koboldcpp Whisper path (rides koboldcpp; needs a Whisper model present).
+    let stt_parakeet = launcher::stt_uses_parakeet(&settings, &state.config);
+    let parakeet_up = stt_parakeet && launcher::parakeet_running(&state);
     let whisper_dir = launcher::whisper_models_dir(&settings);
     let whisper_present = whisper_model_statuses(&whisper_dir)
         .values()
@@ -3261,9 +3386,16 @@ async fn stack_status(State(state): State<Arc<AppState>>) -> Json<StackStatusRes
     };
     let flag = |up: bool| if up { "ok" } else { "idle" };
 
+    let stt_up = if stt_parakeet {
+        parakeet_up
+    } else {
+        kobold_up && whisper_present
+    };
     Json(StackStatusResponse {
         llm: up_or_busy(kobold_up, kobold_downloading),
-        stt: up_or_busy(kobold_up && whisper_present, kobold_downloading),
+        // Whisper rides koboldcpp specifically: with the llama.cpp runtime the
+        // whisper path can never come up, so don't show it as "coming up".
+        stt: up_or_busy(stt_up, !stt_parakeet && !runtime_llamacpp && kobold_downloading),
         tts: flag(tts_up),
         embedder: flag(retriever.is_some()),
         reranker: flag(retriever.map(|r| r.has_reranker()).unwrap_or(false)),
@@ -3279,27 +3411,41 @@ async fn stack_start(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
     // start_ai_stack blocks (reachability probes + process spawn) → blocking pool.
     let stack_state = state.clone();
     tokio::task::spawn_blocking(move || {
-        // Ensure the koboldcpp RUNTIME exists — without it, an LLM model can't be
-        // served and Start would silently do nothing for LLM/STT. This also flips a
-        // stale `.downloading` marker (e.g. a download that died on an older build)
-        // so a fresh fetch can start.
-        ensure_koboldcpp(&stack_state);
-        // Spawn whatever is present now (the TTS engine, and koboldcpp if it's
-        // already installed).
-        launcher::start_ai_stack(&stack_state);
-        // If koboldcpp was still downloading, wait (bounded) for its exe to land,
-        // then spawn it — so a first click brings LLM/STT up without a second one.
-        if launcher::koboldcpp_status(
-            &AppSettings::load(&stack_state.config.settings_path),
-            &stack_state.config,
-        ) == launcher::KoboldcppStatus::Downloading
+        // Ensure the selected LLM RUNTIME exists — without it, an LLM model can't
+        // be served and Start would silently do nothing for LLM/STT. This also
+        // flips a stale `.downloading` marker (e.g. a download that died on an
+        // older build) so a fresh fetch can start. llama.cpp is opt-in: its
+        // downloader only runs when it IS the selected runtime.
+        let runtime_status = |stack_state: &Arc<AppState>| {
+            let settings = AppSettings::load(&stack_state.config.settings_path);
+            if chasm_core::normalize_llm_runtime(&settings.runtime.llm_runtime)
+                == chasm_core::LLM_RUNTIME_LLAMACPP
+            {
+                launcher::llamacpp_status(&stack_state.config)
+            } else {
+                launcher::koboldcpp_status(&settings, &stack_state.config)
+            }
+        };
         {
+            let settings = AppSettings::load(&stack_state.config.settings_path);
+            if chasm_core::normalize_llm_runtime(&settings.runtime.llm_runtime)
+                == chasm_core::LLM_RUNTIME_LLAMACPP
+            {
+                ensure_llamacpp(&stack_state);
+            } else {
+                ensure_koboldcpp(&stack_state);
+            }
+        }
+        // Spawn whatever is present now (the TTS engine, and the LLM runtime if
+        // it's already installed).
+        launcher::start_ai_stack(&stack_state);
+        // If the runtime was still downloading, wait (bounded) for its exe to
+        // land, then spawn it — so a first click brings LLM/STT up without a
+        // second one.
+        if runtime_status(&stack_state) == launcher::KoboldcppStatus::Downloading {
             for _ in 0..180 {
                 std::thread::sleep(std::time::Duration::from_secs(5)); // ≤15 min
-                match launcher::koboldcpp_status(
-                    &AppSettings::load(&stack_state.config.settings_path),
-                    &stack_state.config,
-                ) {
+                match runtime_status(&stack_state) {
                     launcher::KoboldcppStatus::Installed => {
                         launcher::start_ai_stack(&stack_state);
                         break;

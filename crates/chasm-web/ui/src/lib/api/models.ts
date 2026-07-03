@@ -41,8 +41,8 @@ export interface ModelSettingsDto {
   folder?: string;
 }
 
-/** The four AI settings domains served by ModelPicker. */
-export type ModelDomain = "llm" | "tts" | "stt" | "retrieval";
+/** The AI settings domains served by ModelPicker (runtime = the LLM runtime picker). */
+export type ModelDomain = "llm" | "tts" | "stt" | "retrieval" | "runtime";
 
 export const modelsApi = {
   get: (domain: ModelDomain) =>

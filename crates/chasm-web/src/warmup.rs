@@ -282,14 +282,22 @@ fn bridge_turn_shape(state: &Arc<AppState>) -> (String, bool) {
 // ---------------------------------------------------------------------------
 
 /// Transcribes ~1.3 s of silence so the first real push-to-talk line doesn't pay
-/// Whisper's first-decode warm-up. Skipped when no Whisper model is selected.
+/// the STT engine's first-decode warm-up. Targets the active provider's endpoint
+/// (koboldcpp Whisper, or the dedicated Parakeet server when selected). Skipped
+/// when the Whisper path is active but no Whisper model is selected.
 async fn warm_stt(state: &Arc<AppState>, deadlines: WarmupDeadlines) -> String {
     let settings = AppSettings::load(&state.config.settings_path);
-    let model = chasm_core::stt_effective_model(&settings.stt);
+    let parakeet = crate::launcher::stt_uses_parakeet(&settings, &state.config);
+    let model = if parakeet {
+        // The Parakeet server ignores the model field; send its repo id.
+        chasm_core::PARAKEET_HF_REPO.to_string()
+    } else {
+        chasm_core::stt_effective_model(&settings.stt)
+    };
     if model.is_empty() {
         return "stt skipped (no model selected)".to_string();
     }
-    let endpoint = state.config.stt_endpoint.clone();
+    let endpoint = crate::effective_stt_endpoint(&state.config, &settings);
     // koboldcpp serves STT on the LLM port; by the time we get here the LLM wait
     // already succeeded (or failed), so only probe briefly.
     let brief = WarmupDeadlines {
@@ -499,6 +507,7 @@ mod tests {
             voices_dir: root.join("voices"),
             llm_models_dir: root.join("models-llm"),
             stt_endpoint: "http://127.0.0.1:9/v1/audio/transcriptions".into(),
+            parakeet_stt_endpoint: "http://127.0.0.1:9/v1/audio/transcriptions".into(),
             llm_endpoint: "http://127.0.0.1:9".into(),
             tts_endpoint: "http://127.0.0.1:9".into(),
         };

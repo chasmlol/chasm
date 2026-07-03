@@ -14,6 +14,7 @@ import {
   AudioLines,
   Mic,
   Database,
+  Server,
   Cable,
   Activity,
   Download,
@@ -104,6 +105,12 @@ export const NAV_GROUPS: NavGroup[] = [
         label: "Retrieval",
         path: "settings/retrieval",
         icon: Database,
+      },
+      {
+        key: "runtimes",
+        label: "Runtimes",
+        path: "settings/runtimes",
+        icon: Server,
       },
       { key: "bridge", label: "Bridge", path: "settings/bridge", icon: Cable },
       {
