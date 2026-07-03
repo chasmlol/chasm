@@ -148,6 +148,24 @@ export interface BridgeView {
   connection: BridgeConnection;
 }
 
+// --- Hotkeys (GET /api/ui/v1/settings/hotkeys, POST .../hotkeys/save) ------
+
+/** The four in-game input bindings, as canonical key names ("Alt", "Enter",
+ * "F5", "H", ...). Mirrors `HotkeysSettings` (chasm-core/src/settings.rs). */
+export interface HotkeysConfig {
+  push_to_talk: string;
+  enter_text: string;
+  todd_push_to_talk: string;
+  todd_enter_text: string;
+}
+
+/** Mirrors `UiHotkeysView`. `defaults` drives the per-row reset buttons. */
+export interface HotkeysView {
+  settings_path: string;
+  config: HotkeysConfig;
+  defaults: HotkeysConfig;
+}
+
 // --- Tracing (GET /api/ui/v1/traces, GET .../traces/:id) -------------------
 
 /** One row in the recent-traces list. Mirrors `TraceListEntry`. */
@@ -306,6 +324,11 @@ export const systemApi = {
   bridge: () => getJson<BridgeView>(`${UI_API}/settings/bridge`),
   saveBridge: (config: BridgeConfig) =>
     postJson<BridgeView>(`${UI_API}/settings/bridge/save`, config),
+
+  // Hotkeys
+  hotkeys: () => getJson<HotkeysView>(`${UI_API}/settings/hotkeys`),
+  saveHotkeys: (config: HotkeysConfig) =>
+    postJson<HotkeysView>(`${UI_API}/settings/hotkeys/save`, config),
 
   // Tracing (read-only)
   traces: () => getJson<TracesList>(`${UI_API}/traces`),

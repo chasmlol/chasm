@@ -6,6 +6,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 mod game_launcher;
+pub mod hotkeys;
 pub mod profile_import;
 mod profiles;
 mod providers;

@@ -24,6 +24,7 @@ import { Stt } from "@/screens/settings/Stt";
 import { Retrieval } from "@/screens/settings/Retrieval";
 import { Runtimes } from "@/screens/settings/Runtimes";
 import { Bridge } from "@/screens/settings/Bridge";
+import { Hotkeys } from "@/screens/settings/Hotkeys";
 import { Tracing } from "@/screens/settings/Tracing";
 import { Updates } from "@/screens/settings/Updates";
 
@@ -72,6 +73,7 @@ export function App() {
             <Route path="retrieval" element={<Retrieval />} />
             <Route path="runtimes" element={<Runtimes />} />
             <Route path="bridge" element={<Bridge />} />
+            <Route path="hotkeys" element={<Hotkeys />} />
             <Route path="tracing" element={<Tracing />} />
             <Route path="updates" element={<Updates />} />
           </Route>

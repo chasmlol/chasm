@@ -49,6 +49,10 @@ pub struct AppSettings {
     /// `api[provider].api_key` still overrides this when set. Secret; never logged.
     #[serde(default)]
     pub api_keys: BTreeMap<String, String>,
+    /// In-game input bindings (the Hotkeys settings page). Delivered to the
+    /// NVSE plugin via the bridge `control/hotkeys.cfg` file (see
+    /// [`crate::hotkeys`]).
+    pub hotkeys: HotkeysSettings,
 }
 
 impl Default for AppSettings {
@@ -65,6 +69,38 @@ impl Default for AppSettings {
             interface: InterfaceSettings::default(),
             persona: PersonaSettings::default(),
             api_keys: BTreeMap::new(),
+            hotkeys: HotkeysSettings::default(),
+        }
+    }
+}
+
+/// The four in-game input bindings, stored as canonical key names (see
+/// [`crate::hotkeys::virtual_key_code`] for the name set). Defaults mirror the
+/// NVSE plugin's original hardcoded keys, so existing users see their current
+/// keys pre-filled and a missing/invalid name falls back to the same key the
+/// plugin would use anyway.
+///
+/// `#[serde(default)]` so older settings files (no `hotkeys` key) load fine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HotkeysSettings {
+    /// Hold-to-record voice input to nearby NPCs. Plugin default: Alt (VK_MENU).
+    pub push_to_talk: String,
+    /// Opens the typed-message input to NPCs. Plugin default: Enter (VK_RETURN).
+    pub enter_text: String,
+    /// Hold-to-record voice input addressed to Todd. Plugin default: H.
+    pub todd_push_to_talk: String,
+    /// Opens the typed-message input to Todd. Plugin default: O.
+    pub todd_enter_text: String,
+}
+
+impl Default for HotkeysSettings {
+    fn default() -> Self {
+        Self {
+            push_to_talk: "Alt".to_string(),
+            enter_text: "Enter".to_string(),
+            todd_push_to_talk: "H".to_string(),
+            todd_enter_text: "O".to_string(),
         }
     }
 }
@@ -3051,5 +3087,34 @@ mod tests {
         assert_eq!(settings.llm.provider, "local");
         assert_eq!(settings.stt.provider, "local");
         assert_eq!(settings.tts.provider, "local");
+    }
+
+    #[test]
+    fn hotkeys_defaults_mirror_plugin_hardcoded_keys() {
+        let hotkeys = HotkeysSettings::default();
+        assert_eq!(hotkeys.push_to_talk, "Alt");
+        assert_eq!(hotkeys.enter_text, "Enter");
+        assert_eq!(hotkeys.todd_push_to_talk, "H");
+        assert_eq!(hotkeys.todd_enter_text, "O");
+    }
+
+    #[test]
+    fn hotkeys_persist_and_round_trip() {
+        let mut settings = AppSettings::default();
+        settings.hotkeys.push_to_talk = "F".to_string();
+        settings.hotkeys.todd_enter_text = "F7".to_string();
+        let json = serde_json::to_string(&settings).unwrap();
+        let reloaded: AppSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(reloaded.hotkeys.push_to_talk, "F");
+        assert_eq!(reloaded.hotkeys.todd_enter_text, "F7");
+        assert_eq!(reloaded.hotkeys.enter_text, "Enter"); // untouched default
+    }
+
+    #[test]
+    fn hotkeys_default_when_key_absent() {
+        // Older settings files have no `hotkeys` key → serde default fills it.
+        let json = r#"{"profile":"fallout-new-vegas"}"#;
+        let settings: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.hotkeys, HotkeysSettings::default());
     }
 }

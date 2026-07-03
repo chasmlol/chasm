@@ -18,6 +18,7 @@ import {
   Database,
   Server,
   Cable,
+  Keyboard,
   Activity,
   Download,
 } from "lucide-react";
@@ -127,6 +128,12 @@ export const NAV_GROUPS: NavGroup[] = [
         icon: Server,
       },
       { key: "bridge", label: "Bridge", path: "settings/bridge", icon: Cable },
+      {
+        key: "hotkeys",
+        label: "Hotkeys",
+        path: "settings/hotkeys",
+        icon: Keyboard,
+      },
       {
         key: "tracing",
         label: "Tracing",

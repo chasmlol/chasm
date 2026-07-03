@@ -41,6 +41,7 @@ pub(crate) mod companions;
 pub(crate) mod config;
 pub(crate) mod gamestate;
 pub(crate) mod globals;
+pub(crate) mod hotkeys;
 pub(crate) mod models;
 pub(crate) mod persona;
 pub(crate) mod profiles;
@@ -163,6 +164,10 @@ pub(crate) fn api_router() -> Router<Arc<AppState>> {
         // --- bridge (connection config + live status) ------------------------
         .route("/settings/bridge", get(bridge::get_bridge))
         .route("/settings/bridge/save", post(bridge::save_bridge))
+        // --- hotkeys (in-game input bindings; save also pushes the bridge
+        // control/hotkeys.cfg the NVSE plugin live-polls) ----------------------
+        .route("/settings/hotkeys", get(hotkeys::get_hotkeys))
+        .route("/settings/hotkeys/save", post(hotkeys::save_hotkeys))
         // --- tracing (READ-ONLY trace viewer; reuses the shared trace cores) -
         // The legacy `/traces` handlers already parse the per-request JSONL into
         // the same list + waterfall view; the SPA reads them under /api/ui/v1 too

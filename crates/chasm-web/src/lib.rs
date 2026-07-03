@@ -378,6 +378,19 @@ pub fn router(config: AppConfig) -> Router {
     // localhost hop) when `CHASM_FNV_BRIDGE` is set. Shares this runtime +
     // AppState; off by default so the standalone bin / HTTP path is unaffected.
     if tokio::runtime::Handle::try_current().is_ok() && fnv_bridge::in_process_enabled() {
+        // Seed the bridge hotkeys file from persisted settings so the in-game
+        // plugin picks up custom bindings even if the Hotkeys screen is never
+        // opened this session (saves rewrite it too; see ui::hotkeys).
+        {
+            let settings = chasm_core::AppSettings::load(&state.config.settings_path);
+            if let Err(err) = chasm_core::hotkeys::write_bridge_hotkeys_file(
+                &chasm_core::default_bridge_root(),
+                &settings.hotkeys,
+            ) {
+                tracing::warn!("failed to seed bridge hotkeys file: {err}");
+            }
+        }
+
         let bridge_state = Arc::clone(&state);
         tokio::spawn(async move {
             fnv_bridge::spawn_in_process(bridge_state).await;
