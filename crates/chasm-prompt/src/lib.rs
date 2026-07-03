@@ -9,8 +9,15 @@
 //! activation, the action/quest/structured formatters and constants, history)
 //! are reproduced faithfully. The runtime-only pieces — vector activation and
 //! chat-vector retrieval (need the embeddings backend), and per-request inputs
-//! like gamestate / world-state scopes / TTS audio tags — are shown as
-//! correctly-ordered placeholders rather than guessed at.
+//! like the global scenario (resolves gamestate macros per turn) / world-state
+//! scopes / TTS audio tags — are shown as correctly-ordered placeholders
+//! rather than guessed at.
+//!
+//! Scenario note: since the Globals rework, the `Scenario` component comes
+//! from the GLOBAL scenario template (Globals page, `{{macro}}` placeholders
+//! resolved per turn — see [`scenario`]), NOT from the per-character card
+//! `scenario` field. The card field is still parsed and stored for imported
+//! SillyTavern cards, but it never reaches the prompt.
 
 use std::cmp::Ordering;
 
@@ -19,6 +26,9 @@ pub use lore_injection::*;
 
 pub mod macros;
 pub use macros::{apply_macros, macros_from_metadata, macros_from_value};
+
+pub mod scenario;
+pub use scenario::{participants_macro, DEFAULT_SCENARIO_TEMPLATE};
 
 use regex::RegexBuilder;
 use serde_json::Value;
@@ -637,6 +647,45 @@ impl Builder {
     }
 }
 
+/// Pushes the GLOBAL scenario component in the slot the per-character card
+/// `scenario` field used to occupy (see [`assemble_prompt_with_retrieval_collect`]).
+///
+/// * `Some(text)` (non-blank) — included, formatted exactly like the old card
+///   field (`"Scenario:\n{text}"`), so downstream `build_chat_messages`-style
+///   consumers see an identical shape.
+/// * `Some(blank)` — the user cleared the global template (or every macro in
+///   it resolved empty): the component is omitted entirely.
+/// * `None` — static/panel assembly with no live turn: a `generation-time`
+///   placeholder keeps the send order visible without guessing at macros.
+fn push_global_scenario(builder: &mut Builder, global_scenario: Option<&str>) {
+    match global_scenario {
+        Some(text) => {
+            let text = text.trim();
+            if !text.is_empty() {
+                builder.push(
+                    "system",
+                    "scenario",
+                    "Scenario",
+                    "system",
+                    "included",
+                    "Global scenario template, gamestate macros resolved for this turn.",
+                    format!("Scenario:\n{text}"),
+                );
+            }
+        }
+        None => builder.push(
+            "system",
+            "scenario",
+            "Scenario",
+            "system",
+            "generation-time",
+            "Global scenario template (Globals page) — {{macro}} placeholders resolve \
+             against the turn's gamestate at generation time.",
+            String::new(),
+        ),
+    }
+}
+
 /// Normalizes a slug-style key for native-NPC matching: lowercase, non
 /// alphanumeric collapsed to a single space (so `easy_pete` ~ `Easy Pete`),
 /// mirroring the loose `normalizeSlugKey`/`normalizeLookupKey` comparison in
@@ -1051,6 +1100,10 @@ pub fn assemble_prompt_with_retrieval(
     requested_scopes: &[String],
     ctx: Option<RetrievalCtx>,
 ) -> PromptAssemblyView {
+    // The static/panel path has no live turn, so the GLOBAL scenario (a
+    // per-request input: it resolves gamestate macros per turn) is shown as a
+    // correctly-ordered placeholder (`None`), like the other runtime-only
+    // pieces.
     assemble_prompt_with_retrieval_collect(
         repo,
         participant,
@@ -1059,6 +1112,7 @@ pub fn assemble_prompt_with_retrieval(
         scan_text,
         requested_scopes,
         ctx,
+        None,
     )
     .0
 }
@@ -1071,6 +1125,19 @@ pub fn assemble_prompt_with_retrieval(
 /// the model saw. The prompt TEXT (the returned [`PromptAssemblyView`]) is
 /// unchanged — this only surfaces the entry identities that were previously
 /// discarded after assembly.
+///
+/// `global_scenario` is the GLOBAL scenario for this turn — the Globals-page
+/// template already resolved through the turn's gamestate macros (see
+/// [`crate::scenario`]). It is injected at the exact slot the per-character
+/// card `scenario` field used to occupy in the ST-style assembly order
+/// (after `Personality`, before `Example dialogue`); the card field itself is
+/// no longer injected (still parsed/stored for imported-card compat).
+/// * `Some(text)`  — inject `text` as the `Scenario` component (skipped when
+///   blank after trimming).
+/// * `None`        — no live turn (the static panel): a correctly-ordered
+///   `generation-time` placeholder is shown instead, like the other
+///   per-request inputs.
+#[allow(clippy::too_many_arguments)]
 pub fn assemble_prompt_with_retrieval_collect(
     repo: &LiveChatRepository,
     participant: &ParticipantView,
@@ -1079,6 +1146,7 @@ pub fn assemble_prompt_with_retrieval_collect(
     action_scan: &str,
     requested_scopes: &[String],
     ctx: Option<RetrievalCtx>,
+    global_scenario: Option<&str>,
 ) -> (PromptAssemblyView, InjectedView) {
     let mut notes: Vec<String> = Vec::new();
     let mut builder = Builder::new();
@@ -1114,16 +1182,15 @@ pub fn assemble_prompt_with_retrieval_collect(
             "",
             format!("Character: {}", card.name),
         );
+        // NOTE: `card.scenario` is deliberately NOT in this list any more. The
+        // scenario slot is filled by the GLOBAL scenario template below
+        // (resolved with gamestate macros per turn); the card field is only
+        // tolerated for imported-ST-card storage compat (see
+        // `chasm_st_compat::CharacterCard::scenario`).
         for (key, label, value) in [
             ("system_prompt", "System prompt", &card.system_prompt),
             ("description", "Description", &card.description),
             ("personality", "Personality", &card.personality),
-            ("scenario", "Scenario", &card.scenario),
-            (
-                "example_dialogue",
-                "Example dialogue",
-                &card.example_dialogue,
-            ),
         ] {
             if !value.is_empty() {
                 builder.push(
@@ -1137,6 +1204,18 @@ pub fn assemble_prompt_with_retrieval_collect(
                 );
             }
         }
+        push_global_scenario(&mut builder, global_scenario);
+        if !card.example_dialogue.is_empty() {
+            builder.push(
+                "system",
+                "example_dialogue",
+                "Example dialogue",
+                "system",
+                "included",
+                "",
+                format!("Example dialogue:\n{}", card.example_dialogue),
+            );
+        }
     } else {
         builder.push(
             "system",
@@ -1147,6 +1226,9 @@ pub fn assemble_prompt_with_retrieval_collect(
             "No character card resolved for this participant.",
             String::new(),
         );
+        // The scenario is global (scene, not persona), so a card-less
+        // participant still gets it, at the same position in the order.
+        push_global_scenario(&mut builder, global_scenario);
     }
 
     // --- Activated lore -----------------------------------------------------
@@ -2077,6 +2159,120 @@ mod tests {
         dir
     }
 
+    /// The minimal PNG the compat card reader accepts: signature + one `chara`
+    /// tEXt chunk (base64-encoded card JSON) + IEND. CRCs are not validated by
+    /// the reader, so they are written as zeros.
+    fn png_card(json: &str) -> Vec<u8> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let mut data = Vec::new();
+        data.extend_from_slice(b"chara");
+        data.push(0);
+        data.extend_from_slice(STANDARD.encode(json.as_bytes()).as_bytes());
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(b"tEXt");
+        out.extend_from_slice(&data);
+        out.extend_from_slice(&[0, 0, 0, 0]); // tEXt CRC (unchecked)
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(b"IEND");
+        out.extend_from_slice(&[0, 0, 0, 0]); // IEND CRC (unchecked)
+        out
+    }
+
+    #[test]
+    fn scenario_component_comes_from_global_template_not_card() {
+        // A card WITH a scenario field on disk: the assembler must inject the
+        // GLOBAL scenario at that slot and never the card's own text.
+        let root = scratch_dir("global-scenario");
+        let characters_dir = root.join("characters");
+        std::fs::create_dir_all(&characters_dir).unwrap();
+        let card_json = serde_json::json!({
+            "name": "Sunny Smiles",
+            "personality": "Friendly scout.",
+            "scenario": "CARD SCENARIO — must never be injected",
+            "mes_example": "Example line.",
+        });
+        std::fs::write(
+            characters_dir.join("Sunny Smiles.png"),
+            png_card(&card_json.to_string()),
+        )
+        .unwrap();
+
+        let repo = LiveChatRepository::new(&root);
+        let speaker = participant("Sunny Smiles", Some("Sunny Smiles"));
+
+        // Live turn: the resolved global scenario fills the card-scenario slot.
+        let (view, _) = assemble_prompt_with_retrieval_collect(
+            &repo,
+            &speaker,
+            &[],
+            "hi",
+            "hi",
+            &[],
+            None,
+            Some("It is night. You are in Goodsprings."),
+        );
+        let scenario = view
+            .components
+            .iter()
+            .find(|component| component.key == "scenario")
+            .expect("scenario component present");
+        assert_eq!(scenario.status, "included");
+        assert_eq!(
+            scenario.content,
+            "Scenario:\nIt is night. You are in Goodsprings."
+        );
+        // Same position in the ST assembly order as the old card field:
+        // after Personality, before Example dialogue.
+        fn index_of(view: &PromptAssemblyView, key: &str) -> usize {
+            view.components
+                .iter()
+                .position(|component| component.key == key)
+                .unwrap_or_else(|| panic!("component {key} present"))
+        }
+        assert!(index_of(&view, "personality") < index_of(&view, "scenario"));
+        assert!(index_of(&view, "scenario") < index_of(&view, "example_dialogue"));
+        // The per-character card scenario is tolerated on disk but NEVER injected.
+        assert!(view
+            .components
+            .iter()
+            .all(|component| !component.content.contains("CARD SCENARIO")));
+
+        // Blank global scenario (cleared template / all-empty macros) -> the
+        // component is omitted entirely, not injected as an empty block.
+        let (view, _) = assemble_prompt_with_retrieval_collect(
+            &repo,
+            &speaker,
+            &[],
+            "hi",
+            "hi",
+            &[],
+            None,
+            Some("   "),
+        );
+        assert!(view
+            .components
+            .iter()
+            .all(|component| component.key != "scenario"));
+
+        // Static panel (no live turn): a correctly-ordered placeholder.
+        let (view, _) = assemble_prompt_with_retrieval_collect(
+            &repo, &speaker, &[], "hi", "hi", &[], None, None,
+        );
+        let placeholder = view
+            .components
+            .iter()
+            .find(|component| component.key == "scenario")
+            .expect("scenario placeholder present");
+        assert_eq!(placeholder.status, "generation-time");
+        assert!(placeholder.content.is_empty());
+        assert!(index_of(&view, "personality") < index_of(&view, "scenario"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn assembly_returns_injected_action_entries_with_reason() {
         // Lay down a single action book with one CONSTANT (always-on) action and
@@ -2118,6 +2314,7 @@ mod tests {
             "Hey, please follow me to town.",
             "Hey, please follow me to town.",
             &[],
+            None,
             None,
         );
 

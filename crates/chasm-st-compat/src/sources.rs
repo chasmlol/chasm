@@ -26,6 +26,11 @@ pub struct CharacterCard {
     pub system_prompt: String,
     pub description: String,
     pub personality: String,
+    /// The card's own scenario field. STORAGE COMPAT ONLY: imported SillyTavern
+    /// cards may carry it and it round-trips through save/re-embed untouched,
+    /// but prompt assembly no longer injects it — the Scenario slot is filled
+    /// by the GLOBAL scenario template (Globals page; see
+    /// `chasm_prompt::scenario`), resolved with gamestate macros per turn.
     pub scenario: String,
     pub example_dialogue: String,
     /// Linked world/lorebook name from `data.extensions.world`, when present.

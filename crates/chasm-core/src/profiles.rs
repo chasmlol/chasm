@@ -221,6 +221,18 @@ impl ProfilePaths {
         )
     }
 
+    /// Globals store file (app-wide prompt building blocks, e.g. the global
+    /// scenario template): `profiles/<id>/headless/globals.json` or
+    /// `{data_root}/headless/globals.json`. Resolved on the file itself (same
+    /// rule as [`Self::live_chats_store`]): a fresh install writes the legacy
+    /// location until the profile ships/migrates its own copy.
+    pub fn globals_store(&self) -> PathBuf {
+        self.resolve(
+            &["headless", "globals.json"],
+            self.data_root.join("headless").join("globals.json"),
+        )
+    }
+
     /// Embed cache dir: `profiles/<id>/embed-cache` or the legacy embed cache dir
     /// (`CHASM_EMBED_DIR` / `{data_root}/embed-cache`).
     pub fn embed_cache_dir(&self) -> PathBuf {

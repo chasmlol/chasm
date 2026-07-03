@@ -611,6 +611,12 @@ fn project_character(id: &str, card: &Value) -> UiBookEntry {
 
 /// The persona fields editable from the Characters screen, mapped to the card's
 /// JSON key. The UI value key is the first element, the card key the second.
+///
+/// `scenario` stays in this map for STORAGE COMPAT ONLY: the Characters screen
+/// no longer shows the field (the scenario is global now — Globals → Scenario,
+/// see `ui/globals.rs`), so the form never sends it and the imported card's
+/// value is preserved untouched. It is not injected into prompts either
+/// (`chasm-prompt` fills that slot from the global template).
 const CHARACTER_FIELDS: &[(&str, &str)] = &[
     ("name", "name"),
     ("systemPrompt", "system_prompt"),

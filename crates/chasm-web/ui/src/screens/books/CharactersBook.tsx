@@ -31,13 +31,10 @@ const CHARACTER_FIELDS: BookField[] = [
     kind: "textarea",
     rows: 3,
   },
-  {
-    key: "scenario",
-    label: "Scenario",
-    kind: "textarea",
-    rows: 3,
-    help: "The situation the character is in when the player meets them.",
-  },
+  // NOTE: no "scenario" field here any more. The scenario is GLOBAL now
+  // (Globals → Scenario), resolved with gamestate macros per turn; the
+  // per-card field is dead data in prompts (still tolerated on imported
+  // cards, just not editable or injected).
   {
     key: "firstMessage",
     label: "First message",

@@ -11,10 +11,11 @@
 //!     recorded one), run ONE minimal system+user completion against the same
 //!     local LLM the NPC turns use, and return the resolved prompt + the reply.
 //!
-//! This is the ONLY place `chasm_prompt::apply_macros` runs this pass — the
-//! production NPC prompt path (`assemble_prompt_with_retrieval_collect`, cards,
-//! lore) is deliberately untouched; where macros eventually plug into real
-//! prompts is a later decision proven safe by this harness first.
+//! Since the Globals rework, production macro substitution exists but is
+//! scoped to ONE component: the GLOBAL scenario template (`generate.rs`
+//! resolves it per turn; see `chasm_prompt::scenario`). Cards, lore, and
+//! system prompts still never run macros; this page and the Globals preview
+//! stay the free-form proof surfaces.
 //!
 //! Like the rest of `/api/ui/v1`, this is UI-only: it never touches the game
 //! transport (`/api/game/*`) or the headless contract (`/api/headless/*`).
@@ -25,8 +26,10 @@ use axum::{extract::State, Json};
 use serde::Serialize;
 use serde_json::{json, Value};
 use chasm_core::AppSettings;
-use chasm_st_compat::LiveChat;
 
+// The latest-recorded-macros snapshot + active-chat pick are shared with the
+// generation path (the scenario fallback reads the same source this page shows).
+use crate::generate::{active_live_chat, latest_chat_macros};
 use crate::{AppState, WebError, WebResult};
 
 /// Builds a `WebError` carrying `message` (rendered as the JSON error body).
@@ -62,85 +65,6 @@ pub(crate) struct UiGamestateTest {
     /// page can explain why every macro resolved to nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-}
-
-/// The newest macros-bearing turn of one live chat: `(send_date, macros)`.
-///
-/// The live game path writes each NPC's history to its per-participant
-/// PROJECTION session while older / group-mode chats use the shared segment
-/// sessions (see `messages_for_participant` in chasm-st-compat) — and the two
-/// overlap for turns visible to several NPCs. Scanning both and keeping the
-/// newest `send_date` works for every layout: duplicated copies of a turn carry
-/// the same macro table, so whichever copy wins the tie is correct.
-fn latest_chat_macros(state: &AppState, live_chat: &LiveChat) -> (Option<String>, Value) {
-    let mut session_ids: Vec<String> = live_chat
-        .segments
-        .iter()
-        .map(|segment| segment.session_id.clone())
-        .collect();
-    if let Some(sessions) = live_chat.participant_sessions.as_object() {
-        // Projection entries are `{ "sessionId": "…" }` objects (see
-        // `participant_session_id`), but tolerate raw strings too.
-        session_ids.extend(sessions.values().filter_map(|entry| {
-            entry
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .or_else(|| entry.as_str())
-                .filter(|id| !id.is_empty())
-                .map(str::to_string)
-        }));
-    }
-    session_ids.sort();
-    session_ids.dedup();
-
-    let mut best: Option<(String, Value)> = None;
-    for session_id in &session_ids {
-        // Unreadable / not-yet-created sessions are skipped rather than failing
-        // the whole view — the page should always render.
-        let Ok(messages) = state.repository.read_session_messages(session_id) else {
-            continue;
-        };
-        for message in messages {
-            let Some(macros) = message
-                .extra
-                .get("chasm")
-                .and_then(|chasm| chasm.get("macros"))
-                .filter(|macros| macros.as_object().is_some_and(|map| !map.is_empty()))
-            else {
-                continue;
-            };
-            // ISO-8601 timestamps compare lexicographically; `>=` keeps the
-            // later-in-file copy on equal stamps.
-            let send_date = message.send_date.clone().unwrap_or_default();
-            if best
-                .as_ref()
-                .map_or(true, |(best_date, _)| send_date.as_str() >= best_date.as_str())
-            {
-                best = Some((send_date, macros.clone()));
-            }
-        }
-    }
-
-    match best {
-        Some((send_date, macros)) => {
-            let updated_at = (!send_date.is_empty()).then_some(send_date);
-            (updated_at, macros)
-        }
-        None => (None, json!({})),
-    }
-}
-
-/// The active live chat: most recently updated first, so a stale chat sitting
-/// in the store never shadows the one the game is writing to.
-fn active_live_chat(state: &AppState) -> WebResult<Option<LiveChat>> {
-    let mut chats = state.repository.list_live_chats()?;
-    chats.sort_by(|a, b| {
-        b.updated_at
-            .clone()
-            .unwrap_or_default()
-            .cmp(&a.updated_at.clone().unwrap_or_default())
-    });
-    Ok(chats.into_iter().next())
 }
 
 /// `GET /api/ui/v1/gamestate` — the latest recorded macro table + timestamp.

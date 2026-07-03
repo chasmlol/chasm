@@ -18,6 +18,7 @@ export * from "./models";
 export * from "./config";
 export * from "./chat";
 export * from "./gamestate";
+export * from "./globals";
 
 import { systemApi } from "./system";
 import { booksApi } from "./books";
@@ -25,8 +26,17 @@ import { modelsApi } from "./models";
 import { configApi } from "./config";
 import { chatApi } from "./chat";
 import { gamestateApi } from "./gamestate";
+import { globalsApi } from "./globals";
 
-export { systemApi, booksApi, modelsApi, configApi, chatApi, gamestateApi };
+export {
+  systemApi,
+  booksApi,
+  modelsApi,
+  configApi,
+  chatApi,
+  gamestateApi,
+  globalsApi,
+};
 
 /**
  * Flat convenience surface. The system methods are hoisted to the top level for
@@ -40,4 +50,5 @@ export const api = {
   config: configApi,
   chat: chatApi,
   gamestate: gamestateApi,
+  globals: globalsApi,
 };

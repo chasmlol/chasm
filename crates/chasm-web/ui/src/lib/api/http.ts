@@ -25,5 +25,18 @@ export async function postJson<T>(url: string, body: unknown): Promise<T> {
   return (await res.json()) as T;
 }
 
+export async function putJson<T>(url: string, body: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`${url} → ${res.status} ${res.statusText}`);
+  return (await res.json()) as T;
+}
+
 /** Base path for the UI JSON API. */
 export const UI_API = "/api/ui/v1";

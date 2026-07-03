@@ -51,6 +51,28 @@ pub struct LiveChatStore {
     pub items: BTreeMap<String, LiveChat>,
 }
 
+/// The Globals store (`headless/globals.json`): app-wide prompt building blocks
+/// that belong to no single character or book. Today that is the global
+/// scenario template; future globals land as new fields here (unknown keys
+/// already survive a read→write round-trip via `extra`).
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct GlobalsStore {
+    /// The global scenario prompt template ({{macro}} placeholders allowed).
+    /// Replaces the per-character card `scenario` field in prompt assembly.
+    /// Semantics: `None` = never saved → callers fall back to the built-in
+    /// default template; `Some("")` = explicitly cleared → the scenario
+    /// component is omitted from prompts entirely.
+    #[serde(
+        default,
+        rename = "scenarioTemplate",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub scenario_template: Option<String>,
+    /// Forward-compat: any other keys in `globals.json` are preserved verbatim.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveChat {
@@ -305,6 +327,50 @@ impl LiveChatRepository {
         let mut store = self.read_store()?;
         let out = mutate(&mut store);
         self.write_store(&store)?;
+        Ok(out)
+    }
+
+    /// Path to the Globals store, resolved under the active profile
+    /// (`profiles/<id>/headless/globals.json`) with a legacy fallback — the
+    /// same per-subpath rule as [`Self::store_path`].
+    pub fn globals_store_path(&self) -> PathBuf {
+        self.paths().globals_store()
+    }
+
+    /// Reads the Globals store (`headless/globals.json`). A missing file is the
+    /// pristine default (every global unset), not an error.
+    pub fn read_globals(&self) -> Result<GlobalsStore> {
+        let path = self.globals_store_path();
+        if !path.exists() {
+            return Ok(GlobalsStore::default());
+        }
+        read_json_file(&path)
+    }
+
+    /// Persists the Globals store, pretty-printed like the live-chats store.
+    pub fn write_globals(&self, store: &GlobalsStore) -> Result<()> {
+        let path = self.globals_store_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| CompatError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let text = serde_json::to_string_pretty(store).map_err(|source| CompatError::Json {
+            path: path.clone(),
+            source,
+        })?;
+        fs::write(&path, text).map_err(|source| CompatError::Io {
+            path: path.clone(),
+            source,
+        })
+    }
+
+    /// Reads, mutates, and writes the Globals store in one shot.
+    pub fn update_globals<T>(&self, mutate: impl FnOnce(&mut GlobalsStore) -> T) -> Result<T> {
+        let mut store = self.read_globals()?;
+        let out = mutate(&mut store);
+        self.write_globals(&store)?;
         Ok(out)
     }
 
@@ -1112,6 +1178,46 @@ mod tests {
         assert!(!out.contains("Howdy stranger"), "Pete's own line removed");
         assert!(out.contains("Watch the geckos"), "Sunny's overheard line kept");
         assert!(out.contains("hey everyone"), "shared room line kept");
+    }
+
+    #[test]
+    fn globals_store_round_trips_and_defaults_when_missing() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("chasm-test-globals-{nanos}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = LiveChatRepository::new(&root);
+
+        // Missing file -> pristine defaults (scenario unset), not an error.
+        let store = repo.read_globals().unwrap();
+        assert!(store.scenario_template.is_none());
+
+        // Save a template; it survives a re-read, and unknown keys placed in
+        // the file by future versions survive an update round-trip.
+        repo.update_globals(|globals| {
+            globals.scenario_template = Some("It is {{time_of_day}}.".to_string());
+            globals
+                .extra
+                .insert("futureKey".to_string(), serde_json::json!({ "keep": true }));
+        })
+        .unwrap();
+        let store = repo.read_globals().unwrap();
+        assert_eq!(
+            store.scenario_template.as_deref(),
+            Some("It is {{time_of_day}}.")
+        );
+        assert_eq!(store.extra["futureKey"]["keep"], true);
+        // Written under headless/globals.json (mirrors live-chats.json).
+        assert!(root.join("headless").join("globals.json").exists());
+
+        // Explicitly cleared (`Some("")`) is distinct from never-saved (`None`).
+        repo.update_globals(|globals| globals.scenario_template = Some(String::new()))
+            .unwrap();
+        assert_eq!(repo.read_globals().unwrap().scenario_template.as_deref(), Some(""));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

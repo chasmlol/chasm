@@ -820,6 +820,7 @@ dependencies = [
 name = "chasm-prompt"
 version = "0.2.18"
 dependencies = [
+ "base64 0.22.1",
  "chasm-core",
  "chasm-embed",
  "chasm-st-compat",

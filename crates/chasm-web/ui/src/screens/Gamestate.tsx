@@ -32,8 +32,9 @@ import { cn } from "@/lib/utils";
 // BOTTOM: the tester — paste a system-prompt template containing `{{macro}}`
 // placeholders and Run test. The backend resolves it against the latest
 // recorded table (unknown macros → empty), runs ONE minimal system+user
-// generation, and returns the RESOLVED prompt + the model's reply. This is the
-// proof-of-pipeline surface; nothing here touches the real NPC prompts.
+// generation, and returns the RESOLVED prompt + the model's reply. The tester
+// itself never touches real NPC prompts; production macro use is scoped to
+// the GLOBAL scenario template (Globals → Scenario).
 // ===========================================================================
 
 const DEFAULT_TEMPLATE =
@@ -167,8 +168,9 @@ export function Gamestate() {
           <>
             The live macro table the mod extracts each turn, and a tester that
             resolves <code className="font-mono">{"{{macro}}"}</code>{" "}
-            placeholders against it and runs a generation. Real NPC prompts are
-            untouched — this page is the proof surface.
+            placeholders against it and runs a generation. In production these
+            macros drive the global scenario (Globals → Scenario); this page is
+            the raw proof surface.
           </>
         }
         actions={

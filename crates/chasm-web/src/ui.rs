@@ -39,6 +39,7 @@ pub(crate) mod bridge;
 pub(crate) mod chat;
 pub(crate) mod config;
 pub(crate) mod gamestate;
+pub(crate) mod globals;
 pub(crate) mod models;
 pub(crate) mod profiles;
 pub(crate) mod settings;
@@ -91,10 +92,19 @@ pub(crate) fn api_router() -> Router<Arc<AppState>> {
         )
         // --- chat (read-only live-chat projection; STUB) ---------------------
         .route("/chat/view", get(chat::chat_view))
-        // --- gamestate (latest recorded macro table + the substitution tester;
-        // the ONLY surface that runs `apply_macros` this pass) ----------------
+        // --- gamestate (latest recorded macro table + the substitution tester) -
         .route("/gamestate", get(gamestate::gamestate_view))
         .route("/gamestate/test", post(gamestate::gamestate_test))
+        // --- globals (global scenario template: the production macro surface,
+        // replacing the per-character card scenario; + resolved preview) ------
+        .route(
+            "/globals/scenario",
+            get(globals::get_scenario).put(globals::put_scenario),
+        )
+        .route(
+            "/globals/scenario/preview",
+            post(globals::preview_scenario),
+        )
         // --- profiles (list + activate the active game profile) --------------
         .route("/profiles", get(profiles::list_profiles))
         .route("/profiles/select", post(profiles::select_profile))

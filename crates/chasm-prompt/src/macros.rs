@@ -6,10 +6,12 @@
 //! [`apply_macros`] is the whole substitution engine: plain string replacement,
 //! no defaults, conditionals, randoms, or nested expansion (future iterations).
 //!
-//! This pass the engine is exercised ONLY by the Gamestate test endpoint
-//! (`POST /api/ui/v1/gamestate/test`) — it is deliberately NOT applied to the
-//! production NPC prompt (`assemble_prompt_with_retrieval_collect` and friends
-//! stay macro-free until injection is designed).
+//! Production injection is scoped to ONE component: the GLOBAL scenario
+//! template (see [`crate::scenario`]), resolved per turn by the generation
+//! path with the turn's macros plus backend-computed ones (`{{participants}}`).
+//! No other prompt component (cards, lore, system prompt) runs macros; the
+//! Gamestate test endpoint (`POST /api/ui/v1/gamestate/test`) and the Globals
+//! preview remain the free-form proof surfaces.
 
 use std::collections::BTreeMap;
 
@@ -107,10 +109,10 @@ mod tests {
 
     #[test]
     fn substitutes_multiple_macros_in_one_string() {
-        let macros = table(&[("major_location", "Goodsprings"), ("time_of_day", "afternoon (14:32)")]);
+        let macros = table(&[("major_location", "Goodsprings"), ("time_of_day", "2:32PM")]);
         assert_eq!(
             apply_macros("You are in {{major_location}}. It is {{time_of_day}}.", &macros),
-            "You are in Goodsprings. It is afternoon (14:32)."
+            "You are in Goodsprings. It is 2:32PM."
         );
     }
 

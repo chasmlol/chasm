@@ -13,3 +13,7 @@ serde_json.workspace = true
 chasm-core = { path = "../chasm-core" }
 chasm-embed = { path = "../chasm-embed" }
 chasm-st-compat = { path = "../chasm-st-compat" }
+
+[dev-dependencies]
+# Tests build minimal PNG character cards (base64-encoded tEXt payloads).
+base64.workspace = true

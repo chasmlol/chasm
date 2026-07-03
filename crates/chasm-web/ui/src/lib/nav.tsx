@@ -6,6 +6,7 @@ import {
   ScrollText,
   Swords,
   Variable,
+  Globe,
   SlidersHorizontal,
   Layers,
   Cpu,
@@ -59,6 +60,17 @@ export const NAV_GROUPS: NavGroup[] = [
         label: "Gamestate",
         path: "gamestate",
         icon: Variable,
+      },
+    ],
+  },
+  {
+    label: "Globals",
+    items: [
+      {
+        key: "globals-scenario",
+        label: "Scenario",
+        path: "globals/scenario",
+        icon: Globe,
       },
     ],
   },

@@ -427,11 +427,21 @@ struct TurnContext {
     extra_context: String,
     gamestate: Value,
     player_metadata: Value,
-    /// The turn's gamestate macro table (`metadata.macros`, flat key→value),
-    /// extracted once so `finalize_turn` can record it on the persisted message
-    /// (`extra.chasm.macros`). NOT threaded into prompt assembly or retrieval —
-    /// substitution only runs in the Gamestate test harness this pass.
+    /// The turn's FRESH gamestate macro table (`metadata.macros`, flat
+    /// key→value), extracted once so `finalize_turn` can record it verbatim on
+    /// the persisted message (`extra.chasm.macros`) — never back-filled from
+    /// older turns, so the recorded history stays honest. Prompt-side macro use
+    /// goes through `scenario_macros` below; retrieval stays macro-free.
     macros: BTreeMap<String, String>,
+    /// The macro table the GLOBAL scenario resolves against this request:
+    /// `macros` when the mod sent a table this turn, else the latest recorded
+    /// `extra.chasm.macros` (the same source the Gamestate page reads), so
+    /// UI/admin-driven turns still see real values. Backend-computed macros
+    /// (`{{participants}}`) are merged per speaker in `prepare_speaker_turn`.
+    scenario_macros: BTreeMap<String, String>,
+    /// The effective global scenario template (Globals store value, else the
+    /// built-in default; empty = user disabled the scenario component).
+    scenario_template: String,
     /// Action-book scopes the request supplies (`actionBookScopes`). Gates
     /// scope-restricted actions (e.g. admin-only spawn). Empty for regular NPCs
     /// unless the helper sends them.
@@ -523,6 +533,14 @@ fn resolve_turn_context(state: &Arc<AppState>, id: &str, body: &Value) -> WebRes
 
     let player_metadata = body.get("metadata").cloned().unwrap_or(Value::Null);
     let macros = chasm_prompt::macros_from_metadata(&player_metadata);
+    // Scenario resolution uses the freshest table available: this turn's macros
+    // when the mod sent them, else the latest recorded table from this chat.
+    let scenario_macros = if macros.is_empty() {
+        chasm_prompt::macros_from_value(&latest_chat_macros(state, &live_chat).1)
+    } else {
+        macros.clone()
+    };
+    let scenario_template = global_scenario_template(state);
 
     Ok(TurnContext {
         live_chat,
@@ -534,9 +552,163 @@ fn resolve_turn_context(state: &Arc<AppState>, id: &str, body: &Value) -> WebRes
         gamestate,
         player_metadata,
         macros,
+        scenario_macros,
+        scenario_template,
         requested_scopes: parse_action_book_scopes(body),
         orchestrator,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Global scenario (the ONLY production surface that resolves gamestate macros)
+// ---------------------------------------------------------------------------
+
+/// The effective global scenario template: the Globals store value when saved
+/// (empty string = the user explicitly disabled the component), else the
+/// built-in `chasm_prompt::DEFAULT_SCENARIO_TEMPLATE`. Read fresh per request
+/// so a Globals-page save applies on the very next turn.
+pub(crate) fn global_scenario_template(state: &AppState) -> String {
+    match state.repository.read_globals() {
+        Ok(store) => store
+            .scenario_template
+            .unwrap_or_else(|| chasm_prompt::DEFAULT_SCENARIO_TEMPLATE.to_string()),
+        Err(error) => {
+            tracing::warn!(
+                "globals store read failed ({error}); using the default scenario template"
+            );
+            chasm_prompt::DEFAULT_SCENARIO_TEMPLATE.to_string()
+        }
+    }
+}
+
+/// Merges the BACKEND-COMPUTED macros for one prompted character over the
+/// turn's table (a computed key deliberately wins over a same-named mod key —
+/// the backend knows the conversation better than the game plugin does).
+///
+/// Today that is `{{participants}}`: the player (named via the table's
+/// `player_name`) plus the OTHER NPCs in the conversation. Future computed
+/// macros belong here so every caller (live, admin, Globals preview) picks
+/// them up together.
+fn insert_computed_macros(macros: &mut BTreeMap<String, String>, other_npcs: &[String]) {
+    let player_name = macros.get("player_name").cloned().unwrap_or_default();
+    macros.insert(
+        "participants".to_string(),
+        chasm_prompt::participants_macro(&player_name, other_npcs),
+    );
+}
+
+/// The OTHER present NPCs of a conversation (excluding the character being
+/// prompted), by display name — the NPC half of `{{participants}}`. Presence
+/// order is the store's participant-id order (BTreeMap), so it is stable.
+fn other_npc_names(live_chat: &LiveChat, speaker_participant_id: &str) -> Vec<String> {
+    orchestrator::compute_eligible(live_chat)
+        .into_iter()
+        .filter(|participant| participant.participant_id != speaker_participant_id)
+        .map(|participant| participant.name)
+        .collect()
+}
+
+/// Resolves the GLOBAL scenario text for one prompted character: computed
+/// macros merged over `turn_macros`, then `apply_macros` on `template`.
+/// Returns "" (component omitted) when the template is blank. This is the
+/// scenario-only injection pass — no other prompt component runs macros.
+fn resolve_global_scenario(
+    template: &str,
+    turn_macros: &BTreeMap<String, String>,
+    other_npcs: &[String],
+) -> String {
+    if template.trim().is_empty() {
+        return String::new();
+    }
+    let mut macros = turn_macros.clone();
+    insert_computed_macros(&mut macros, other_npcs);
+    chasm_prompt::apply_macros(template, &macros)
+        .trim()
+        .to_string()
+}
+
+/// The newest macros-bearing turn of one live chat: `(send_date, macros)` from
+/// the persisted `extra.chasm.macros` blobs `finalize_turn` writes.
+///
+/// The live game path writes each NPC's history to its per-participant
+/// PROJECTION session while older / group-mode chats use the shared segment
+/// sessions (see `messages_for_participant` in chasm-st-compat) — and the two
+/// overlap for turns visible to several NPCs. Scanning both and keeping the
+/// newest `send_date` works for every layout: duplicated copies of a turn carry
+/// the same macro table, so whichever copy wins the tie is correct.
+///
+/// Shared by the generation path (scenario fallback when a turn arrives without
+/// fresh macros) and the Gamestate/Globals UI pages — one snapshot source.
+pub(crate) fn latest_chat_macros(state: &AppState, live_chat: &LiveChat) -> (Option<String>, Value) {
+    let mut session_ids: Vec<String> = live_chat
+        .segments
+        .iter()
+        .map(|segment| segment.session_id.clone())
+        .collect();
+    if let Some(sessions) = live_chat.participant_sessions.as_object() {
+        // Projection entries are `{ "sessionId": "…" }` objects (see
+        // `participant_session_id`), but tolerate raw strings too.
+        session_ids.extend(sessions.values().filter_map(|entry| {
+            entry
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .or_else(|| entry.as_str())
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        }));
+    }
+    session_ids.sort();
+    session_ids.dedup();
+
+    let mut best: Option<(String, Value)> = None;
+    for session_id in &session_ids {
+        // Unreadable / not-yet-created sessions are skipped rather than failing
+        // the whole lookup — callers should always get a table (even empty).
+        let Ok(messages) = state.repository.read_session_messages(session_id) else {
+            continue;
+        };
+        for message in messages {
+            let Some(macros) = message
+                .extra
+                .get("chasm")
+                .and_then(|chasm| chasm.get("macros"))
+                .filter(|macros| macros.as_object().is_some_and(|map| !map.is_empty()))
+            else {
+                continue;
+            };
+            // ISO-8601 timestamps compare lexicographically; `>=` keeps the
+            // later-in-file copy on equal stamps.
+            let send_date = message.send_date.clone().unwrap_or_default();
+            if best
+                .as_ref()
+                .map_or(true, |(best_date, _)| send_date.as_str() >= best_date.as_str())
+            {
+                best = Some((send_date, macros.clone()));
+            }
+        }
+    }
+
+    match best {
+        Some((send_date, macros)) => {
+            let updated_at = (!send_date.is_empty()).then_some(send_date);
+            (updated_at, macros)
+        }
+        None => (None, json!({})),
+    }
+}
+
+/// The active live chat: most recently updated first, so a stale chat sitting
+/// in the store never shadows the one the game is writing to. Shared by the
+/// admin scenario fallback and the Gamestate/Globals UI pages.
+pub(crate) fn active_live_chat(state: &AppState) -> WebResult<Option<LiveChat>> {
+    let mut chats = state.repository.list_live_chats()?;
+    chats.sort_by(|a, b| {
+        b.updated_at
+            .clone()
+            .unwrap_or_default()
+            .cmp(&a.updated_at.clone().unwrap_or_default())
+    });
+    Ok(chats.into_iter().next())
 }
 
 /// Runs the orchestrator. The deterministic path picks the forced speaker (when
@@ -688,6 +860,15 @@ fn prepare_speaker_turn(
         }),
         _ => None,
     };
+    // GLOBAL scenario for THIS speaker: the Globals template resolved with the
+    // turn's macro table + computed macros ({{participants}} excludes the
+    // speaker being prompted). Injected at the old card-scenario slot by the
+    // assembler. Deliberately NOT part of the retrieval scan text above.
+    let global_scenario = resolve_global_scenario(
+        &ctx.scenario_template,
+        &ctx.scenario_macros,
+        &other_npc_names(&ctx.live_chat, &speaker_participant_id),
+    );
     let (assembled, injected) = chasm_prompt::assemble_prompt_with_retrieval_collect(
         &state.repository,
         &speaker_view,
@@ -696,6 +877,7 @@ fn prepare_speaker_turn(
         &ctx.message,
         &ctx.requested_scopes,
         retrieval_ctx,
+        Some(&global_scenario),
     );
 
     let scene_roster = build_scene_roster(state, ctx, &speaker_participant_id, &speaker_name);
@@ -1975,6 +2157,20 @@ fn resolve_admin_run(state: &Arc<AppState>, body: &Value) -> WebResult<AdminRun>
         }),
         _ => None,
     };
+    // GLOBAL scenario for the admin turn: same template + macro-table rules as
+    // the live path (fresh request `metadata.macros`, else the latest recorded
+    // table of the active live chat). Admin sessions are 1-on-1, so
+    // {{participants}} names the player alone.
+    let global_scenario = {
+        let mut macros = chasm_prompt::macros_from_metadata(&request_metadata);
+        if macros.is_empty() {
+            if let Ok(Some(live_chat)) = active_live_chat(state) {
+                macros =
+                    chasm_prompt::macros_from_value(&latest_chat_macros(state, &live_chat).1);
+            }
+        }
+        resolve_global_scenario(&global_scenario_template(state), &macros, &[])
+    };
     // Admin (Todd) path uses the _collect variant so it ALSO gets the activated
     // actions' trusted execution/scoped-catalogs — relayed below via
     // metadata.activatedActions so Todd can fire ACTION_BOOK actions (gestures,
@@ -1988,6 +2184,7 @@ fn resolve_admin_run(state: &Arc<AppState>, body: &Value) -> WebResult<AdminRun>
         &message,
         &parse_action_book_scopes(body),
         retrieval_ctx,
+        Some(&global_scenario),
     );
 
     // Admin = Todd, who must stay terse. Append a hard one-sentence rule to the
@@ -2578,6 +2775,81 @@ mod tests {
         assert_eq!(decoded["mode"], "group");
         assert_eq!(decoded["chatId"], "Goodsprings");
         assert_eq!(decoded["groupId"], "fnv-goodsprings");
+    }
+
+    // --- Global scenario resolution -----------------------------------------
+
+    /// A LiveChat with the given present+audible NPCs (id, name).
+    fn group_chat(npcs: &[(&str, &str)]) -> LiveChat {
+        let mut chat = LiveChat::default();
+        for (id, name) in npcs {
+            chat.presence.insert(
+                id.to_string(),
+                LiveChatParticipant {
+                    participant_id: id.to_string(),
+                    kind: "npc".to_string(),
+                    character_id: Some(format!("char-{id}")),
+                    name: name.to_string(),
+                    present: Some(true),
+                    audible: Some(true),
+                    ..Default::default()
+                },
+            );
+        }
+        chat
+    }
+
+    #[test]
+    fn other_npc_names_excludes_the_prompted_speaker() {
+        let chat = group_chat(&[
+            ("npc-pete", "Easy Pete"),
+            ("npc-sunny", "Sunny Smiles"),
+            ("npc-trudy", "Trudy"),
+        ]);
+        assert_eq!(
+            other_npc_names(&chat, "npc-pete"),
+            vec!["Sunny Smiles".to_string(), "Trudy".to_string()]
+        );
+        // 1-on-1: no other NPCs.
+        let solo = group_chat(&[("npc-pete", "Easy Pete")]);
+        assert!(other_npc_names(&solo, "npc-pete").is_empty());
+    }
+
+    #[test]
+    fn resolves_global_scenario_with_computed_participants() {
+        let macros: BTreeMap<String, String> = [
+            ("player_name".to_string(), "Courier".to_string()),
+            ("time_of_day".to_string(), "11:10PM".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let resolved = resolve_global_scenario(
+            "It is {{time_of_day}}. You speak with {{participants}}.",
+            &macros,
+            &["Sunny Smiles".to_string(), "Trudy".to_string()],
+        );
+        assert_eq!(
+            resolved,
+            "It is 11:10PM. You speak with Courier, Sunny Smiles, and Trudy."
+        );
+
+        // 1-on-1 turn: participants is the player alone.
+        let solo = resolve_global_scenario("With {{participants}}.", &macros, &[]);
+        assert_eq!(solo, "With Courier.");
+
+        // Blank template = user disabled the component: resolves to "" (the
+        // assembler then omits the scenario entirely).
+        assert_eq!(resolve_global_scenario("   ", &macros, &[]), "");
+
+        // Empty macro table degrades but never leaks placeholders; the
+        // computed participants still names the player.
+        let empty = resolve_global_scenario(
+            chasm_prompt::DEFAULT_SCENARIO_TEMPLATE,
+            &BTreeMap::new(),
+            &[],
+        );
+        assert!(!empty.contains("{{"), "no unresolved macros: {empty}");
+        assert!(empty.contains("You are in a conversation with the player."));
     }
 
     // --- Admin / "Todd" single-character generation ------------------------
