@@ -13,6 +13,7 @@ import { LoreBook } from "@/screens/books/LoreBook";
 import { QuestBook } from "@/screens/books/QuestBook";
 import { ActionBook } from "@/screens/books/ActionBook";
 import { Gamestate } from "@/screens/Gamestate";
+import { Relationships } from "@/screens/Relationships";
 import { Persona } from "@/screens/Persona";
 import { Globals } from "@/screens/Globals";
 import { Profiles } from "@/screens/settings/Profiles";
@@ -48,6 +49,7 @@ export function App() {
           <Route path="lore" element={<LoreBook />} />
           <Route path="quest" element={<QuestBook />} />
           <Route path="action" element={<ActionBook />} />
+          <Route path="relationships" element={<Relationships />} />
           <Route path="gamestate" element={<Gamestate />} />
           <Route path="persona" element={<Persona />} />
 

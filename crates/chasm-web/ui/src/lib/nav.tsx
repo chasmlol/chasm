@@ -2,6 +2,7 @@ import type { ComponentType } from "react";
 import {
   MessagesSquare,
   Users,
+  HeartHandshake,
   BookText,
   ScrollText,
   Swords,
@@ -57,6 +58,12 @@ export const NAV_GROUPS: NavGroup[] = [
       { key: "lore", label: "Lore Book", path: "lore", icon: BookText },
       { key: "quest", label: "Quest Book", path: "quest", icon: ScrollText },
       { key: "action", label: "Action Book", path: "action", icon: Swords },
+      {
+        key: "relationships",
+        label: "Relationships",
+        path: "relationships",
+        icon: HeartHandshake,
+      },
       {
         key: "gamestate",
         label: "Gamestate",

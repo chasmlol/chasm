@@ -16,9 +16,11 @@ use thiserror::Error;
 
 mod action_books;
 mod lorebooks;
+mod relationships;
 mod sources;
 pub use action_books::*;
 pub use lorebooks::*;
+pub use relationships::*;
 pub use sources::*;
 
 #[derive(Debug, Error)]

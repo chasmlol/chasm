@@ -20,6 +20,7 @@ export * from "./chat";
 export * from "./gamestate";
 export * from "./globals";
 export * from "./persona";
+export * from "./relationships";
 
 import { systemApi } from "./system";
 import { booksApi } from "./books";
@@ -29,6 +30,7 @@ import { chatApi } from "./chat";
 import { gamestateApi } from "./gamestate";
 import { globalsApi } from "./globals";
 import { personaApi } from "./persona";
+import { relationshipsApi } from "./relationships";
 
 export {
   systemApi,
@@ -39,6 +41,7 @@ export {
   gamestateApi,
   globalsApi,
   personaApi,
+  relationshipsApi,
 };
 
 /**
@@ -55,4 +58,5 @@ export const api = {
   gamestate: gamestateApi,
   globals: globalsApi,
   persona: personaApi,
+  relationships: relationshipsApi,
 };

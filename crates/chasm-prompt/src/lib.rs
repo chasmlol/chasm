@@ -771,6 +771,60 @@ fn push_player_persona(builder: &mut Builder, notes: &mut Vec<String>, repo: &Li
     }
 }
 
+/// Injects the character's Gamemaster-maintained relationships (their current
+/// view of the player and of other NPCs) as raw prose — each entry is already
+/// a self-contained sentence naming both parties ("Easy Pete views the Courier
+/// as …"), so no header or per-line labels are added: they would only bloat
+/// the context. A character with NO entries pushes nothing — untouched
+/// characters keep a byte-identical prompt shape.
+///
+/// Called at the END of the head assembly (after example dialogue), NOT inside
+/// the card block: this content changes only when a game save runs the GM
+/// pass, so parking it last keeps the static card content above it cached in
+/// the LLM's prefix even across a save that rewrites an entry. The component
+/// key `relationships` is deliberately not in `build_chat_messages`'
+/// `VOLATILE_KEYS` — between saves it never changes, so the whole head stays
+/// a cache hit per turn.
+fn push_character_relationships(
+    builder: &mut Builder,
+    notes: &mut Vec<String>,
+    repo: &LiveChatRepository,
+    participant: &ParticipantView,
+) {
+    let Some(character_id) = participant
+        .character_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let store = match repo.read_relationships() {
+        Ok(store) => store,
+        Err(error) => {
+            notes.push(format!("Relationships read failed: {error}"));
+            return;
+        }
+    };
+    let lines: Vec<&str> = store
+        .entries_for(character_id)
+        .into_iter()
+        .map(|(_, entry)| entry.text.as_str())
+        .filter(|text| !text.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return;
+    }
+    builder.push(
+        "system",
+        "relationships",
+        "Relationships",
+        "system",
+        "included",
+        "Gamemaster-maintained views, updated on game saves.",
+        lines.join("\n"),
+    );
+}
+
 /// Normalizes a slug-style key for native-NPC matching: lowercase, non
 /// alphanumeric collapsed to a single space (so `easy_pete` ~ `Easy Pete`),
 /// mirroring the loose `normalizeSlugKey`/`normalizeLookupKey` comparison in
@@ -1904,6 +1958,15 @@ pub fn assemble_prompt_with_retrieval_collect(
         String::new(),
     );
 
+    // --- Relationships (Gamemaster ledger) -----------------------------------
+    // LAST head component on purpose: it changes on game saves (never per
+    // turn), so sitting at the tail of the head keeps everything above it —
+    // card, scenario, persona, example dialogue — a prefix-cache hit even
+    // across a save that rewrites an entry. Keys off the participant's
+    // character id, so card-less NPCs get their views too; no entries → no
+    // component (byte-identical prompt).
+    push_character_relationships(&mut builder, &mut notes, repo, participant);
+
     // --- Chat history (last 40, mapped to chat-completion roles) ------------
     let start = messages.len().saturating_sub(HISTORY_LIMIT);
     for (index, message) in messages[start..].iter().enumerate() {
@@ -2486,6 +2549,111 @@ mod tests {
             .components
             .iter()
             .any(|component| component.key == "player_persona"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn relationships_inject_only_when_entries_exist() {
+        // DEFAULT state: no relationships store, or a store with no entries for
+        // this character → the assembly is component-for-component identical
+        // to a build without the feature (nothing keyed "relationships").
+        // With entries → ONE stable-head component listing every pair.
+        use chasm_st_compat::{RelationshipsStore, PLAYER_TARGET_ID};
+        let root = scratch_dir("relationships");
+        let characters_dir = root.join("characters");
+        std::fs::create_dir_all(&characters_dir).unwrap();
+        let card_json = serde_json::json!({
+            "name": "Easy Pete",
+            "personality": "Laconic prospector.",
+            "mes_example": "Example line.",
+        });
+        std::fs::write(
+            characters_dir.join("Easy Pete.png"),
+            png_card(&card_json.to_string()),
+        )
+        .unwrap();
+        let repo = LiveChatRepository::new(&root);
+        let speaker = participant("Easy Pete", Some("Easy Pete"));
+
+        // No store at all → no component; capture the full shape as baseline.
+        let baseline = assemble_prompt(&repo, &speaker, &[]);
+        assert!(baseline
+            .components
+            .iter()
+            .all(|component| component.key != "relationships"));
+
+        // A store that exists but holds entries only for OTHER characters →
+        // byte-identical assembly for this one (the empty-default guarantee).
+        let mut store = RelationshipsStore::default();
+        store.upsert("Trudy", PLAYER_TARGET_ID, "Courier", "player", "Wary.", "T1");
+        repo.write_relationships(&store).unwrap();
+        let untouched = assemble_prompt(&repo, &speaker, &[]);
+        assert_eq!(
+            baseline
+                .components
+                .iter()
+                .map(|c| (c.key.clone(), c.content.clone()))
+                .collect::<Vec<_>>(),
+            untouched
+                .components
+                .iter()
+                .map(|c| (c.key.clone(), c.content.clone()))
+                .collect::<Vec<_>>(),
+            "a store without entries for this character must not change its prompt"
+        );
+
+        // Entries for THIS character → one included component: the RAW entry
+        // prose only (each line already names both parties), no header, no
+        // per-line labels — anything more is context bloat.
+        store.upsert(
+            "Easy Pete",
+            PLAYER_TARGET_ID,
+            "Courier",
+            "player",
+            "Pete respects the Courier's caution around dynamite.",
+            "T1",
+        );
+        store.upsert(
+            "Easy Pete",
+            "Sunny Smiles",
+            "Sunny Smiles",
+            "npc",
+            "Pete trusts Sunny to handle the town's defense drills.",
+            "T1",
+        );
+        repo.write_relationships(&store).unwrap();
+        let view = assemble_prompt(&repo, &speaker, &[]);
+        let relationships = view
+            .components
+            .iter()
+            .find(|component| component.key == "relationships")
+            .expect("relationships component injected");
+        assert_eq!(relationships.status, "included");
+        // Target-id BTreeMap order ("Sunny Smiles" sorts before "player").
+        assert_eq!(
+            relationships.content,
+            "Pete trusts Sunny to handle the town's defense drills.\n\
+             Pete respects the Courier's caution around dynamite."
+        );
+        // LAST head component: after example dialogue (and after every other
+        // included head component), so a save-time rewrite never invalidates
+        // the cached static card prefix above it.
+        let index_of = |key: &str| {
+            view.components
+                .iter()
+                .position(|component| component.key == key)
+                .unwrap_or_else(|| panic!("component {key} present"))
+        };
+        assert!(index_of("example_dialogue") < index_of("relationships"));
+        let last_included_head = view
+            .components
+            .iter()
+            .filter(|c| c.status == "included" && !c.content.is_empty())
+            .filter(|c| !["lore", "chat_vectors", "quest_books", "action_books", "world_state"].contains(&c.key.as_str()))
+            .last()
+            .unwrap();
+        assert_eq!(last_included_head.key, "relationships");
 
         std::fs::remove_dir_all(&root).ok();
     }

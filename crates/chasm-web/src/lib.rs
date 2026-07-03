@@ -45,6 +45,7 @@ mod capture;
 mod connection;
 mod fnv_bridge;
 mod game_bridge;
+mod gamemaster;
 mod generate;
 mod launcher;
 mod llm;

@@ -43,6 +43,7 @@ pub(crate) mod globals;
 pub(crate) mod models;
 pub(crate) mod persona;
 pub(crate) mod profiles;
+pub(crate) mod relationships;
 pub(crate) mod settings;
 
 /// Where the built SPA lives: `crates/chasm-web/ui/dist`, resolved off the
@@ -110,6 +111,14 @@ pub(crate) fn api_router() -> Router<Arc<AppState>> {
         .route(
             "/globals/scenario/preview",
             post(globals::preview_scenario),
+        )
+        // --- relationships (the Gamemaster's directional ledger: list + the
+        // user's edit/clear correction surface; ids ride in the POST body
+        // because character ids contain spaces) --------------------------------
+        .route("/relationships", get(relationships::list_relationships))
+        .route(
+            "/relationships/save",
+            post(relationships::save_relationship),
         )
         // --- profiles (list + activate the active game profile) --------------
         .route("/profiles", get(profiles::list_profiles))

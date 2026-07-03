@@ -695,7 +695,8 @@ pub(crate) fn spawn_generation(state: Arc<AppState>) -> bool {
 }
 
 /// RFC3339 UTC "now" without pulling in chrono: seconds precision is plenty.
-fn chrono_now_iso() -> String {
+/// Shared with the gamemaster pass for relationship entry timestamps.
+pub(crate) fn chrono_now_iso() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -783,6 +784,16 @@ pub async fn receive_capture(
         map.insert("image".to_string(), json!(image_status.clone()));
     }
     write_json_atomic(&capture_path(&dir), &capture).map_err(WebError::from)?;
+
+    // --- Queue the Gamemaster relationships pass on SAVE captures. ----------
+    // Same trigger vocabulary as the persona regeneration below, but a fully
+    // independent background task with its own busy flag: it neither delays
+    // this response nor the persona generation, and a pass skipped while one
+    // is already running loses nothing (its content stays past the watermark
+    // for the next save).
+    if is_save_trigger(&capture) {
+        crate::gamemaster::spawn_pass(state.clone());
+    }
 
     // --- Queue generation. ---------------------------------------------------
     let settings = AppSettings::load(&state.config.settings_path).persona;

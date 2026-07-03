@@ -3065,6 +3065,12 @@ mod tests {
             component("character", "You are Sunny Smiles."),
             component("lore", "Activated lore:\nGeckos roam the hills."),
             component("chat_vectors", "Relevant past chat context:\nDoc patched you up."),
+            // Relationships change only on game save, never per turn — they
+            // must ride in the STABLE HEAD, not the depth-1 volatile block.
+            component(
+                "relationships",
+                "Sunny Smiles's relationships:\n- Toward Courier: Sunny trusts her after the gecko hunt.",
+            ),
         ];
         let history = vec![
             MessageView {
@@ -3090,11 +3096,14 @@ mod tests {
         assert!(head.contains("Sunny Smiles"));
         assert!(!head.contains("Geckos"));
         assert!(!head.contains("Doc patched"));
+        // Relationships are HEAD content (save-cadence, not per-turn).
+        assert!(head.contains("Sunny trusts her after the gecko hunt."));
         // Volatile block rides at depth 1: after history, before the newest line.
         assert_eq!(messages[2]["role"], "system");
         let volatile = messages[2]["content"].as_str().unwrap();
         assert!(volatile.contains("Geckos roam the hills."));
         assert!(volatile.contains("Doc patched you up."));
+        assert!(!volatile.contains("gecko hunt"));
         assert_eq!(messages[3]["content"], "hi there");
     }
 

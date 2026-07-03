@@ -256,6 +256,22 @@ impl ProfilePaths {
         self.content_root().join("headless").join("persona")
     }
 
+    /// Relationships store file (the Gamemaster-maintained directional
+    /// character→target opinions + per-session watermarks):
+    /// `profiles/<id>/headless/relationships.json` when the profile folder
+    /// exists, else `{data_root}/headless/relationships.json`.
+    ///
+    /// Same write-safe rule as [`Self::persona_dir`]: this is a runtime store
+    /// the backend WRITES and the file does not exist until the first GM pass,
+    /// so the per-subpath [`Self::resolve`] rule would route the first write to
+    /// the legacy root even with a profile active. Anchoring on
+    /// [`Self::content_root`] keeps reads and writes agreeing from the start.
+    pub fn relationships_store(&self) -> PathBuf {
+        self.content_root()
+            .join("headless")
+            .join("relationships.json")
+    }
+
     /// The "content root" used by code paths that derive several sibling paths
     /// from one base (the live-chat repository, save-sync). When a profile is
     /// active *and* its folder exists, this is `profiles/<id>`; otherwise it is
