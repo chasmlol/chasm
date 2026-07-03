@@ -9,6 +9,7 @@ import { AppShell } from "@/components/AppShell";
 import { InterfaceSettings } from "@/screens/InterfaceSettings";
 import { Chat } from "@/screens/Chat";
 import { CharactersBook } from "@/screens/books/CharactersBook";
+import { Companions } from "@/screens/Companions";
 import { LoreBook } from "@/screens/books/LoreBook";
 import { QuestBook } from "@/screens/books/QuestBook";
 import { ActionBook } from "@/screens/books/ActionBook";
@@ -46,6 +47,7 @@ export function App() {
           {/* Main */}
           <Route path="chat" element={<Chat />} />
           <Route path="characters" element={<CharactersBook />} />
+          <Route path="companions" element={<Companions />} />
           <Route path="lore" element={<LoreBook />} />
           <Route path="quest" element={<QuestBook />} />
           <Route path="action" element={<ActionBook />} />

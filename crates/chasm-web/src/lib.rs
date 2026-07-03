@@ -1756,7 +1756,7 @@ fn build_voice_clone(config: &AppConfig, settings: &AppSettings, engine: &str) -
 /// per-NPC references from the game, then clones each with the engine). Shared by
 /// the legacy redirect handler and the JSON API. Cloning is always per-engine, so a
 /// PocketTTS run never touches faster-qwen3-tts clips and vice-versa.
-fn start_voice_clone(state: &AppState) {
+pub(crate) fn start_voice_clone(state: &AppState) {
     let settings = AppSettings::load(&state.config.settings_path);
     let profile_id = settings.active_profile_id(&state.config.profiles_dir);
     let Some(profile) = GameProfile::read(&state.config.profiles_dir, &profile_id) else {

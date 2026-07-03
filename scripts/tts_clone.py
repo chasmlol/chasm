@@ -11,6 +11,7 @@ import os
 import sys
 import traceback
 
+import numpy as np
 import soundfile as sf
 
 SAMPLE_TEXT = (
@@ -21,12 +22,21 @@ SAMPLE_TEXT = (
 
 
 def trimmed_prompt(ref, out_dir, seconds=18):
-    """A short, mono prompt clip for cloning (long refs slow some engines)."""
+    """A short, mono prompt clip for cloning (long refs slow some engines).
+
+    Peak-normalized to ~-1 dBFS: engines reproduce the prompt's loudness, and
+    user-uploaded clips (companions) are often far quieter than the
+    game-extracted ones — without this, cloned voices come out very quiet.
+    The runtime TTS servers condition on this same prompt.wav.
+    """
     audio, sr = sf.read(ref)
     if getattr(audio, "ndim", 1) > 1:
         audio = audio.mean(axis=1)
     if len(audio) > int(seconds * sr):
         audio = audio[: int(seconds * sr)]
+    peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+    if peak > 1e-4:
+        audio = audio * (0.89 / peak)
     path = os.path.join(out_dir, "prompt.wav")
     sf.write(path, audio, sr)
     return path

@@ -14,6 +14,7 @@
 
 export * from "./system";
 export * from "./books";
+export * from "./companions";
 export * from "./models";
 export * from "./config";
 export * from "./chat";
@@ -24,6 +25,7 @@ export * from "./relationships";
 
 import { systemApi } from "./system";
 import { booksApi } from "./books";
+import { companionsApi } from "./companions";
 import { modelsApi } from "./models";
 import { configApi } from "./config";
 import { chatApi } from "./chat";
@@ -35,6 +37,7 @@ import { relationshipsApi } from "./relationships";
 export {
   systemApi,
   booksApi,
+  companionsApi,
   modelsApi,
   configApi,
   chatApi,
@@ -52,6 +55,7 @@ export {
 export const api = {
   ...systemApi,
   books: booksApi,
+  companions: companionsApi,
   models: modelsApi,
   config: configApi,
   chat: chatApi,

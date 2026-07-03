@@ -682,7 +682,7 @@ fn save_character(state: &AppState, id: &str, values: &Value) -> WebResult<UiBoo
 /// Extracts the embedded character JSON from a PNG card, preferring the V3
 /// `ccv3` tEXt chunk and falling back to the V2 `chara` chunk (both base64).
 /// Mirrors [`chasm_st_compat`]'s reader.
-fn read_png_character_json(bytes: &[u8]) -> Option<String> {
+pub(crate) fn read_png_character_json(bytes: &[u8]) -> Option<String> {
     if bytes.len() < 8 || bytes[..8] != PNG_SIGNATURE {
         return None;
     }
@@ -734,7 +734,7 @@ fn read_png_character_json(bytes: &[u8]) -> Option<String> {
 /// before `IEND`. The image data (`IHDR`, `IDAT`, palette, everything else) is
 /// preserved byte-for-byte, so only the embedded persona changes. Returns `None`
 /// if the input isn't a PNG with an `IEND`.
-fn write_png_character_json(original: &[u8], json: &str) -> Option<Vec<u8>> {
+pub(crate) fn write_png_character_json(original: &[u8], json: &str) -> Option<Vec<u8>> {
     if original.len() < 8 || original[..8] != PNG_SIGNATURE {
         return None;
     }
@@ -809,7 +809,7 @@ fn text_chunk(keyword: &str, text: &[u8]) -> Vec<u8> {
 
 /// CRC-32 (IEEE 802.3, the PNG variant): reflected, poly 0xEDB88320, init/xor
 /// 0xFFFFFFFF. Computed inline so the UI layer needs no extra dependency.
-fn crc32(bytes: &[u8]) -> u32 {
+pub(crate) fn crc32(bytes: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &byte in bytes {
         crc ^= u32::from(byte);

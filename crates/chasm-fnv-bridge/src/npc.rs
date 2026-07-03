@@ -820,3 +820,172 @@ fn strip_png(s: &str) -> String {
         t.to_string()
     }
 }
+
+// ===========================================================================
+// Companions — merge the NVSE plugin's registry into the character map.
+//
+// The npc→character map is otherwise built ONCE at startup from the character
+// cards that exist at that moment, and candidate resolution REQUIRES a map
+// entry — so a companion created mid-session (its card is written after boot)
+// failed every turn until chasm restarted. The plugin-owned registry at
+// `<root>/companions/registry.txt` is the live source of truth for claimed
+// companions; merging it per turn keeps them resolvable with no restart.
+// ===========================================================================
+
+const COMPANION_REGISTRY_HEADER: &str = "CHASM_COMPANION_REGISTRY_V1";
+const COMPANION_POOL_SIZE: usize = 8;
+
+/// Claimed companions from the plugin registry as map entries
+/// (`npc_key -> {characterId, characterName}`). Empty on any parse problem.
+pub fn companion_map_entries(root: &std::path::Path) -> Map<String, Value> {
+    let mut entries = Map::new();
+    let path = root.join("companions").join("registry.txt");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return entries;
+    };
+    let mut lines = text.lines();
+    if lines.next().map(str::trim) != Some(COMPANION_REGISTRY_HEADER) {
+        return entries;
+    }
+    let mut fields: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for line in lines {
+        if let Some((key, value)) = line.split_once('=') {
+            fields.insert(key.trim().to_string(), value.trim().to_string());
+        }
+    }
+    let decode = |key: &str| -> String {
+        use base64::Engine as _;
+        fields
+            .get(key)
+            .and_then(|v| base64::engine::general_purpose::STANDARD.decode(v).ok())
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    for slot in 0..COMPANION_POOL_SIZE {
+        if fields.get(&format!("slot{slot}.claimed")).map(String::as_str) != Some("1") {
+            continue;
+        }
+        let npc_key = fields
+            .get(&format!("slot{slot}.npc_key"))
+            .cloned()
+            .unwrap_or_default();
+        let name = decode(&format!("slot{slot}.name_base64"));
+        let mut character = decode(&format!("slot{slot}.character_base64"));
+        if character.is_empty() {
+            character = if name.is_empty() { npc_key.clone() } else { name.clone() };
+        }
+        if npc_key.is_empty() || character.is_empty() {
+            continue;
+        }
+        entries.insert(
+            npc_key,
+            json!({ "characterId": character, "characterName": character }),
+        );
+    }
+    entries
+}
+
+/// An augmented config whose map includes registry companions, or `None` when
+/// there is nothing new to add (no registry / all keys already mapped).
+pub fn config_with_companions(config: &BridgeConfig, root: &std::path::Path) -> Option<BridgeConfig> {
+    let entries = companion_map_entries(root);
+    let missing: Vec<(String, Value)> = entries
+        .into_iter()
+        .filter(|(key, _)| get_npc_mapping_entry(&config.npc_character_map, &json!({ "npc_key": key })).is_none())
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let mut augmented = config.clone();
+    for (key, value) in missing {
+        augmented.npc_character_map.insert(key, value);
+    }
+    Some(augmented)
+}
+
+#[cfg(test)]
+mod companion_tests {
+    use super::*;
+    use crate::default_config;
+    use base64::Engine as _;
+
+    fn write_registry(dir: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(dir.join("companions")).unwrap();
+        std::fs::write(dir.join("companions").join("registry.txt"), body).unwrap();
+    }
+
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("chasm_comp_map_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn b64(s: &str) -> String {
+        base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
+    }
+
+    #[test]
+    fn registry_companions_become_map_entries_and_candidates_resolve() {
+        let root = temp_root("resolve");
+        write_registry(
+            &root,
+            &format!(
+                "CHASM_COMPANION_REGISTRY_V1\r\nrev=4\r\nslot0.claimed=0\r\n\
+                 slot3.claimed=1\r\nslot3.npc_key=steve\r\nslot3.name_base64={}\r\n\
+                 slot3.character_base64={}\r\nslot3.status=spawned\r\n",
+                b64("steve"),
+                b64("steve"),
+            ),
+        );
+
+        let config = default_config();
+        let augmented = config_with_companions(&config, &root).expect("companion added");
+        let entry = get_npc_mapping_entry(&augmented.npc_character_map, &json!({ "npc_key": "steve" }))
+            .expect("steve mapped");
+        assert_eq!(entry["characterId"], json!("steve"));
+
+        // The exact rejection that produced "No mapped NPC within 10 meters":
+        // a synthetic focused candidate with require_mapped_character semantics.
+        let request = crate::protocol::parse_native_text_request(
+            std::path::Path::new("req_x.txt"),
+            "req_x\r\nsteve\r\nsteve\r\n1\r\nhi\r\nWilderness\r\n\r\n\r\n\r\n\r\n",
+        );
+        assert!(nearby_npc_candidates(&config, &request, 1.5, 105.0).is_empty());
+        let participants = nearby_npc_candidates(&augmented, &request, 1.5, 105.0);
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0].character_id, "steve");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_or_alien_registry_changes_nothing() {
+        let root = temp_root("none");
+        let config = default_config();
+        assert!(config_with_companions(&config, &root).is_none());
+        write_registry(&root, "BOGUS_HEADER\r\nslot0.claimed=1\r\n");
+        assert!(config_with_companions(&config, &root).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn already_mapped_companions_do_not_trigger_a_clone() {
+        let root = temp_root("mapped");
+        write_registry(
+            &root,
+            &format!(
+                "CHASM_COMPANION_REGISTRY_V1\r\nslot0.claimed=1\r\nslot0.npc_key=steve\r\n\
+                 slot0.name_base64={}\r\nslot0.character_base64={}\r\n",
+                b64("steve"),
+                b64("steve"),
+            ),
+        );
+        let mut config = default_config();
+        config
+            .npc_character_map
+            .insert("steve".into(), json!({ "characterId": "steve" }));
+        assert!(config_with_companions(&config, &root).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

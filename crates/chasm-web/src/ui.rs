@@ -37,6 +37,7 @@ use crate::AppState;
 pub(crate) mod books;
 pub(crate) mod bridge;
 pub(crate) mod chat;
+pub(crate) mod companions;
 pub(crate) mod config;
 pub(crate) mod gamestate;
 pub(crate) mod globals;
@@ -119,6 +120,18 @@ pub(crate) fn api_router() -> Router<Arc<AppState>> {
             "/relationships/save",
             post(relationships::save_relationship),
         )
+        // --- companions (authored FNV followers; see mod-source
+        // docs/companions-architecture.md: pool status + create + slot ops
+        // relayed to the NVSE plugin as command files) -------------------------
+        // Voice clips ride the create body as base64 (server cap: 64MB decoded),
+        // so this route overrides axum's 2MB default body limit.
+        .route(
+            "/companions",
+            get(companions::list_companions)
+                .post(companions::create_companion)
+                .layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024)),
+        )
+        .route("/companions/:slot/op", post(companions::companion_op))
         // --- profiles (list + activate the active game profile) --------------
         .route("/profiles", get(profiles::list_profiles))
         .route("/profiles/select", post(profiles::select_profile))

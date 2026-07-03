@@ -314,6 +314,12 @@ async fn run_turn(
         return process_save_sync_request(config, client, sink, request).await;
     }
 
+    // Companions created mid-session live in the plugin's registry, not the
+    // startup character map — merge them in per turn so their dialogue resolves
+    // without a chasm restart (see npc::config_with_companions).
+    let companion_config = npc::config_with_companions(config, root);
+    let config = companion_config.as_ref().unwrap_or(config);
+
     let admin = admin::is_admin_request(request);
     let distance_meters = npc::native_distance_meters(request);
 
