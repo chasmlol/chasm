@@ -229,14 +229,8 @@
 
                 <details class="settings-group" open>
                     <summary class="settings-legend">Streaming <span class="chev" aria-hidden="true"></span></summary>
-                    <label class="checkbox"><input type="checkbox" name="streaming_enabled"{% if page.tts.streaming_enabled %} checked{% endif %}> Streaming / lowest latency</label>
                     <div class="field-row range-row">
-                        <label for="streaming_chunk_ms">Streaming chunk size (ms)</label>
-                        <input type="range" id="streaming_chunk_ms" name="streaming_chunk_ms"
-                            min="{{ page.tts.streaming_chunk_min }}" max="{{ page.tts.streaming_chunk_max }}" step="{{ page.tts.streaming_chunk_step }}"
-                            value="{{ page.tts.streaming_chunk_ms }}"
                             oninput="this.nextElementSibling.value = this.value">
-                        <output class="range-output">{{ page.tts.streaming_chunk_ms }}</output>
                     </div>
                 </details>
 

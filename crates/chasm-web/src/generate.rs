@@ -197,6 +197,38 @@ pub async fn generate_stream(
 /// errors surface before streaming starts) and returns the raw NDJSON event lines.
 /// The HTTP handler above streams them as the response body; the in-process bridge
 /// client parses each line back into a `Value` — one code path, minus the socket.
+/// Appends a generate-side stage marker to the bridge's per-request trace file
+/// (best-effort; only when the bridge tracer already opened this request). Gives
+/// the trace waterfall visibility INSIDE the generate path — context resolution,
+/// speaker selection, prompt assembly — instead of one opaque gap between
+/// `live_chat_generate_start` and `live_chat_first_delta`.
+fn trace_generate_stage(trace_id: Option<&str>, stage: &str) {
+    let Some(id) = trace_id else { return };
+    if id.is_empty() || id.contains(['/', '\\', '.']) {
+        return; // ids are bridge-generated (req_...); refuse anything path-like
+    }
+    let Some(local) = std::env::var_os("LOCALAPPDATA") else { return };
+    let path = std::path::Path::new(&local)
+        .join("chasm")
+        .join("bridge")
+        .join("traces")
+        .join(format!("{id}.jsonl"));
+    if !path.exists() {
+        return;
+    }
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let line = format!(
+        "{{\"request_id\":\"{id}\",\"stage\":\"{stage}\",\"at_ms\":{at_ms},\"source\":\"chasm-web\"}}\n"
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&path) {
+        use std::io::Write as _;
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 pub async fn generate_stream_core(
     state: Arc<AppState>,
     id: String,
@@ -210,6 +242,7 @@ pub async fn generate_stream_core(
     // is returned as a non-200 (which the helper's `streamApi` surfaces),
     // rather than mid-stream.
     let ctx = resolve_turn_context(&state, &id, &body)?;
+    trace_generate_stage(trace_id.as_deref(), "gen_ctx_resolved");
 
     // Persist the player message immediately (mirrors the Node append-user step
     // that happens before speaker selection).
@@ -220,22 +253,14 @@ pub async fn generate_stream_core(
     // Run the orchestrator before streaming so selection errors surface as a
     // non-200 (the deterministic fallback never errors here once eligible).
     let (speakers, selector) = orchestrate(&state, &ctx, &body).await?;
+    trace_generate_stage(trace_id.as_deref(), "gen_speakers_selected");
     let speaker_summaries: Vec<Value> = speakers.iter().map(speaker_summary).collect();
 
-    // Honor the TTS "streaming" toggle LIVE, per request: read it fresh each turn
-    // so flipping it in the UI takes effect on the very next NPC line with no
-    // restart. The helper always streams (its `liveChatStreaming` is forced on at
-    // launch); Rust owns the real decision here. When OFF, we suppress incremental
-    // `speech.delta`s and emit the whole extracted speech as a SINGLE delta right
-    // before the turn finalizes, so the helper plays the line at once.
-    // Load settings once: the TTS streaming toggle AND the LLM sampling knobs,
-    // both read fresh per request so UI changes apply on the very next turn.
+    // LLM sampling knobs, read fresh per request so UI changes apply on the
+    // very next turn. (Speech goes out as ONE delta per line once the model
+    // finishes: faster-qwen3-tts streams the AUDIO natively, so no text-side
+    // opener-chunk splitting is needed — that legacy path is removed.)
     let live_settings = AppSettings::load(&state.config.settings_path);
-    let stream_speech = live_settings.tts.streaming_enabled;
-    // First-chunk size in characters, from the live `streaming_chunk_ms` knob
-    // (≈ target audio length of the opener; 0 ⇒ fire at the first word). Read
-    // fresh per request, so sliding it in the UI applies on the next NPC line.
-    let first_chunk_chars = live_settings.tts.streaming_chunk_ms as usize / STREAMING_MS_PER_CHAR;
     let sampling = crate::llm::Sampling::from_settings(&live_settings.llm.sampling);
 
     let state = state.clone();
@@ -262,19 +287,15 @@ pub async fn generate_stream_core(
                     return;
                 }
             };
+            trace_generate_stage(trace_id.as_deref(), "gen_prompt_assembled");
 
             // speaker.start
             yield ndjson(&json!({ "type": "speaker.start", "speaker": plan.speaker }));
 
-            // Stream the model output, emitting only SPEECH as speech.delta.
-            // Structured turns return a reasoning channel + a JSON object, so we
-            // incrementally extract the `speech` field (mirrors ST
-            // `extractStructuredSpeechPrefix`) and emit just the new text — never
-            // the reasoning preamble or JSON syntax. Plain-text turns stream
-            // through unchanged. `collected` keeps the full raw output for
-            // finalize_turn, which re-parses it.
+            // Collect the model output; `collected` keeps the full raw output
+            // for finalize_turn, which re-parses it. Speech is emitted as one
+            // delta after the loop (qwen3-tts streams the audio itself).
             let mut collected = String::new();
-            let mut first_chunk_len: Option<usize> = None;
             let response_format = plan.structured.then(crate::llm::structured_response_format);
             match crate::llm::chat_completion_stream(&endpoint, &plan.chat_messages, response_format.as_ref(), trace_id.as_deref(), sampling)
                 .await
@@ -287,23 +308,6 @@ pub async fn generate_stream_core(
                                     continue;
                                 }
                                 collected.push_str(&token);
-                                // Speak the small FIRST chunk the moment the opening
-                                // words cross `streaming_chunk_ms` — streaming only,
-                                // once per turn. The remainder goes out after the
-                                // loop as a single chunk. When OFF, nothing emits
-                                // here; the whole line goes out at the end.
-                                if !stream_speech || first_chunk_len.is_some() {
-                                    continue;
-                                }
-                                let speech = extracted_speech(plan.structured, &collected);
-                                if let Some(end) = first_chunk_end(&speech, first_chunk_chars) {
-                                    first_chunk_len = Some(end);
-                                    yield ndjson(&json!({
-                                        "type": "speech.delta",
-                                        "text": speech[..end].to_string(),
-                                        "speaker": plan.speaker,
-                                    }));
-                                }
                             }
                             Err(error) => {
                                 yield ndjson(&json!({
@@ -324,14 +328,10 @@ pub async fn generate_stream_core(
                 }
             }
 
-            // Speak the REMAINDER as one chunk: the full line minus the opener we
-            // already spoke — or the WHOLE line when streaming is off, or when the
-            // line was shorter than the first-chunk threshold (no opener went out).
+            // The WHOLE line as one speech delta; faster-qwen3-tts streams the
+            // audio out as it synthesizes, so playback still starts promptly.
             let full = extracted_speech(plan.structured, &collected);
-            let rest = match first_chunk_len {
-                Some(len) if len <= full.len() => full[len..].trim_start(),
-                _ => full.as_str(),
-            };
+            let rest = full.as_str();
             if !rest.is_empty() {
                 yield ndjson(&json!({
                     "type": "speech.delta",
@@ -380,6 +380,7 @@ pub async fn generate(
 ) -> WebResult<Json<Value>> {
     let trace_id = trace_id_from_headers(&headers);
     let ctx = resolve_turn_context(&state, &id, &body)?;
+    trace_generate_stage(trace_id.as_deref(), "gen_ctx_resolved");
 
     // Persist the player message once (before speaker selection, like Node).
     if !ctx.message.is_empty() {
@@ -388,6 +389,7 @@ pub async fn generate(
 
     // Run the orchestrator to get the ordered speaker list (empty = silence).
     let (speakers, selector) = orchestrate(&state, &ctx, &body).await?;
+    trace_generate_stage(trace_id.as_deref(), "gen_speakers_selected");
     let speaker_summaries: Vec<Value> = speakers.iter().map(speaker_summary).collect();
 
     let endpoint = state.config.llm_endpoint.clone();
@@ -878,8 +880,10 @@ fn prepare_speaker_turn(
     };
     // GLOBAL scenario for THIS speaker: the Globals template resolved with the
     // turn's macro table + computed macros ({{participants}} excludes the
-    // speaker being prompted). Injected at the old card-scenario slot by the
-    // assembler. Deliberately NOT part of the retrieval scan text above.
+    // speaker being prompted). NOT given to the assembler (Some("") omits the
+    // old card-scenario slot): its per-turn timestamp there busted the LLM
+    // prompt cache every turn. build_chat_messages injects it late instead.
+    // Deliberately NOT part of the retrieval scan text above.
     let global_scenario = resolve_global_scenario(
         &ctx.scenario_template,
         &ctx.scenario_macros,
@@ -893,7 +897,7 @@ fn prepare_speaker_turn(
         &ctx.message,
         &ctx.requested_scopes,
         retrieval_ctx,
-        Some(&global_scenario),
+        Some(""),
     );
 
     let scene_roster = build_scene_roster(state, ctx, &speaker_participant_id, &speaker_name);
@@ -911,6 +915,7 @@ fn prepare_speaker_turn(
         // so it's in `history`; don't re-append it (that would make co-speakers
         // answer the player instead of the prior NPC's just-spoken line).
         false,
+        &global_scenario,
     );
 
     let audible_to = default_audible_to(&ctx.live_chat, &speaker_participant_id);
@@ -1069,6 +1074,7 @@ fn build_chat_messages(
     current_speaker_participant_id: &str,
     scene_roster: &str,
     append_player_message: bool,
+    global_scenario: &str,
 ) -> Vec<Value> {
     let mut system_parts: Vec<String> = assembled
         .components
@@ -1200,6 +1206,22 @@ fn build_chat_messages(
     // The admin path doesn't persist it, so it still needs the append.
     if append_player_message && !message.is_empty() {
         messages.push(json!({ "role": "user", "content": message }));
+    }
+
+    // GLOBAL scenario, injected LATE (ST-style in-chat injection at depth 1 -
+    // just before the newest line). The scenario carries a per-turn timestamp;
+    // sitting in the early system prompt it invalidated the LLM's cached prefix
+    // every turn, forcing re-ingestion of everything after it (chat history
+    // included) - measured at 1-2s per turn. Down here, the static system
+    // prompt and the history stay cached and only ~a hundred tokens reprocess.
+    if !global_scenario.is_empty() {
+        let scenario_message = json!({ "role": "system", "content": global_scenario });
+        let insert_at = if messages.len() > 1 {
+            messages.len() - 1
+        } else {
+            messages.len()
+        };
+        messages.insert(insert_at, scenario_message);
     }
 
     messages
@@ -1635,22 +1657,6 @@ fn parse_structured(raw: &str) -> Option<(String, Value)> {
     Some((speech, value))
 }
 
-/// Decides the `speech.delta` text to emit for ONE streamed token, given the
-/// live TTS streaming toggle. Returns `None` to emit nothing this tick.
-///
-/// - `stream == false`: always `None` — non-streaming mode buffers and emits the
-///   whole line once after the model finishes (see [`buffered_full_speech`]).
-/// - `stream == true`, structured: incrementally extract the growing `speech`
-///   prefix and return only the newly-grown tail (advancing `emitted`). Returns
-///   `None` when the prefix hasn't grown (e.g. still inside JSON syntax).
-/// - `stream == true`, plain text: return the token verbatim.
-///
-/// Factored out of the stream loop so the streaming-vs-buffered decision is unit
-/// testable without driving an HTTP stream.
-/// Rough milliseconds of English speech per character, used to turn the live
-/// `streaming_chunk_ms` knob into a first-chunk character target (~13 chars/sec).
-/// Only the feel matters; the user tunes the ms value directly.
-const STREAMING_MS_PER_CHAR: usize = 75;
 
 /// Speech text extracted from the (partial or complete) raw model output: the
 /// structured `speech` field via the incremental extractor, or plain text with
@@ -1664,21 +1670,6 @@ fn extracted_speech(structured: bool, collected: &str) -> String {
     }
 }
 
-/// Byte offset where the first speech chunk should end: the first whitespace
-/// word-boundary at or after `min_chars` characters. `None` until enough text has
-/// arrived for a clean opener. `min_chars == 0` ends at the very first word —
-/// the fastest possible first audio.
-fn first_chunk_end(speech: &str, min_chars: usize) -> Option<usize> {
-    let floor = min_chars.max(1);
-    let mut chars = 0usize;
-    for (idx, ch) in speech.char_indices() {
-        chars += 1;
-        if chars >= floor && ch.is_whitespace() {
-            return Some(idx);
-        }
-    }
-    None
-}
 
 /// Incrementally extracts the `speech` string value from a partial structured
 /// JSON buffer (mirrors ST `extractStructuredSpeechPrefix`). Finds the first
@@ -2230,7 +2221,7 @@ fn resolve_admin_run(state: &Arc<AppState>, body: &Value) -> WebResult<AdminRun>
         &message,
         &parse_action_book_scopes(body),
         retrieval_ctx,
-        Some(&global_scenario),
+        Some(""),
     );
 
     // Admin = Todd, who must stay terse. Append a hard one-sentence rule to the
@@ -2256,6 +2247,7 @@ fn resolve_admin_run(state: &Arc<AppState>, body: &Value) -> WebResult<AdminRun>
         // Admin sessions don't persist the player message to history, so it must be
         // appended as the final user turn here.
         true,
+        &global_scenario,
     );
 
     Ok(AdminRun {
@@ -2726,24 +2718,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn first_chunk_ends_at_first_word_boundary_after_min_chars() {
-        let speech = "Well now, that depends on who is asking.";
-        // 0 ⇒ first word, fastest first audio.
-        assert_eq!(&speech[..first_chunk_end(speech, 0).unwrap()], "Well");
-        // ~10 chars ⇒ first word boundary at/after 10 chars.
-        assert_eq!(&speech[..first_chunk_end(speech, 10).unwrap()], "Well now,");
-        // Threshold longer than the whole line ⇒ no opener; the rest path speaks
-        // the whole line as one chunk.
-        assert_eq!(first_chunk_end(speech, 100), None);
-    }
-
-    #[test]
-    fn first_chunk_waits_until_a_boundary_arrives() {
-        // A single word still streaming (no whitespace yet) ⇒ wait, don't clip it.
-        assert_eq!(first_chunk_end("Well", 0), None);
-        assert_eq!(first_chunk_end("", 0), None);
-    }
 
     #[test]
     fn extracted_speech_pulls_structured_field_and_plain_text() {
@@ -2859,6 +2833,40 @@ mod tests {
         // 1-on-1: no other NPCs.
         let solo = group_chat(&[("npc-pete", "Easy Pete")]);
         assert!(other_npc_names(&solo, "npc-pete").is_empty());
+    }
+
+    #[test]
+    fn late_scenario_injects_as_system_message_at_depth_one() {
+        let assembled = chasm_core::PromptAssemblyView::default();
+        let history = vec![
+            MessageView {
+                role: "player".to_string(),
+                content: "hello".to_string(),
+                ..Default::default()
+            },
+            MessageView {
+                role: "assistant".to_string(),
+                content: "hi there".to_string(),
+                ..Default::default()
+            },
+        ];
+        let messages = build_chat_messages(
+            &assembled, &history, "", false, "", "", &Value::Null, "", "", false,
+            "It is 1:22PM. You are in the saloon.",
+        );
+        // Scenario rides as a SYSTEM message at depth 1: after the history bulk,
+        // directly before the newest line - so the cached prompt prefix survives
+        // the per-turn timestamp. Never inside the leading system prompt.
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "system");
+        assert_eq!(messages[1]["content"], "It is 1:22PM. You are in the saloon.");
+        assert_eq!(messages[2]["content"], "hi there");
+
+        // Empty scenario -> no injection at all.
+        let plain = build_chat_messages(
+            &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "",
+        );
+        assert_eq!(plain.len(), 2);
     }
 
     #[test]

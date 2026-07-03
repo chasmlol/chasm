@@ -289,7 +289,7 @@ pub struct LiveChatView {
     pub selected_participant_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MessageView {
     pub id: String,
     pub role: String,
@@ -447,7 +447,7 @@ pub struct PromptComponentView {
 }
 
 /// The full prompt for a live chat + participant, broken into ordered components.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PromptAssemblyView {
     pub participant_id: String,
     pub participant_name: String,

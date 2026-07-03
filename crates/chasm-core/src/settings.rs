@@ -482,8 +482,6 @@ pub struct TtsSettings {
     pub local_engine: String,
     /// Selected API provider value (matches [`TTS_API_PROVIDERS`]).
     pub api_provider: String,
-    pub streaming_enabled: bool,
-    pub streaming_chunk_ms: u32,
     /// MAX size (ms of audio) of a streamed TTS chunk. The backend ramps slices (a
     /// small first slice for fast first-audio, doubling up to this cap) so the plugin
     /// gets few, big chunk files — bounding its per-frame file I/O. Read fresh per
@@ -522,8 +520,6 @@ impl Default for TtsSettings {
             // `normalize_local_engine`). Empty = "none selected".
             local_engine: String::new(),
             api_provider: "ElevenLabs".to_string(),
-            streaming_enabled: true,
-            streaming_chunk_ms: STREAMING_CHUNK_MS_DEFAULT,
             stream_slice_ms: STREAM_SLICE_MS_DEFAULT,
             caption_max_chars: CAPTION_MAX_CHARS_DEFAULT,
             npc_volume: NPC_VOLUME_DEFAULT,
@@ -726,7 +722,6 @@ impl AppSettings {
 pub const STREAMING_CHUNK_MS_MIN: u32 = 0;
 pub const STREAMING_CHUNK_MS_MAX: u32 = 10_000;
 pub const STREAMING_CHUNK_MS_STEP: u32 = 50;
-pub const STREAMING_CHUNK_MS_DEFAULT: u32 = 500;
 
 // `tts.stream_slice_ms`: the MAX size (ms of audio) of a streamed TTS chunk. The
 // backend ramps slices — a small first slice (~200ms) for fast first-audio, then
@@ -734,8 +729,8 @@ pub const STREAMING_CHUNK_MS_DEFAULT: u32 = 500;
 // many tiny ones. Chunk-file count is what bounds the plugin's per-frame file I/O
 // (it reads one WAV per chunk through MO2's usvfs, ~tens of ms each), so big steady
 // slices are the key to smooth in-game playback. The single streaming buffer plays
-// any chunk size gaplessly, and the ramp keeps it from underrunning early. Distinct
-// from `streaming_chunk_ms` (the LLM opener text size), not the TTS audio slice.
+// any chunk size gaplessly, and the ramp keeps it from underrunning early. This IS the
+// TTS audio slice size (the legacy LLM opener-text chunking is removed).
 pub const STREAM_SLICE_MS_MIN: u32 = 60;
 pub const STREAM_SLICE_MS_MAX: u32 = 4_000;
 pub const STREAM_SLICE_MS_DEFAULT: u32 = 1_500;
@@ -1672,11 +1667,6 @@ pub fn normalize_max_tags(value: u8) -> u8 {
     value.min(MAX_TAGS_MAX)
 }
 
-/// Clamp/round a streaming chunk value to the slider's range and step.
-pub fn normalize_streaming_chunk_ms(value: u32) -> u32 {
-    let clamped = value.clamp(STREAMING_CHUNK_MS_MIN, STREAMING_CHUNK_MS_MAX);
-    ((clamped + STREAMING_CHUNK_MS_STEP / 2) / STREAMING_CHUNK_MS_STEP) * STREAMING_CHUNK_MS_STEP
-}
 
 /// Clamp a TTS mini-chunk slice size to [`STREAM_SLICE_MS_MIN`]..=[`STREAM_SLICE_MS_MAX`].
 pub fn normalize_stream_slice_ms(value: u32) -> u32 {
@@ -1884,8 +1874,6 @@ pub struct TtsPanelView {
     pub is_api: bool,
     pub local_engines: Vec<LocalEngineView>,
     pub api_providers: Vec<ApiProviderView>,
-    pub streaming_enabled: bool,
-    pub streaming_chunk_ms: u32,
     pub streaming_chunk_min: u32,
     pub streaming_chunk_max: u32,
     pub streaming_chunk_step: u32,
@@ -2586,8 +2574,6 @@ pub fn tts_panel_view(
         is_api: tts.mode == "api",
         local_engines,
         api_providers,
-        streaming_enabled: tts.streaming_enabled,
-        streaming_chunk_ms: normalize_streaming_chunk_ms(tts.streaming_chunk_ms),
         streaming_chunk_min: STREAMING_CHUNK_MS_MIN,
         streaming_chunk_max: STREAMING_CHUNK_MS_MAX,
         streaming_chunk_step: STREAMING_CHUNK_MS_STEP,
@@ -2821,8 +2807,6 @@ mod tests {
     #[test]
     fn defaults_mirror_sillytavern() {
         let tts = TtsSettings::default();
-        assert_eq!(tts.streaming_chunk_ms, 500);
-        assert!(tts.streaming_enabled);
         assert_eq!(tts.audio_tags.max_tags_per_reply, 2);
         assert!(!tts.audio_tags.enabled);
     }
@@ -2934,9 +2918,6 @@ mod tests {
 
     #[test]
     fn streaming_chunk_is_clamped_and_stepped() {
-        assert_eq!(normalize_streaming_chunk_ms(99_999), 10_000);
-        assert_eq!(normalize_streaming_chunk_ms(524), 500);
-        assert_eq!(normalize_streaming_chunk_ms(525), 550);
     }
 
     #[test]

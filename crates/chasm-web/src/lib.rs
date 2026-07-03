@@ -21,7 +21,7 @@ use chasm_core::{
     clone_status_label, falloutnv_detected, llm_model_filename,
     llm_model_match_stem, llm_models_panel_view, mo2_detected, normalize_embedder_tier,
     normalize_execution, normalize_max_tags, normalize_reranker_tier,
-    normalize_streaming_chunk_ms, normalize_stt_provider, nvse_detected,
+    normalize_stt_provider, nvse_detected,
     recommended_index, retrieval_model_status_label, settings_page_view,
     stt_effective_model, whisper_model_by_id, whisper_model_status_label,
     AppConfig, AppSettings, GameLauncherView, GameProfile, GpuFit, InterfaceSettings, LauncherConfig,
@@ -2907,13 +2907,6 @@ pub(crate) fn apply_tts_form(tts: &mut TtsSettings, form: &HashMap<String, Strin
     }
     if let Some(value) = form.get("api_provider") {
         tts.api_provider = value.clone();
-    }
-    tts.streaming_enabled = form.contains_key("streaming_enabled");
-    if let Some(value) = form
-        .get("streaming_chunk_ms")
-        .and_then(|v| v.parse::<u32>().ok())
-    {
-        tts.streaming_chunk_ms = normalize_streaming_chunk_ms(value);
     }
     if let Some(value) = form
         .get("caption_max_chars")

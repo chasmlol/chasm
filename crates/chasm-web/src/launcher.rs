@@ -1142,6 +1142,19 @@ fn build_managed_koboldcpp_spec(
         args.push(mmproj.display().to_string());
     }
 
+    // Thinking models: suppress the reasoning preamble entirely. It is never
+    // shown to anyone, and at typical eval speeds each ~70-token thinking
+    // block adds a full second before the first spoken word reaches TTS
+    // (measured via the per-turn stage traces).
+    args.push("--reasoningeffort".to_string());
+    args.push("none".to_string());
+
+    // Gemma-family models use sliding-window attention; koboldcpp's SWA cache
+    // CANNOT fast-forward, so every turn re-ingested the whole prompt. A
+    // full-size KV cache (--noswa) re-enables prefix caching: measured 0.53s
+    // cold -> 0.15s on appended turns. Costs some VRAM; worth it universally.
+    args.push("--noswa".to_string());
+
     // Whisper STT is optional: add --whispermodel only when a model is selected AND
     // its .bin is on disk, so STT never blocks the LLM from starting.
     let whisper_file = chasm_core::stt_effective_model(&settings.stt);

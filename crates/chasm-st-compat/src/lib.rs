@@ -529,17 +529,39 @@ impl LiveChatRepository {
         Ok(messages)
     }
 
-    /// Removes every message in a participant's conversation from the live
-    /// chat's segment files — messages where the participant is the recorded
-    /// live speaker or appears in `audibleTo`. Operates on raw JSON lines so no
-    /// message fields are lost on rewrite, and keeps lines without live metadata
-    /// (e.g. the chat header). Returns the number of messages removed.
+    /// Clears a participant's FULL conversation context: removes every message
+    /// that participant can SEE (their own lines, lines audible to them, and
+    /// public / no-metadata lines — the same visibility rule the chat view and
+    /// the prompt history use) from their projection session AND the live
+    /// chat's shared segment files. Operates on raw JSON lines so no message
+    /// fields are lost on rewrite; keeps non-message lines (the chat header).
+    /// Returns the number of messages removed.
     pub fn clear_participant_history(
         &self,
         live_chat: &LiveChat,
         participant_id: &str,
     ) -> Result<usize> {
         let mut removed = 0usize;
+        // The participant's own projection (the live game path's authoritative
+        // per-NPC history) first — leaving it intact was the "clear didn't
+        // clear" bug: the view and the prompt read the projection when present.
+        if let Some(session_id) = participant_session_id(live_chat, participant_id) {
+            let path = self.session_file_path(&session_id)?;
+            if path.exists() {
+                let content = fs::read_to_string(&path).map_err(|source| CompatError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                let (out, removed_here) = strip_participant_from_jsonl(&content, participant_id);
+                if removed_here > 0 {
+                    removed += removed_here;
+                    fs::write(&path, out).map_err(|source| CompatError::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
+                }
+            }
+        }
         for segment in &live_chat.segments {
             let path = self.session_file_path(&segment.session_id)?;
             if !path.exists() {
@@ -894,53 +916,28 @@ fn is_public_or_player_visible_without_live_metadata(message: &STJsonlChatMessag
                 .is_none()
 }
 
-/// Whether a raw chat-message JSON value belongs to a participant's
-/// conversation: the participant is the recorded live speaker, OR the line was
-/// addressed to them privately (they are audible and no other NPC is audible).
-/// A line the participant merely overheard in a shared scene does NOT match, so
-/// clearing one NPC never wipes a bystander NPC's lines. Lines without live
-/// metadata (e.g. the chat header) never match.
-fn message_belongs_to_participant(message: &Value, participant_id: &str) -> bool {
-    let Some(live) = message
-        .get("extra")
-        .and_then(|extra| extra.get("headless"))
-        .and_then(|headless| headless.get("metadata"))
-        .and_then(|metadata| metadata.get("live"))
-    else {
+/// Whether a raw chat-message JSON line is VISIBLE to a participant — the same
+/// rule the chat view and the prompt history use (`collect_visible_messages`):
+/// the participant is the recorded live speaker, the line is audible to them,
+/// it is a player-visible line, globally visible, or a public / no-live-metadata
+/// line (which every participant sees). Clearing a participant removes exactly
+/// what they could see, so their next turn starts from a genuinely empty
+/// context. Non-message lines (the chat header) never match.
+fn message_visible_to_participant(message: &Value, participant_id: &str) -> bool {
+    let Ok(parsed) = serde_json::from_value::<STJsonlChatMessage>(message.clone()) else {
         return false;
     };
-    // The participant's own spoken lines always belong to their history.
-    if live.get("speakerParticipantId").and_then(Value::as_str) == Some(participant_id) {
-        return true;
+    match extract_live_metadata(&parsed) {
+        Some(live) => visible_reason(&parsed, &live, participant_id).is_some(),
+        None => is_public_or_player_visible_without_live_metadata(&parsed),
     }
-    // Otherwise a line only belongs to this participant if it was addressed to
-    // THEM privately: they were audible AND no OTHER NPC was audible. This stops
-    // "clear <NPC>" from wiping a bystander NPC's lines just because the cleared
-    // NPC happened to overhear them in a shared scene (e.g. Goodsprings, where
-    // every nearby NPC is listed in `audibleTo`). Player lines directed at this
-    // NPC alone (audibleTo = {npc, player}) are still cleared.
-    let Some(audible) = live.get("audibleTo").and_then(Value::as_array) else {
-        return false;
-    };
-    let participant_audible = audible
-        .iter()
-        .any(|value| value.as_str() == Some(participant_id));
-    if !participant_audible {
-        return false;
-    }
-    let other_npc_audible = audible.iter().any(|value| {
-        value
-            .as_str()
-            .is_some_and(|id| id != participant_id && id.starts_with("npc:"))
-    });
-    !other_npc_audible
 }
 
-/// Removes every JSONL line that belongs to `participant_id` (the recorded live
-/// speaker, or listed in `audibleTo`) from a raw chat-session file body. Lines
-/// without live metadata (e.g. the chat header) are preserved. Returns the
-/// rewritten body — newline-terminated when non-empty — and the number of
-/// messages removed.
+/// Removes every JSONL line VISIBLE to `participant_id` (speaker / audible /
+/// player-visible / global / public-no-metadata — the chat-view visibility
+/// rule) from a raw chat-session file body. Non-message lines (the chat
+/// header) are preserved. Returns the rewritten body — newline-terminated when
+/// non-empty — and the number of messages removed.
 ///
 /// Shared by the live participant-clear path and the save-sync checkpoint scrub
 /// so a cleared conversation is removed by EXACTLY the same rule from both the
@@ -956,7 +953,7 @@ pub fn strip_participant_from_jsonl(content: &str, participant_id: &str) -> (Str
         }
         let belongs = serde_json::from_str::<Value>(trimmed)
             .ok()
-            .is_some_and(|value| message_belongs_to_participant(&value, participant_id));
+            .is_some_and(|value| message_visible_to_participant(&value, participant_id));
         if belongs {
             removed += 1;
         } else {
@@ -1130,25 +1127,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strip_participant_removes_only_their_lines() {
-        // Header (no live metadata) is kept; Sunny's speaker line and a player
-        // line audible to Sunny are removed; Chet's line (not audible to Sunny)
-        // stays. This is the exact rule shared by clear + the checkpoint scrub.
+    fn strip_participant_removes_everything_they_can_see() {
+        // Clearing = the participant's FULL visible context: their own lines,
+        // lines audible to them, and public / no-metadata lines. The header
+        // (not a message) and lines invisible to them survive.
         let content = concat!(
             "{\"user_name\":\"Player\",\"chat_metadata\":{}}\n",
+            // Player line audible to Sunny -> removed.
             "{\"is_user\":true,\"mes\":\"hi sunny\",\"extra\":{\"headless\":{\"metadata\":{\"live\":{\"audibleTo\":[\"player\",\"npc:sunny\"]}}}}}\n",
+            // Sunny's own line -> removed.
             "{\"name\":\"Sunny\",\"mes\":\"Howdy.\",\"extra\":{\"headless\":{\"metadata\":{\"live\":{\"speakerParticipantId\":\"npc:sunny\",\"audibleTo\":[\"player\",\"npc:sunny\"]}}}}}\n",
+            // Public / no-live-metadata player line (the orphan kind that used
+            // to survive every clear and bloat every prompt) -> removed.
+            "{\"is_user\":true,\"mes\":\"Hello\",\"extra\":{}}\n",
+            // Chet's line, NOT audible to Sunny -> invisible to her, kept.
             "{\"name\":\"Chet\",\"mes\":\"Hey.\",\"extra\":{\"headless\":{\"metadata\":{\"live\":{\"speakerParticipantId\":\"npc:chet\",\"audibleTo\":[\"player\",\"npc:chet\"]}}}}}\n",
         );
         let (out, removed) = strip_participant_from_jsonl(content, "npc:sunny");
-        assert_eq!(removed, 2);
+        assert_eq!(removed, 3);
         assert!(out.contains("chat_metadata"), "header kept");
-        assert!(out.contains("Chet"), "unrelated NPC kept");
+        assert!(out.contains("Chet"), "line invisible to Sunny kept");
         assert!(!out.contains("Howdy"), "Sunny's line removed");
-        assert!(
-            !out.contains("hi sunny"),
-            "player line audible to Sunny removed"
-        );
+        assert!(!out.contains("hi sunny"), "player line audible to Sunny removed");
+        assert!(!out.contains("Hello"), "public no-metadata line removed");
         assert!(out.ends_with('\n'));
         // Idempotent: a second pass removes nothing.
         let (_, again) = strip_participant_from_jsonl(&out, "npc:sunny");
@@ -1156,28 +1157,30 @@ mod tests {
     }
 
     #[test]
-    fn clearing_one_npc_keeps_a_bystander_npcs_lines() {
-        // Goodsprings-style shared scene: every nearby NPC is listed in
-        // `audibleTo`. Clearing Easy Pete must remove ONLY Pete's own lines and
-        // player lines addressed to Pete alone — never Sunny's lines that Pete
-        // merely overheard (the bug that wiped Sunny's history along with Pete's).
+    fn clearing_one_npc_wipes_their_full_shared_scene_context() {
+        // Goodsprings-style shared scene. Clearing Easy Pete removes EVERYTHING
+        // Pete could see — his lines, lines he overheard, and room-wide player
+        // lines — so his next turn starts from an empty context. A line he was
+        // NOT audible for (Chet's private aside) survives.
         let content = concat!(
             "{\"user_name\":\"Player\",\"chat_metadata\":{}}\n",
-            // Player greets Pete privately (only Pete audible) -> cleared.
             "{\"is_user\":true,\"mes\":\"hi pete\",\"extra\":{\"headless\":{\"metadata\":{\"live\":{\"audibleTo\":[\"player\",\"npc:easy_pete\"]}}}}}\n",
-            // Pete's own reply -> cleared.
             "{\"name\":\"Pete\",\"mes\":\"Howdy stranger.\",\"extra\":{\"headless\":{\"metadata\":{\"live\":{\"speakerParticipantId\":\"npc:easy_pete\",\"audibleTo\":[\"player\",\"npc:easy_pete\"]}}}}}\n",
-            // Sunny speaks while Pete is also audible -> MUST stay.
             "{\"name\":\"Sunny\",\"mes\":\"Watch the geckos.\",\"extra\":{\"headless\":{\"metadata\":{\"live\":{\"speakerParticipantId\":\"npc:sunny\",\"audibleTo\":[\"player\",\"npc:sunny\",\"npc:easy_pete\"]}}}}}\n",
-            // Player addresses the room (both NPCs audible) -> shared, MUST stay.
             "{\"is_user\":true,\"mes\":\"hey everyone\",\"extra\":{\"headless\":{\"metadata\":{\"live\":{\"audibleTo\":[\"player\",\"npc:sunny\",\"npc:easy_pete\"]}}}}}\n",
+            "{\"name\":\"Chet\",\"mes\":\"psst, over here.\",\"extra\":{\"headless\":{\"metadata\":{\"live\":{\"speakerParticipantId\":\"npc:chet\",\"audibleTo\":[\"player\",\"npc:chet\"]}}}}}\n",
         );
         let (out, removed) = strip_participant_from_jsonl(content, "npc:easy_pete");
-        assert_eq!(removed, 2, "only Pete's own line + the Pete-only player line");
-        assert!(!out.contains("hi pete"), "player line to Pete alone removed");
-        assert!(!out.contains("Howdy stranger"), "Pete's own line removed");
-        assert!(out.contains("Watch the geckos"), "Sunny's overheard line kept");
-        assert!(out.contains("hey everyone"), "shared room line kept");
+        assert_eq!(removed, 4, "everything Pete could see");
+        assert!(!out.contains("hi pete"));
+        assert!(!out.contains("Howdy stranger"));
+        assert!(!out.contains("Watch the geckos"), "overheard line cleared too");
+        assert!(!out.contains("hey everyone"), "room line cleared too");
+        assert!(out.contains("psst, over here"), "line Pete never heard survives");
+        // Sunny still has her own view of what SHE said elsewhere: clearing Pete
+        // must not touch files/lines invisible to him — verified by the Chet line
+        // above; cross-file isolation is covered by clear_participant_history
+        // only rewriting files where something matched.
     }
 
     #[test]
