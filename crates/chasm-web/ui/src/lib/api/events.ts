@@ -22,6 +22,8 @@ export interface EventDto {
   realTime: string;
   /** Pre-formatted in-game clock, e.g. "13:42, 15 Nov 2281". */
   gameTime?: string;
+  /** In-game day counter since the save began (1-based). */
+  gameDay?: number;
   location?: string;
   actors?: EventActorDto[];
   data?: Record<string, unknown>;

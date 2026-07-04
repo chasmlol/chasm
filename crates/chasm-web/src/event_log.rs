@@ -156,6 +156,16 @@ fn normalize_event(raw: &Value, seq: u64, now: &str) -> Option<Value> {
     if !game_time.is_empty() {
         out.insert("gameTime".into(), json!(game_time));
     }
+    // In-game day counter (GameDaysPassed, 1-based). Accept a JSON number or a
+    // numeric string, keep it as a number.
+    if let Some(day) = obj
+        .get("gameDay")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+    {
+        if day >= 0 {
+            out.insert("gameDay".into(), json!(day));
+        }
+    }
     let location = str_field("location");
     if !location.is_empty() {
         out.insert("location".into(), json!(location));
@@ -378,6 +388,24 @@ mod tests {
         let seqs: Vec<u64> = events.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
         assert_eq!(seqs, vec![1, 2, 3]);
         assert_eq!(summaries(root.path()), vec!["First", "Second", "Third"]);
+    }
+
+    #[test]
+    fn append_preserves_game_day_and_structured_data() {
+        let root = TempRoot::new("gameday");
+        let incoming = json!({
+            "id": "x",
+            "type": "location",
+            "summary": "Entered Prospector Saloon",
+            "gameDay": 3,
+            "location": "Prospector Saloon, Goodsprings",
+            "data": { "locationMajor": "Goodsprings", "locationMinor": "Prospector Saloon" }
+        });
+        append_events(root.path(), &[incoming]).unwrap();
+        let stored = &read_events_file(&current_file(root.path()))[0];
+        assert_eq!(stored["gameDay"], 3);
+        assert_eq!(stored["data"]["locationMajor"], "Goodsprings");
+        assert_eq!(stored["data"]["locationMinor"], "Prospector Saloon");
     }
 
     #[test]

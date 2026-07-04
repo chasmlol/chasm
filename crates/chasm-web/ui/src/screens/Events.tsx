@@ -94,13 +94,20 @@ function TypeChip({
 
 function EventRow({ event }: { event: EventDto }) {
   const when = eventWhen(event);
+  const dayLabel =
+    typeof event.gameDay === "number" ? `Day ${event.gameDay}` : null;
   return (
     <div className="flex items-center gap-3 border-t border-[var(--line-soft)] px-4 py-2 first:border-t-0">
       <span
-        className="w-36 shrink-0 truncate text-xs tabular-nums text-[var(--muted-foreground)]"
+        className="flex w-40 shrink-0 flex-col text-xs tabular-nums"
         title={new Date(event.realTime).toLocaleString()}
       >
-        {when}
+        {dayLabel && (
+          <span className="truncate font-medium text-[var(--foreground)]">
+            {dayLabel}
+          </span>
+        )}
+        <span className="truncate text-[var(--muted-foreground)]">{when}</span>
       </span>
       <span
         className={cn(
