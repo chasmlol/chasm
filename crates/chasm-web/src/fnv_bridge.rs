@@ -244,6 +244,15 @@ impl ChasmClient for InProcessChasmClient {
         crate::music::spawn_song_job(self.state.clone(), job);
     }
 
+    fn schedule_task(&self, spec: Value) {
+        // Fire-and-forget: parse + persist the scheduled task synchronously (a
+        // cheap file write), so the turn is never blocked. A failure is logged and
+        // does not disturb the turn.
+        if let Err(error) = crate::scheduler::schedule_from_spec(&self.state, &spec) {
+            tracing::warn!("scheduler: failed to schedule task: {error}");
+        }
+    }
+
     async fn synthesize_stream(
         &self,
         body: &Value,

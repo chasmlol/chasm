@@ -55,6 +55,10 @@ pub struct AppSettings {
     /// NVSE plugin via the bridge `control/hotkeys.cfg` file (see
     /// [`crate::hotkeys`]).
     pub hotkeys: HotkeysSettings,
+    /// NPC movement/travel system (the Travel settings page + the reusable
+    /// "walk an NPC to a place, arriving on time" engine). Serde default so
+    /// older settings files load fine.
+    pub movement: MovementSettings,
 }
 
 impl Default for AppSettings {
@@ -73,6 +77,46 @@ impl Default for AppSettings {
             persona: PersonaSettings::default(),
             api_keys: BTreeMap::new(),
             hotkeys: HotkeysSettings::default(),
+            movement: MovementSettings::default(),
+        }
+    }
+}
+
+/// The NPC movement/travel system: a reusable engine that walks an NPC from where
+/// it stands to a destination so it *arrives at a scheduled in-game time* — the
+/// distance is measured, a travel duration derived from [`walk_speed`], and the
+/// departure backed off so arrival lands on time. While the player is away the
+/// engine advances the NPC along the route in steps (Gamebryo will not path an
+/// actor in an unloaded cell, so we simulate it — the same technique living-world
+/// mods use). `#[serde(default)]` so older settings files (no `movement` key) load.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MovementSettings {
+    /// Master switch. When off, a scheduled `travel` fires the old instant
+    /// teleport at its trigger time instead of a timed, walked journey.
+    pub enabled: bool,
+    /// Travel speed in **metres of world distance per in-game hour**. This is
+    /// game-time (decoupled from the frame-rate/timescale) so "arrive at 3:00 PM"
+    /// math is stable: `eta_hours = distance_m / walk_speed`. Default 1500 ≈ a
+    /// brisk ~1.5 km per in-game hour; raise for faster travel, lower for slower.
+    pub walk_speed: f32,
+    /// When on, advance the NPC along the route while the player is elsewhere
+    /// (unloaded), so intercepting them mid-journey finds them on the road. When
+    /// off, they simply appear at the destination at arrival time.
+    pub offscreen_simulation: bool,
+    /// Minimum world-distance (metres) the NPC must have advanced before the
+    /// engine emits the next position update — throttles the waypoint stream so
+    /// short ticks don't spam identical moves. Default 40 m.
+    pub waypoint_stride: f32,
+}
+
+impl Default for MovementSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            walk_speed: 1500.0,
+            offscreen_simulation: true,
+            waypoint_stride: 40.0,
         }
     }
 }

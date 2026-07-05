@@ -495,6 +495,14 @@ struct TurnContext {
     orchestrator: orchestrator::OrchestratorSettings,
 }
 
+/// Whether a turn's requested action-book scopes mark it as the admin/gamemaster
+/// (Todd) path. The admin turn ships `admin`/`godmode` scopes; it keeps the fuller
+/// [`chasm_prompt::STRUCTURED_OUTPUT_INSTRUCTION`], while regular NPCs use the
+/// smaller [`chasm_prompt::NPC_STRUCTURED_OUTPUT_INSTRUCTION`].
+fn is_admin_scope(scopes: &[String]) -> bool {
+    scopes.iter().any(|s| s == "admin" || s == "godmode")
+}
+
 /// Parses the request's `actionBookScopes` (array of strings) into the scope list
 /// the prompt assembler gates actions on. Accepts camelCase or snake_case.
 fn parse_action_book_scopes(body: &Value) -> Vec<String> {
@@ -1044,6 +1052,11 @@ fn prepare_speaker_turn_traced(
         // answer the player instead of the prior NPC's just-spoken line).
         false,
         &global_scenario,
+        is_admin_scope(&ctx.requested_scopes),
+        ctx.scenario_macros
+            .get("nearby_locations")
+            .map(String::as_str)
+            .unwrap_or(""),
     );
 
     let audible_to = default_audible_to(&ctx.live_chat, &speaker_participant_id);
@@ -1260,6 +1273,8 @@ fn build_chat_messages(
     scene_roster: &str,
     append_player_message: bool,
     global_scenario: &str,
+    is_admin: bool,
+    nearby_locations: &str,
 ) -> Vec<Value> {
     // Components whose content CHANGES from turn to turn (retrieval picks,
     // book activations, live world state). They must NOT ride in the head
@@ -1349,10 +1364,15 @@ fn build_chat_messages(
                 .content
                 .starts_with("Activated Quest Book entries:")
         });
-        // Single source of action guidance now lives in STRUCTURED_OUTPUT_INSTRUCTION
-        // (lean + positive). The action-book *entries* themselves are still injected
-        // as a system component; only the redundant how-to blocks were removed.
-        system_parts.push(chasm_prompt::STRUCTURED_OUTPUT_INSTRUCTION.to_string());
+        // Action guidance: the admin/Todd path keeps the full instruction (spawn +
+        // targeted actions); regular NPCs get the smaller, clearer NPC instruction
+        // (with the to/at/then scheduling explained). The action-book *entries*
+        // themselves are still injected as a system component either way.
+        system_parts.push(if is_admin {
+            chasm_prompt::STRUCTURED_OUTPUT_INSTRUCTION.to_string()
+        } else {
+            chasm_prompt::NPC_STRUCTURED_OUTPUT_INSTRUCTION.to_string()
+        });
         if has_quest_block {
             // Rides with the quest entries in the volatile block: it appears
             // only on turns where a quest book activated, so in the head
@@ -1496,6 +1516,24 @@ fn build_chat_messages(
             messages.len()
         };
         messages.insert(insert_at, scenario_message);
+    }
+
+    // Nearby travel destinations (the mod's `nearby_locations` macro), at depth 1
+    // like the scenario: the list changes as the player moves, so it must NOT sit
+    // in the cached head. Gives the model the exact place names the plugin can
+    // resolve, so a scheduled "travel to X" names a REAL marker.
+    if !nearby_locations.trim().is_empty() {
+        let note = format!(
+            "Nearby places you can travel to, nearest first, each with its distance \
+             (use the exact place name, without the distance, as the destination): {}. \
+             For a building you can go to its entrance (e.g. to=\"Prospector Saloon\") \
+             or inside it (prefix with inside, e.g. to=\"inside Prospector Saloon\") — \
+             pick whichever the conversation means.",
+            nearby_locations.trim()
+        );
+        let msg = json!({ "role": "system", "content": note });
+        let insert_at = if messages.len() > 1 { messages.len() - 1 } else { messages.len() };
+        messages.insert(insert_at, msg);
     }
 
     // Player persona LAST, so it lands closest to the newest player line — the
@@ -1977,16 +2015,68 @@ fn normalize_structured_action_aliases(structured: &mut Value, aliases: &[(Strin
     }
 
     let mut out: Vec<Value> = Vec::new();
+    let mut scheduled: Vec<Value> = Vec::new();
     for raw in &raw_actions {
+        // Function-call surface (regular NPCs emit `name(args)`): parse the call
+        // and route a scheduled one (has `at=` or `to=`) into `scheduled` — run_turn
+        // hands each to the scheduler store — and an immediate one into `actions`.
+        // A string with no parens (bare "wave") or a JSON object falls through to
+        // the alias resolution below.
+        if let Value::String(text) = raw {
+            if let Some(call) = crate::scheduler::parse_action_call(text) {
+                let action_id = resolve_verb_to_action_id(&call.name, &by_alias, &ids);
+                if action_id.is_empty() {
+                    continue; // unknown action word
+                }
+                if call.is_scheduled() {
+                    scheduled.push(json!({
+                        "raw": text,
+                        "steps": [{
+                            "verb": call.name,
+                            "action_id": action_id,
+                            "when": call.at,
+                            "destination": call.to,
+                        }],
+                    }));
+                } else {
+                    out.push(json!({
+                        "id": action_id,
+                        "target": call.target.unwrap_or_default(),
+                        "parameters": {},
+                        "reason": format!("Action call \"{text}\"."),
+                    }));
+                }
+                continue;
+            }
+        }
         match raw {
             Value::String(text) => {
                 if let Some(id) = by_alias.get(&chasm_prompt::slug_action_alias(text)) {
+                    // The whole string is the alias (e.g. "wave", "follow").
                     out.push(json!({
                         "id": id,
                         "target": "",
                         "parameters": {},
                         "reason": format!("Selected action alias \"{text}\"."),
                     }));
+                } else {
+                    // A plain phrase whose leading word is the alias and the rest
+                    // is who/what it is aimed at (e.g. "follow me", "attack Easy
+                    // Pete"). NPCs write actions as one plain string, so resolve the
+                    // first word and keep the remainder as the target. (Scheduled
+                    // phrases like "travel to X at Y" were already peeled off above.)
+                    let trimmed = text.trim();
+                    let (first, rest) = trimmed
+                        .split_once(char::is_whitespace)
+                        .unwrap_or((trimmed, ""));
+                    if let Some(id) = by_alias.get(&chasm_prompt::slug_action_alias(first)) {
+                        out.push(json!({
+                            "id": id,
+                            "target": rest.trim(),
+                            "parameters": {},
+                            "reason": format!("Selected action \"{text}\"."),
+                        }));
+                    }
                 }
             }
             Value::Object(map) => {
@@ -2021,7 +2111,35 @@ fn normalize_structured_action_aliases(structured: &mut Value, aliases: &[(Strin
 
     if let Some(obj) = structured.as_object_mut() {
         obj.insert("actions".to_string(), Value::Array(out));
+        if !scheduled.is_empty() {
+            obj.insert("scheduled".to_string(), Value::Array(scheduled));
+        }
     }
+}
+
+/// Resolve a natural-language action verb-phrase to a canonical action id, for a
+/// scheduled step. Tries the whole phrase as an alias, then each word (so
+/// "please wave" resolves to `wave`); returns "" when nothing matches (the step
+/// then fires as a travel/no-op fallback rather than a native action).
+fn resolve_verb_to_action_id(
+    verb: &str,
+    by_alias: &std::collections::HashMap<String, String>,
+    ids: &std::collections::HashSet<String>,
+) -> String {
+    let whole = chasm_prompt::slug_action_alias(verb);
+    if let Some(id) = by_alias.get(&whole) {
+        return id.clone();
+    }
+    if ids.contains(verb) {
+        return verb.to_string();
+    }
+    for word in verb.split_whitespace() {
+        let slug = chasm_prompt::slug_action_alias(word);
+        if let Some(id) = by_alias.get(&slug) {
+            return id.clone();
+        }
+    }
+    String::new()
 }
 
 fn parse_structured(raw: &str) -> Option<(String, Value)> {
@@ -2628,6 +2746,9 @@ fn resolve_admin_run(state: &Arc<AppState>, body: &Value) -> WebResult<AdminRun>
         // appended as the final user turn here.
         true,
         &global_scenario,
+        // This is the admin/Todd generation path → the full instruction.
+        true,
+        "",
     );
 
     Ok(AdminRun {
@@ -3259,7 +3380,7 @@ mod tests {
         ];
         let messages = build_chat_messages(
             &assembled, &history, "", false, "", "", &Value::Null, "", "", false,
-            "It is 1:22PM. You are in the saloon.",
+            "It is 1:22PM. You are in the saloon.", false, "",
         );
         // Scenario rides as a SYSTEM message at depth 1: after the history bulk,
         // directly before the newest line - so the cached prompt prefix survives
@@ -3271,7 +3392,7 @@ mod tests {
 
         // Empty scenario -> no injection at all.
         let plain = build_chat_messages(
-            &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "",
+            &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "", false, "",
         );
         assert_eq!(plain.len(), 2);
     }
@@ -3314,7 +3435,7 @@ mod tests {
             },
         ];
         let messages = build_chat_messages(
-            &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "",
+            &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "", false, "",
         );
         // Head system message: stable card only — retrieval picks must NOT be
         // there or every turn's differing picks would invalidate the LLM's
@@ -3370,7 +3491,7 @@ mod tests {
             },
         ];
         let messages = build_chat_messages(
-            &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "",
+            &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "", false, "",
         );
         // Head holds the card but NOT the persona — the persona moved to depth 1.
         let head = messages[0]["content"].as_str().unwrap();
@@ -3408,7 +3529,7 @@ mod tests {
             ..Default::default()
         }];
         let messages = build_chat_messages(
-            &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "",
+            &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "", false, "",
         );
         // Just the head system message + the one history line: no persona block.
         assert_eq!(messages.len(), 2);
@@ -3492,7 +3613,7 @@ mod tests {
             },
         ];
         let messages = build_chat_messages(
-            &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "",
+            &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "", false, "",
         );
         // Not in the cached head.
         assert!(!messages[0]["content"].as_str().unwrap().contains("YOU ARE IN COMBAT"));

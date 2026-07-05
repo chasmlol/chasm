@@ -1315,6 +1315,34 @@ fn build_native_action_commands(
     Some(commands)
 }
 
+/// Build the native action command FILE BODY (the exact `control/actions/*.txt`
+/// content) WITHOUT writing it — for the scheduler to capture at schedule time
+/// (where the turn context is available) and replay at fire time by writing it
+/// verbatim. The command is self-contained: the actor is named by `npc_key` and
+/// the script args are resolved live by the plugin (`actor`/`player`), so the
+/// captured body works whenever it is written, regardless of conversation state.
+/// Returns `None` if the action isn't a queueable native/Action-Book action.
+/// Repeat expansion is ignored (a scheduled action fires once).
+pub fn build_native_command_body(
+    request: &NativeRequest,
+    actor: &ActionActor,
+    gm: &GameMaster,
+    source: &str,
+) -> Option<String> {
+    if !gm.should_trigger {
+        return None;
+    }
+    let action = gm.action.trim().to_uppercase();
+    if !["ATTACK", "FOLLOW", "STOP_FOLLOW", "ACTION_BOOK"].contains(&action.as_str()) {
+        return None;
+    }
+    if actor.native_npc_key.trim().is_empty() && actor.native_npc_name.trim().is_empty() {
+        return None;
+    }
+    let command = build_native_action_command_lines(request, actor, gm, source)?;
+    Some(format!("{}\r\n", command.lines.join("\r\n")))
+}
+
 /// `writeNativeGameMasterCommand`: gate + write a command file to every root's
 /// `control/actions`. Returns true if anything was queued.
 pub fn write_native_game_master_command(

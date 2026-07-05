@@ -49,10 +49,12 @@ mod generate;
 mod launcher;
 mod llm;
 mod llm_api;
+mod movement;
 mod music;
 mod orchestrator;
 mod persona;
 mod save_sync;
+mod scheduler;
 mod stack_lifecycle;
 mod stt_api;
 mod stt_vocab;
@@ -407,6 +409,36 @@ pub fn router(config: AppConfig) -> Router {
         let lifecycle_state = Arc::clone(&state);
         tokio::spawn(async move {
             stack_lifecycle::spawn_lifecycle(lifecycle_state).await;
+        });
+
+        // NPC scheduler tick: while the bridge is running, evaluate pending
+        // scheduled tasks against the plugin-reported in-game clock (and world
+        // snapshot) every few seconds and fire any due triggers by writing the
+        // companion command the plugin polls. Spawned like the lifecycle watcher;
+        // fire-and-forget, so a failed task logs but never stalls anything.
+        let scheduler_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3));
+            loop {
+                ticker.tick().await;
+                let s = Arc::clone(&scheduler_state);
+                // Off the async thread: the tick does blocking file IO.
+                let _ = tokio::task::spawn_blocking(move || scheduler::tick(&s)).await;
+            }
+        });
+
+        // NPC movement engine tick: advance every active journey along its route
+        // against the in-game clock (leave on time, walk, arrive on time), emitting
+        // the position commands the plugin applies. Same cadence + fire-and-forget
+        // shape as the scheduler tick.
+        let movement_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3));
+            loop {
+                ticker.tick().await;
+                let s = Arc::clone(&movement_state);
+                let _ = tokio::task::spawn_blocking(move || movement::tick(&s)).await;
+            }
         });
     }
 

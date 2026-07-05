@@ -14,6 +14,8 @@ import { LoreBook } from "@/screens/books/LoreBook";
 import { QuestBook } from "@/screens/books/QuestBook";
 import { ActionBook } from "@/screens/books/ActionBook";
 import { Gamestate } from "@/screens/Gamestate";
+import { Schedule } from "@/screens/Schedule";
+import { Travel } from "@/screens/Travel";
 import { Relationships } from "@/screens/Relationships";
 import { Events } from "@/screens/Events";
 import { Persona } from "@/screens/Persona";
@@ -58,6 +60,8 @@ export function App() {
           <Route path="relationships" element={<Relationships />} />
           <Route path="events" element={<Events />} />
           <Route path="gamestate" element={<Gamestate />} />
+          <Route path="schedule" element={<Schedule />} />
+          <Route path="travel" element={<Travel />} />
           <Route path="persona" element={<Persona />} />
 
           {/* Globals */}

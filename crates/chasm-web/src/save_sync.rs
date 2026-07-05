@@ -1731,9 +1731,11 @@ fn handle_save_sync_event(
             }));
         }
         let result = create_save_sync_checkpoint(data_root, world_root, chat_roots, &forwarded)?;
-        // The game event log checkpoints alongside the chat state, keyed by the
-        // same checkpoint id, so a later load rolls both back together. Never
-        // fatal: a failed event-log snapshot must not void the chat checkpoint.
+        // Save-aware sidecars checkpoint alongside the chat state, keyed by the
+        // same checkpoint id, so a later load rolls them all back together.
+        // Never fatal: a failed sidecar snapshot must not void the chat
+        // checkpoint — the event log warns, the scheduler/movement stores log
+        // internally.
         if let Ok(checkpoint_id) = resolve_checkpoint_id(body) {
             if let Err(e) = crate::event_log::checkpoint_event_log(
                 data_root,
@@ -1742,6 +1744,11 @@ fn handle_save_sync_event(
             ) {
                 tracing::warn!("event-log checkpoint {checkpoint_id}: {e}");
             }
+            // Scheduler tasks + active NPC journeys roll back with the save
+            // exactly like chat history (a task scheduled in a branch discarded
+            // by that load vanishes).
+            crate::scheduler::checkpoint_scheduler_store(data_root, &checkpoint_id);
+            crate::movement::checkpoint_movement_store(data_root, &checkpoint_id);
         }
         return Ok(result);
     }
@@ -1791,10 +1798,14 @@ fn handle_save_sync_event(
             map.insert("checkpointId".into(), json!(checkpoint_id));
         }
         let result = restore_save_sync_checkpoint(data_root, world_root, chat_roots, &forwarded)?;
-        // Roll the game event log back with the chat state (see the save arm).
+        // Roll every save-aware sidecar back with the chat state (see the save
+        // arm): event log, scheduler tasks, and active NPC journeys all match
+        // the loaded save.
         if let Err(e) = crate::event_log::restore_event_log(data_root, &checkpoint_id) {
             tracing::warn!("event-log restore {checkpoint_id}: {e}");
         }
+        crate::scheduler::restore_scheduler_store(data_root, &checkpoint_id);
+        crate::movement::restore_movement_store(data_root, &checkpoint_id);
         return Ok(result);
     }
 

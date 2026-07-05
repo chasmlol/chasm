@@ -47,8 +47,10 @@ pub(crate) mod persona;
 pub(crate) mod profiles;
 pub(crate) mod providers;
 pub(crate) mod relationships;
+pub(crate) mod scheduler;
 pub(crate) mod settings;
 pub(crate) mod system;
+pub(crate) mod travel;
 
 /// Where the built SPA lives: `crates/chasm-web/ui/dist`, resolved off the
 /// workspace root (the same anchor `AppConfig` uses for `static/`). Built by
@@ -164,6 +166,15 @@ pub(crate) fn api_router() -> Router<Arc<AppState>> {
         // crate::event_log next to save_sync, so the handler is registered from
         // there like the trace viewer below) -----------------------------------
         .route("/events", get(crate::event_log::events_view))
+        // --- scheduler (NPC "cronjob" tasks: read-only list + cancel + a test
+        // hook to raise a condition flag; the in-game clock rides the view) -----
+        .route("/scheduler", get(scheduler::list_scheduler))
+        .route("/scheduler/:id/cancel", post(scheduler::cancel_task))
+        .route("/scheduler/event", post(scheduler::raise_event))
+        // --- travel (NPC movement system: settings + live journeys + cancel) ---
+        .route("/travel", get(travel::list_travel))
+        .route("/travel/settings", post(travel::save_settings))
+        .route("/travel/:id/cancel", post(travel::cancel_journey))
         // --- profiles (list + activate the active game profile) --------------
         .route("/profiles", get(profiles::list_profiles))
         .route("/profiles/select", post(profiles::select_profile))

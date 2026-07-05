@@ -25,10 +25,10 @@
 ///   conversation sentence never renders empty.
 /// * The closing instruction carries no macros at all — it survives even a
 ///   turn with no recorded gamestate.
-pub const DEFAULT_SCENARIO_TEMPLATE: &str = "It is {{time_of_day}}. You are in \
-{{minor_location}}. The surrounding area is {{major_location}}. You are in a \
-conversation with {{participants}}. Speak and act consistently with this \
-place, this time, and the people present.";
+pub const DEFAULT_SCENARIO_TEMPLATE: &str = "It is {{time_of_day}}. You are \
+{{inside_or_outside}} {{minor_location}}. The surrounding area is \
+{{major_location}}. You are in a conversation with {{participants}}. Speak and \
+act consistently with this place, this time, and the people present.";
 
 /// Formats the backend-computed `{{participants}}` macro: who the prompted NPC
 /// is talking WITH — the player plus every OTHER NPC in the group conversation
@@ -140,6 +140,7 @@ mod tests {
     fn default_template_resolves_fully_populated() {
         let macros = table(&[
             ("time_of_day", "2:32PM"),
+            ("inside_or_outside", "inside"),
             ("minor_location", "Prospector Saloon"),
             ("major_location", "Goodsprings"),
             (
@@ -149,7 +150,7 @@ mod tests {
         ]);
         assert_eq!(
             apply_macros(DEFAULT_SCENARIO_TEMPLATE, &macros),
-            "It is 2:32PM. You are in Prospector Saloon. The surrounding area \
+            "It is 2:32PM. You are inside Prospector Saloon. The surrounding area \
              is Goodsprings. You are in a conversation with Courier, Sunny \
              Smiles, and Trudy. Speak and act consistently with this place, this time, \
              and the people present."
@@ -169,6 +170,6 @@ mod tests {
         assert!(resolved.contains("Speak and act consistently"));
         // Each location/time sentence is still its own short sentence.
         assert!(resolved.contains("It is ."));
-        assert!(resolved.contains("You are in ."));
+        assert!(resolved.contains("The surrounding area is ."));
     }
 }

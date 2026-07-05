@@ -527,6 +527,67 @@ async fn run_turn(
         return Ok(());
     }
 
+    // Scheduled actions (natural-language "at <time>" / "then" on an ordinary
+    // action string). `normalize()` peeled these into `structured.scheduled`; they
+    // never fire immediately. For each step whose verb resolved to a native
+    // Action-Book action, build its command NOW (only here is the turn context
+    // available to resolve the script + args) so the tick can replay it verbatim
+    // at the scheduled time. Fire-and-forget; never blocks or fails the turn.
+    for line in &lines {
+        let Some(specs) = line.turn.pointer("/structured/scheduled").and_then(Value::as_array) else {
+            continue;
+        };
+        for spec in specs {
+            let owner_key = first_non_empty([line.native_npc_key.clone(), request.npc_key.clone()]);
+            let owner_name = first_non_empty([
+                line.native_npc_name.clone(),
+                line.character_name.clone(),
+                request.npc_name.clone(),
+            ]);
+            let actor = actions::ActionActor {
+                native_npc_key: owner_key.clone(),
+                native_npc_name: owner_name.clone(),
+                character_name: line.character_name.clone(),
+                character_id: line.character_id.clone(),
+            };
+            let mut out_steps: Vec<Value> = Vec::new();
+            for step in spec.get("steps").and_then(Value::as_array).into_iter().flatten() {
+                let mut step = step.clone();
+                let action_id = step.get("action_id").and_then(Value::as_str).unwrap_or("").to_string();
+                if !action_id.is_empty() {
+                    // Classify just this action against the real turn (which carries
+                    // the activated executions) and build its native command body.
+                    let mut synth = line.turn.clone();
+                    let single = serde_json::json!([{ "id": action_id, "target": "player" }]);
+                    match synth.get_mut("structured") {
+                        Some(s) => s["actions"] = single,
+                        None => synth["structured"] = serde_json::json!({ "actions": single }),
+                    }
+                    let gm = actions::get_native_game_master_action(config, &synth);
+                    if let Some(body) = actions::build_native_command_body(request, &actor, &gm, "scheduler") {
+                        if let Some(obj) = step.as_object_mut() {
+                            obj.insert("command_body".to_string(), Value::String(body));
+                        }
+                    }
+                }
+                out_steps.push(step);
+            }
+            let (day, hour) = request_clock(request);
+            let payload = serde_json::json!({
+                "owner_npc_key": owner_key,
+                "owner_name": owner_name,
+                "character_name": line.character_name.clone(),
+                "live_chat_id": config.live_chat_id.clone(),
+                "raw": spec.get("raw").cloned().unwrap_or(Value::Null),
+                "steps": out_steps,
+                "day": day,
+                "hour": hour,
+            });
+            info!("{}: scheduled phrase by {}", request.request_id, line.character_name);
+            client.schedule_task(payload);
+        }
+    }
+
     // Native actions: classify each line, write a durable command file per triggered
     // action to every control/actions dir, and report a DISARMED game_master on the
     // response so the action fires exactly once (from the file, not the response).
@@ -953,6 +1014,20 @@ fn write_placeholder(sink: &dyn TurnSink, request: &NativeRequest) -> anyhow::Re
 
 fn first_non_empty<const N: usize>(values: [String; N]) -> String {
     values.into_iter().find(|s| !s.is_empty()).unwrap_or_default()
+}
+
+/// The in-game clock (GameDaysPassed, GameHour) the plugin reported in this turn's
+/// `metadata.macros`, as JSON values (string/number or null) for the scheduler
+/// spec. Null when absent — the scheduler then falls back to the live heartbeat.
+fn request_clock(request: &protocol::NativeRequest) -> (serde_json::Value, serde_json::Value) {
+    let macros = request.metadata.get("macros");
+    let get = |key: &str| {
+        macros
+            .and_then(|m| m.get(key))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    (get("game_days_passed"), get("game_hour"))
 }
 
 // ---------------------------------------------------------------------------

@@ -25,6 +25,8 @@ export * from "./globals";
 export * from "./persona";
 export * from "./relationships";
 export * from "./events";
+export * from "./scheduler";
+export * from "./travel";
 
 import { systemApi } from "./system";
 import { booksApi } from "./books";
@@ -39,6 +41,8 @@ import { globalsApi } from "./globals";
 import { personaApi } from "./persona";
 import { relationshipsApi } from "./relationships";
 import { eventsApi } from "./events";
+import { schedulerApi } from "./scheduler";
+import { travelApi } from "./travel";
 
 export {
   systemApi,
@@ -54,6 +58,8 @@ export {
   personaApi,
   relationshipsApi,
   eventsApi,
+  schedulerApi,
+  travelApi,
 };
 
 /**
@@ -75,4 +81,6 @@ export const api = {
   persona: personaApi,
   relationships: relationshipsApi,
   events: eventsApi,
+  scheduler: schedulerApi,
+  travel: travelApi,
 };

@@ -42,12 +42,11 @@ use chasm_st_compat::{ActionEntry, CatalogItem, LiveChatRepository, LoreEntry, Q
 mod action_book_injection;
 pub use action_book_injection::*;
 
-/// The single instruction that tells the model the structured-reply shape AND how
-/// to use actions. Deliberately ONE lean block with a POSITIVE bias (take an
-/// action when it fits) — the old split across three instructions all said
-/// "default to []", which suppressed actions entirely. An action is just its
-/// alias string (e.g. `["attack"]`); the schema also allows an object with the
-/// alias as `id` for actions that need parameters.
+/// The action instruction for the ADMIN / GAMEMASTER path (Todd). Kept as the
+/// original lean block — it covers the admin-scoped surface (spawn `entity`/
+/// `count`, targeted actions). Regular NPCs use the smaller, clearer
+/// [`NPC_STRUCTURED_OUTPUT_INSTRUCTION`] instead (chosen in `build_chat_messages`);
+/// scheduling (`to`/`at`/`then`) lives there, not here.
 pub const STRUCTURED_OUTPUT_INSTRUCTION: &str = concat!(
     "Reply with one JSON object: \"speech\" (your spoken words only, no name or label), ",
     "\"stateUpdates\" ({} unless something must change), and \"actions\".\n",
@@ -60,6 +59,28 @@ pub const STRUCTURED_OUTPUT_INSTRUCTION: &str = concat!(
     "When an entry lists \"Spawnable now\" candidates, use the object form with \"entity\" (one of those ",
     "candidates), \"count\", and \"target\" — e.g. {\"id\":\"spawn\",\"entity\":\"Deathclaw\",\"count\":1,\"target\":\"player\"}."
 );
+
+/// The action instruction for a REGULAR NPC (everyone except the admin/Todd
+/// path). Actions are FUNCTION CALLS — the syntax models are most reliably trained
+/// on, which removes the ambiguity of free-form strings (where the place ends, is
+/// that a time or a target). Each is `word(args)` with optional `to=`/`at=`/
+/// `target=`; the normalizer parses the call. Chosen in `build_chat_messages` for
+/// non-admin turns.
+pub const NPC_STRUCTURED_OUTPUT_INSTRUCTION: &str = r#"Reply with ONE JSON object and nothing else:
+{"speech": "<what you say out loud>", "actions": [<action calls>]}
+- "speech": only your spoken words - no name, no narration, no action words.
+- "actions": a list of action CALLS (strings), one per thing you physically do this turn. Use [] when you are only talking.
+
+Write every action as a function call: an action word from the "Activated Action Book entries" list, followed by ( ). With empty parentheses it happens right now.
+
+Put any details the player gave inside the parentheses as arguments:
+- to="<place>": where a travel action goes. Prefer an exact name from the "Nearby places you can travel to" list.
+- target="<name>": who the action is aimed at (the player, or a nearby person by name).
+- at="<time>": do the action LATER, at that in-game time, instead of now. A scheduled trip looks like: travel(to="<place>", at="3:00PM").
+
+Times are ALWAYS a clock time written like "2:52PM" or "11:00AM". You are told the current in-game time; if the player gives a relative time such as "in an hour", work out the actual clock time yourself and use it - never write "in an hour".
+
+Only use action words from the list, never invent one, and keep them out of "speech"."#;
 
 /// Verbatim from `src/headless/quest-books.js` `QUEST_BOOK_STRUCTURED_OUTPUT_INSTRUCTION`.
 pub const QUEST_BOOK_STRUCTURED_OUTPUT_INSTRUCTION: &str = concat!(

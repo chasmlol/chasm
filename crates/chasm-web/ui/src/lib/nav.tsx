@@ -10,6 +10,8 @@ import {
   Swords,
   Variable,
   UserRound,
+  CalendarClock,
+  Footprints,
   Globe,
   SlidersHorizontal,
   Layers,
@@ -86,6 +88,18 @@ export const NAV_GROUPS: NavGroup[] = [
         label: "Gamestate",
         path: "gamestate",
         icon: Variable,
+      },
+      {
+        key: "schedule",
+        label: "Schedule",
+        path: "schedule",
+        icon: CalendarClock,
+      },
+      {
+        key: "travel",
+        label: "Travel",
+        path: "travel",
+        icon: Footprints,
       },
       {
         key: "persona",

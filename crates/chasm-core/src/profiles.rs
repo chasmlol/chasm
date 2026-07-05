@@ -285,6 +285,35 @@ impl ProfilePaths {
             .join("relationships.json")
     }
 
+    /// Scheduler store file (NPC "cronjob" tasks: time- and condition-triggered
+    /// actions owned by companions / the in-conversation NPC):
+    /// `profiles/<id>/headless/scheduler.json` when the profile folder exists,
+    /// else `{data_root}/headless/scheduler.json`.
+    ///
+    /// Same write-safe rule as [`Self::persona_dir`] / [`Self::relationships_store`]:
+    /// a runtime store the backend WRITES, which does not exist until the first
+    /// task is scheduled, so anchoring on [`Self::content_root`] keeps reads and
+    /// writes agreeing from the start (and makes the file live alongside the
+    /// save-sync snapshots that roll it back with the save).
+    pub fn scheduler_store(&self) -> PathBuf {
+        self.content_root()
+            .join("headless")
+            .join("scheduler.json")
+    }
+
+    /// Movement/travel engine store: the active NPC journeys (who is walking
+    /// where, departed when, arriving when): `profiles/<id>/headless/movement.json`
+    /// when the profile folder exists, else `{data_root}/headless/movement.json`.
+    ///
+    /// Same write-safe / save-aware rule as [`Self::scheduler_store`]: a runtime
+    /// store the backend WRITES, anchored on [`Self::content_root`] so it lives
+    /// alongside the save-sync snapshots that roll it back with the save.
+    pub fn movement_store(&self) -> PathBuf {
+        self.content_root()
+            .join("headless")
+            .join("movement.json")
+    }
+
     /// The "content root" used by code paths that derive several sibling paths
     /// from one base (the live-chat repository, save-sync). When a profile is
     /// active *and* its folder exists, this is `profiles/<id>`; otherwise it is

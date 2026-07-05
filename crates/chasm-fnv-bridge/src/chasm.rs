@@ -86,6 +86,18 @@ pub trait ChasmClient: Send + Sync {
     /// Default: a no-op — music generation runs only in the in-process build
     /// (chasm-web), not the standalone HTTP bin / test mocks.
     fn start_song_job(&self, _job: SongJob) {}
+
+    /// Persist a scheduled NPC task parsed from a natural-language action string
+    /// ("wave at 1am", "loot the body then give to you"). Fire-and-forget: returns
+    /// immediately so the turn is never blocked; the client builds the task from
+    /// the pre-resolved steps and writes it to the scheduler store, logging any
+    /// failure. `spec` is `{ owner_npc_key, owner_name, character_name,
+    /// live_chat_id, raw, day, hour, steps: [ { verb, action_id, when,
+    /// command_body? } ] }`, where `command_body` is the native command the bridge
+    /// captured for a step whose verb resolved to a native Action-Book action.
+    /// Default: a no-op — the scheduler store lives in the in-process build
+    /// (chasm-web), not the standalone HTTP bin / test mocks.
+    fn schedule_task(&self, _spec: Value) {}
 }
 
 pub struct HttpChasmClient {
