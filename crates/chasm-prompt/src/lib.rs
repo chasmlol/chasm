@@ -67,20 +67,27 @@ pub const STRUCTURED_OUTPUT_INSTRUCTION: &str = concat!(
 /// `target=`; the normalizer parses the call. Chosen in `build_chat_messages` for
 /// non-admin turns.
 pub const NPC_STRUCTURED_OUTPUT_INSTRUCTION: &str = r#"Reply with ONE JSON object and nothing else:
-{"speech": "<what you say out loud>", "actions": [<action calls>]}
+{"speech": "<what you say out loud>", "actions": [<steps>]}
 - "speech": only your spoken words - no name, no narration, no action words.
-- "actions": a list of action CALLS (strings), one per thing you physically do this turn. Use [] when you are only talking.
+- "actions": an ORDERED list of the things you physically do. You perform them in order, each step starting only after the step before it finishes. Use [] when you are only talking.
 
-Write every action as a function call: an action word from the "Activated Action Book entries" list, followed by ( ). With empty parentheses it happens right now.
+Each step is an object: {"do": "<verb>", "target": "<who or where>", "at": "<clock time>", "when": "<event>", "after": "<delay>"}.
+- "do": the single verb for what you physically do (wave, travel, attack, follow, wait, give, ...). Use the most natural verb for what you're doing - the system maps it to the closest real action, so it need not be an exact match.
+- "target": who or where the step is aimed at - the player as "player", a nearby person by name, or a place name for a travel step. Omit when it needs none.
+- "at": wait until this in-game clock time to START the step, e.g. "7:00PM". Optional.
+- "when": wait for this EVENT before the step, in plain words - e.g. "the player says hello", "Easy Pete comes near", "it gets dark". Optional.
+- "after": once the step is otherwise ready, wait this long before doing it, e.g. "30 seconds", "5 minutes". Optional.
 
-Put any details the player gave inside the parentheses as arguments:
-- to="<place>": where a travel action goes. Prefer an exact name from the "Nearby places you can travel to" list.
-- target="<name>": who the action is aimed at (the player, or a nearby person by name).
-- at="<time>": do the action LATER, at that in-game time, instead of now. A scheduled trip looks like: travel(to="<place>", at="3:00PM").
+Use "at" for a clock time, "when" for an event, "after" for a delay; a step may have none (do it now) or combine them. The list order IS the word "then": to do A then B, put A before B; to do something after you arrive somewhere, list the travel step first and that step second.
+Times are ALWAYS a clock time like "2:52PM" or "11:00AM". You are told the current in-game time; convert a relative time such as "in five minutes" to the actual clock time yourself - never write "in an hour". If the player asks you to do something later or on an event, emit the step with "at"/"when" set - do NOT just say you will.
+Only put a step in "actions" for a PHYSICAL action (moving, gesturing, fighting, giving) - not for talking, smiling, or nodding.
 
-Times are ALWAYS a clock time written like "2:52PM" or "11:00AM". You are told the current in-game time; if the player gives a relative time such as "in an hour", work out the actual clock time yourself and use it - never write "in an hour".
-
-Only use action words from the list, never invent one, and keep them out of "speech"."#;
+Examples (when the current time is 6:32PM):
+- "wave at me" -> {"speech":"Sure thing.","actions":[{"do":"wave","target":"player"}]}
+- "give me a wave in five minutes" -> {"speech":"You got it.","actions":[{"do":"wave","target":"player","at":"6:37PM"}]}
+- "come to me at 7pm then wave" -> {"speech":"I'll be there.","actions":[{"do":"travel","target":"player","at":"7:00PM"},{"do":"wave","target":"player"}]}
+- "if Easy Pete comes near, shoot him" -> {"speech":"...","actions":[{"do":"attack","target":"Easy Pete","when":"Easy Pete comes near"}]}
+- "when I say hi, wait 30 seconds then kill Easy Pete" -> {"speech":"...","actions":[{"do":"attack","target":"Easy Pete","when":"the player says hi","after":"30 seconds"}]}"#;
 
 /// Verbatim from `src/headless/quest-books.js` `QUEST_BOOK_STRUCTURED_OUTPUT_INSTRUCTION`.
 pub const QUEST_BOOK_STRUCTURED_OUTPUT_INSTRUCTION: &str = concat!(
@@ -203,6 +210,26 @@ fn retrieve_ids(
     };
     probe.mark("  retrieve:search+rerank");
     result
+}
+
+/// Snap a free-form *guessed* action verb/phrase to the nearest real action id
+/// via the embedder — the correction half of "the model guesses a tool call, the
+/// embedder makes it correct". `candidates` is `(action_id, embeddable_text)`
+/// (see [`action_embed_candidates`]). Returns the single best action id at or
+/// above `floor`, or `None` when nothing is close enough — a wild guess no-ops
+/// rather than firing the wrong action.
+pub fn resolve_guess_to_action(
+    ctx: &RetrievalCtx,
+    guess: &str,
+    candidates: &[(String, String)],
+    floor: f32,
+) -> Option<String> {
+    let guess = guess.trim();
+    if guess.is_empty() || candidates.is_empty() {
+        return None;
+    }
+    let built = build_candidates(ctx, candidates.iter().cloned());
+    retrieve_ids(ctx, guess, &built, 1, floor).into_iter().next()
 }
 
 /// Env-gated (CHASM_RETRIEVAL_DUMP=1) content dump of what semantic retrieval
@@ -339,13 +366,68 @@ pub fn turn_actions_from_structured(
     structured: &Value,
     aliases: &[(String, String)],
 ) -> Vec<ActionView> {
-    let Some(items) = structured.get("actions").and_then(Value::as_array) else {
-        return Vec::new();
-    };
     let alias_by_id: std::collections::HashMap<&str, &str> = aliases
         .iter()
         .map(|(id, alias)| (id.as_str(), alias.as_str()))
         .collect();
+    let mut views: Vec<ActionView> = structured
+        .get("actions")
+        .and_then(Value::as_array)
+        .map(|items| actions_from_array(items, &alias_by_id))
+        .unwrap_or_default();
+
+    // SCHEDULED actions (e.g. `travel(to="X", at="5pm")`) are routed into
+    // `structured.scheduled`, not `actions` — but the NPC still chose them, so
+    // surface them in the chat's action list too (otherwise travel never shows).
+    if let Some(scheduled) = structured.get("scheduled").and_then(Value::as_array) {
+        for item in scheduled {
+            let raw = item.get("raw").and_then(Value::as_str).unwrap_or("").trim();
+            let Some(steps) = item.get("steps").and_then(Value::as_array) else {
+                continue;
+            };
+            for step in steps {
+                let id = step
+                    .get("action_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                let alias = step.get("verb").and_then(Value::as_str).unwrap_or("").to_string();
+                let target = step
+                    .get("destination")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let when = step.get("when").and_then(Value::as_str).unwrap_or("").trim();
+                let reason = if !raw.is_empty() {
+                    raw.to_string()
+                } else if !when.is_empty() {
+                    format!("Scheduled: {alias} {target} at {when}").trim().to_string()
+                } else {
+                    format!("Scheduled: {alias} {target}").trim().to_string()
+                };
+                views.push(ActionView {
+                    id,
+                    alias,
+                    target,
+                    params: String::new(),
+                    reason,
+                });
+            }
+        }
+    }
+    views
+}
+
+/// The immediate (`structured.actions`) entries as [`ActionView`]s.
+fn actions_from_array(
+    items: &[Value],
+    alias_by_id: &std::collections::HashMap<&str, &str>,
+) -> Vec<ActionView> {
     items
         .iter()
         .filter_map(|item| {
@@ -1046,6 +1128,23 @@ fn action_vector_text(entry: &ActionEntry) -> String {
         parts.push(entry.vectorizable_text.trim().to_string());
     }
     parts.join("\n")
+}
+
+/// `(action_id, embeddable_text)` for every enabled action — the candidate set a
+/// guessed action call is snapped against ([`resolve_guess_to_action`]). Unlike
+/// the player-word semantic merge, this ignores the `vectorized` flag: the model
+/// explicitly named the action it wants, so even keyword-only idle gestures
+/// (pushups, look-around) must be resolvable. Actions with empty embed text are
+/// dropped (nothing to match on).
+pub fn action_embed_candidates(actions: &[ActionEntry]) -> Vec<(String, String)> {
+    actions
+        .iter()
+        .filter(|entry| !entry.disable)
+        .filter_map(|entry| {
+            let text = action_vector_text(entry);
+            (!text.trim().is_empty()).then(|| (entry.action_id.clone(), text))
+        })
+        .collect()
 }
 
 /// Embedding text for a catalog item: the pre-baked `vectorizableText`, falling
@@ -1760,6 +1859,13 @@ pub fn assemble_prompt_with_retrieval_collect(
         }
         all_actions.extend(book.entries);
     }
+    // Offered-action injection (prompt list + per-message panel) runs ONLY for the
+    // admin/Todd path. Regular NPCs run Option B — the model emits whatever verb it
+    // likes and the embedder snaps it to a real action — so they get NO injected list
+    // and NO panel entries; instead we relay EVERY enabled action's execution binding
+    // (the `else` branch) so any resolved action can still fire.
+    let is_admin = requested_scopes.iter().any(|s| s == "admin" || s == "godmode");
+    if is_admin {
     let mut action_ids: Vec<usize> = all_actions
         .iter()
         .enumerate()
@@ -1905,6 +2011,24 @@ pub fn assemble_prompt_with_retrieval_collect(
                 format_action_book_prompt(&action_entries, &spawn_render)
             ),
         );
+    }
+    } else {
+        // Option B (regular NPCs): inject NO offered-action list and NO panel entries —
+        // the model guesses a verb and the embedder corrects it. Relay every enabled,
+        // in-scope action's execution binding so whatever it resolves to can still fire.
+        for entry in all_actions
+            .iter()
+            .filter(|entry| !entry.disable && action_passes_scopes(entry, requested_scopes))
+        {
+            injected.activated_actions.push(ActivatedActionView {
+                action_id: entry.action_id.clone(),
+                alias: structured_action_alias(entry),
+                binding: entry.binding.clone(),
+                execution: entry.execution.clone(),
+                requires_target: entry.requires_target,
+                scoped_catalogs: Vec::new(),
+            });
+        }
     }
 
     // --- External world state -----------------------------------------------
@@ -2715,13 +2839,15 @@ mod tests {
 
         let repo = LiveChatRepository::new(&root);
         let speaker = participant("Sunny Smiles", None);
+
+        // ADMIN path: the offered-action list is injected with reasons (constant/keyword).
         let (_view, injected) = assemble_prompt_with_retrieval_collect(
             &repo,
             &speaker,
             &[],
             "Hey, please follow me to town.",
             "Hey, please follow me to town.",
-            &[],
+            &["admin".to_string()],
             None,
             None,
         );
@@ -2744,6 +2870,21 @@ mod tests {
         // Lore + quests empty (none on disk) — the view is the same shape as before.
         assert!(injected.lore.is_empty());
         assert!(injected.quests.is_empty());
+
+        // NPC path (Option B): NO offered-action list is injected, but EVERY enabled
+        // action is relayed for execution (the model guesses, the embedder corrects).
+        let (_view, npc) = assemble_prompt_with_retrieval_collect(
+            &repo,
+            &speaker,
+            &[],
+            "Hey, please follow me to town.",
+            "Hey, please follow me to town.",
+            &[],
+            None,
+            None,
+        );
+        assert!(npc.actions.is_empty(), "NPC path injects no offered actions");
+        assert_eq!(npc.activated_actions.len(), 2, "all actions relayed for execution");
 
         std::fs::remove_dir_all(&root).ok();
     }

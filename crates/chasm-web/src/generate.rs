@@ -1691,6 +1691,9 @@ fn persist_player_message_ctx(state: &Arc<AppState>, ctx: &TurnContext) -> WebRe
     state
         .repository
         .append_segment_message(&ctx.segment, &message)?;
+    // EVENT hook: let any scheduled task waiting on "when the player says X" see
+    // this line and arm itself. Once per player turn, before the NPC responds.
+    crate::scheduler::note_player_message(state, &ctx.message);
     Ok(())
 }
 
@@ -1711,11 +1714,67 @@ fn finalize_turn(
     // Resolve the action alias map once so it can both normalize the emitted
     // actions and recover each action's alias for the persisted `turn_actions`.
     let aliases = structured_action_aliases(state);
+
+    // Embedder correction for guessed / off-list action calls ("the model guesses
+    // a tool call, the embedder makes it correct"). Build a resolver that snaps an
+    // unknown verb to the nearest real action; the normalizer calls it only when
+    // exact alias matching fails. Available whenever retrieval + an embedder are
+    // configured — otherwise the closure returns None and behaviour is unchanged.
+    let retrieval_settings = AppSettings::load(&state.config.settings_path).retrieval;
+    let action_candidates: Vec<(String, String)> = if plan.structured && retrieval_settings.enabled {
+        match state.repository.list_action_books() {
+            Ok(books) => chasm_prompt::action_embed_candidates(
+                &books.into_iter().flat_map(|b| b.entries).collect::<Vec<_>>(),
+            ),
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    let embed_ctx = match (state.retriever(), state.embed_cache()) {
+        (Some(retriever), Some(cache))
+            if retrieval_settings.enabled && !action_candidates.is_empty() =>
+        {
+            Some(RetrievalCtx {
+                retriever,
+                cache,
+                chat_memory_enabled: retrieval_settings.chat_memory_enabled,
+                lore_semantic_enabled: retrieval_settings.lore_semantic_enabled,
+                action_semantic_enabled: retrieval_settings.action_semantic_enabled,
+                quest_semantic_enabled: retrieval_settings.quest_semantic_enabled,
+                candidates: retrieval_settings.candidates as usize,
+                top_k: retrieval_settings.top_k as usize,
+                min_score: retrieval_settings.min_score,
+                action_min_score: retrieval_settings.action_min_score,
+                chat_memory_limit: retrieval_settings.chat_memory_limit as usize,
+                lore_limit: retrieval_settings.lore_limit as usize,
+                quest_limit: retrieval_settings.quest_limit as usize,
+            })
+        }
+        _ => None,
+    };
+    // The recall floor (`action_min_score`) is tuned to be OVER-inclusive for
+    // player-word retrieval (a missed action just isn't offered). For a guessed
+    // call a bad snap FIRES the wrong action, so require a stronger match: take
+    // the higher of the recall floor and a dedicated guess floor. Lower this knob
+    // if good guesses get dropped; raise it if wild guesses fire the wrong action.
+    const GUESS_ACTION_FLOOR: f32 = 0.5;
+    let action_floor = retrieval_settings.action_min_score.max(GUESS_ACTION_FLOOR);
+    let guess_closure = |guess: &str| {
+        embed_ctx.as_ref().and_then(|ctx| {
+            chasm_prompt::resolve_guess_to_action(ctx, guess, &action_candidates, action_floor)
+        })
+    };
+
     let (content, structured) = if plan.structured {
         match parse_structured(&raw_trimmed) {
             Some((speech, mut structured)) => {
                 if !aliases.is_empty() {
-                    normalize_structured_action_aliases(&mut structured, &aliases);
+                    normalize_structured_action_aliases(
+                        &mut structured,
+                        &aliases,
+                        Some(&guess_closure),
+                    );
                 }
                 (speech, Some(structured))
             }
@@ -2000,7 +2059,15 @@ fn structured_action_aliases(state: &Arc<AppState>) -> Vec<(String, String)> {
 /// `id`/`actionId`/`action_id`/`name`/`alias`. Drops actions that match no known
 /// alias/id. Mirrors ST `normalizeStructuredActionAliases`; the `alias` key is
 /// added to the object lookup since small models often emit `{"alias": "..."}`.
-fn normalize_structured_action_aliases(structured: &mut Value, aliases: &[(String, String)]) {
+fn normalize_structured_action_aliases(
+    structured: &mut Value,
+    aliases: &[(String, String)],
+    // "The model guesses a tool call, the embedder makes it correct": when exact
+    // alias resolution fails, this snaps the guessed verb to the nearest real
+    // action id (or returns None when nothing is close enough). `None` disables
+    // the fallback (tests / offline replay with no embedder).
+    resolve_guess: Option<&dyn Fn(&str) -> Option<String>>,
+) {
     let Some(raw_actions) = structured.get("actions").and_then(Value::as_array).cloned() else {
         return;
     };
@@ -2014,104 +2081,113 @@ fn normalize_structured_action_aliases(structured: &mut Value, aliases: &[(Strin
         ids.insert(action_id.clone());
     }
 
+    // Resolve the emitted `actions` into an ORDERED plan. Each entry is a step
+    // object `{"do": verb, "target": who/where, "at": clock time}` (the format the
+    // model is prompted with); legacy shapes — a bare `"wave"` string, a
+    // `wave(at="1am")` function call, or an admin `{"id":"spawn",...}` object —
+    // still parse. Each verb resolves to a real action id (exact alias, else the
+    // embedder snaps the guess); unresolvable steps drop.
+    let mut steps: Vec<PlanStep> = Vec::new();
+    for raw in &raw_actions {
+        let Some(fields) = extract_step_fields(raw) else {
+            continue;
+        };
+        let mut action_id = resolve_verb_to_action_id(&fields.verb, &by_alias, &ids);
+        if action_id.is_empty() {
+            action_id = resolve_guess
+                .and_then(|resolve| resolve(&humanize_verb(&fields.verb)))
+                .unwrap_or_default();
+        }
+        if action_id.is_empty() {
+            continue; // unknown verb, no semantic match
+        }
+        // A travel step carries a PLACE: the resolved travel action, or an explicit
+        // place field (`to=`). Its place lives in `to`/`target`. A normal action's
+        // `target` is who it is aimed at. (Deliberately NOT keyed on a "travel-ish"
+        // verb list — that would misroute give/bring/fetch, whose target is a person.)
+        let is_travel = action_id == "movement.travel_to_location" || fields.to.is_some();
+        let (target, destination) = if is_travel {
+            (String::new(), fields.to.clone().unwrap_or_else(|| fields.target.clone()))
+        } else {
+            (fields.target.clone(), String::new())
+        };
+        steps.push(PlanStep {
+            verb: fields.verb,
+            action_id,
+            target,
+            at: fields.at.clone().unwrap_or_default(),
+            when: fields.when.clone().unwrap_or_default(),
+            after: fields.after.clone().unwrap_or_default(),
+            destination,
+            obj: fields.obj,
+        });
+    }
+
     let mut out: Vec<Value> = Vec::new();
     let mut scheduled: Vec<Value> = Vec::new();
-    for raw in &raw_actions {
-        // Function-call surface (regular NPCs emit `name(args)`): parse the call
-        // and route a scheduled one (has `at=` or `to=`) into `scheduled` — run_turn
-        // hands each to the scheduler store — and an immediate one into `actions`.
-        // A string with no parens (bare "wave") or a JSON object falls through to
-        // the alias resolution below.
-        if let Value::String(text) = raw {
-            if let Some(call) = crate::scheduler::parse_action_call(text) {
-                let action_id = resolve_verb_to_action_id(&call.name, &by_alias, &ids);
-                if action_id.is_empty() {
-                    continue; // unknown action word
-                }
-                if call.is_scheduled() {
-                    scheduled.push(json!({
-                        "raw": text,
-                        "steps": [{
-                            "verb": call.name,
-                            "action_id": action_id,
-                            "when": call.at,
-                            "destination": call.to,
-                        }],
-                    }));
-                } else {
-                    out.push(json!({
-                        "id": action_id,
-                        "target": call.target.unwrap_or_default(),
-                        "parameters": {},
-                        "reason": format!("Action call \"{text}\"."),
-                    }));
-                }
-                continue;
+    // The scheduler owns the plan the moment any step is deferred (`at`/`when`/
+    // `after`) or a travel (destination): it walks the WHOLE plan as an ordered
+    // chain, each step gated on its time/event, else on the previous step finishing
+    // (= "then"). A plan of only immediate non-travel gestures stays on the fast
+    // path and fires this turn.
+    let needs_schedule = steps
+        .iter()
+        .any(|s| !s.at.is_empty() || !s.when.is_empty() || !s.after.is_empty() || !s.destination.is_empty());
+    if !needs_schedule {
+        for s in &steps {
+            // Preserve any extra fields on an admin object (spawn `entity`/`count`).
+            let mut obj = s.obj.clone().unwrap_or_default();
+            obj.insert("id".to_string(), json!(s.action_id));
+            obj.insert("target".to_string(), json!(s.target));
+            if !obj.get("parameters").map(Value::is_object).unwrap_or(false) {
+                obj.insert("parameters".to_string(), json!({}));
             }
+            obj.entry("reason".to_string())
+                .or_insert_with(|| json!(format!("Action \"{}\".", s.verb)));
+            out.push(Value::Object(obj));
         }
-        match raw {
-            Value::String(text) => {
-                if let Some(id) = by_alias.get(&chasm_prompt::slug_action_alias(text)) {
-                    // The whole string is the alias (e.g. "wave", "follow").
-                    out.push(json!({
-                        "id": id,
-                        "target": "",
-                        "parameters": {},
-                        "reason": format!("Selected action alias \"{text}\"."),
-                    }));
-                } else {
-                    // A plain phrase whose leading word is the alias and the rest
-                    // is who/what it is aimed at (e.g. "follow me", "attack Easy
-                    // Pete"). NPCs write actions as one plain string, so resolve the
-                    // first word and keep the remainder as the target. (Scheduled
-                    // phrases like "travel to X at Y" were already peeled off above.)
-                    let trimmed = text.trim();
-                    let (first, rest) = trimmed
-                        .split_once(char::is_whitespace)
-                        .unwrap_or((trimmed, ""));
-                    if let Some(id) = by_alias.get(&chasm_prompt::slug_action_alias(first)) {
-                        out.push(json!({
-                            "id": id,
-                            "target": rest.trim(),
-                            "parameters": {},
-                            "reason": format!("Selected action \"{text}\"."),
-                        }));
-                    }
+    } else if !steps.is_empty() {
+        let raw_summary = steps
+            .iter()
+            .map(|s| {
+                let who = if s.destination.is_empty() { &s.target } else { &s.destination };
+                let mut t = s.verb.clone();
+                if !who.is_empty() {
+                    t.push(' ');
+                    t.push_str(who);
                 }
-            }
-            Value::Object(map) => {
-                let raw_id = ["id", "actionId", "action_id", "name", "alias"]
-                    .iter()
-                    .find_map(|key| map.get(*key).and_then(Value::as_str))
-                    .map(str::trim)
-                    .unwrap_or("");
-                let canonical = by_alias
-                    .get(&chasm_prompt::slug_action_alias(raw_id))
-                    .cloned()
-                    .or_else(|| ids.contains(raw_id).then(|| raw_id.to_string()));
-                if let Some(id) = canonical {
-                    let mut obj = map.clone();
-                    obj.insert("id".to_string(), json!(id));
-                    if !obj.get("parameters").map(Value::is_object).unwrap_or(false) {
-                        obj.insert("parameters".to_string(), json!({}));
-                    }
-                    let target = obj
-                        .get("target")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    obj.insert("target".to_string(), json!(target));
-                    out.push(Value::Object(obj));
+                if !s.at.is_empty() {
+                    t.push_str(&format!(" at {}", s.at));
                 }
-            }
-            _ => {}
-        }
+                t
+            })
+            .collect::<Vec<_>>()
+            .join(", then ");
+        let step_values: Vec<Value> = steps
+            .iter()
+            .map(|s| {
+                let opt = |v: &str| if v.is_empty() { Value::Null } else { json!(v) };
+                json!({
+                    "verb": s.verb,
+                    "action_id": s.action_id,
+                    // `when` here is the clock TIME (the scheduler's existing key);
+                    // an event condition and delay ride in `event`/`after`.
+                    "when": opt(&s.at),
+                    "event": opt(&s.when),
+                    "after": opt(&s.after),
+                    "destination": opt(&s.destination),
+                    "target": s.target,
+                })
+            })
+            .collect();
+        scheduled.push(json!({ "raw": raw_summary, "steps": step_values }));
     }
 
     if let Some(obj) = structured.as_object_mut() {
         obj.insert("actions".to_string(), Value::Array(out));
-        if !scheduled.is_empty() {
+        if scheduled.is_empty() {
+            obj.remove("scheduled");
+        } else {
             obj.insert("scheduled".to_string(), Value::Array(scheduled));
         }
     }
@@ -2121,6 +2197,117 @@ fn normalize_structured_action_aliases(structured: &mut Value, aliases: &[(Strin
 /// scheduled step. Tries the whole phrase as an alias, then each word (so
 /// "please wave" resolves to `wave`); returns "" when nothing matches (the step
 /// then fires as a travel/no-op fallback rather than a native action).
+/// One resolved step of an NPC action plan (after verb -> action_id resolution).
+struct PlanStep {
+    verb: String,
+    action_id: String,
+    /// Who the action is aimed at (empty for a travel step, which uses `destination`).
+    target: String,
+    /// Absolute clock time to wait for before this step ("" = as soon as reached).
+    at: String,
+    /// Natural-language event to wait for ("the player says hi", "Easy Pete comes
+    /// near", "it gets dark"). "" = none. The scheduler classifies it.
+    when: String,
+    /// Natural-language delay applied once the step is otherwise ready ("30
+    /// seconds", "5 minutes"). "" = none.
+    after: String,
+    /// Travel place ("" for a non-travel step).
+    destination: String,
+    /// The original emitted object, so admin `entity`/`count` survive the fast path.
+    obj: Option<serde_json::Map<String, Value>>,
+}
+
+/// The raw fields lifted from one emitted `actions` entry, before resolution.
+struct StepFields {
+    verb: String,
+    target: String,
+    at: Option<String>,
+    when: Option<String>,
+    after: Option<String>,
+    to: Option<String>,
+    obj: Option<serde_json::Map<String, Value>>,
+}
+
+/// Lift `(verb, target, at, to)` from one emitted action entry. Handles the
+/// current object form `{"do":..,"target":..,"at":..}`, admin/legacy objects
+/// keyed by `id`/`name`/`alias`, a `verb(args)` function-call string, and a bare
+/// `"wave"` / `"attack Easy Pete"` phrase. `None` when no verb is present.
+fn extract_step_fields(raw: &Value) -> Option<StepFields> {
+    fn pick(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
+        keys.iter()
+            .find_map(|k| map.get(*k).and_then(Value::as_str))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+    match raw {
+        Value::Object(map) => {
+            let verb = pick(
+                map,
+                &["do", "verb", "action", "id", "actionId", "action_id", "name", "alias"],
+            )?;
+            Some(StepFields {
+                verb,
+                target: pick(map, &["target", "who", "on"]).unwrap_or_default(),
+                at: pick(map, &["at", "time"]),
+                when: pick(map, &["when", "if", "once", "event", "trigger"]),
+                after: pick(map, &["after", "delay", "wait"]),
+                to: pick(map, &["to", "dest", "destination", "place", "location"]),
+                obj: Some(map.clone()),
+            })
+        }
+        Value::String(text) => {
+            if let Some(call) = crate::scheduler::parse_action_call(text) {
+                return Some(StepFields {
+                    verb: call.name,
+                    target: call.target.unwrap_or_default(),
+                    at: call.at,
+                    when: None,
+                    after: None,
+                    to: call.to,
+                    obj: None,
+                });
+            }
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            // Bare word, or "verb rest" phrase: first word = verb, remainder = target.
+            let (first, rest) = trimmed.split_once(char::is_whitespace).unwrap_or((trimmed, ""));
+            Some(StepFields {
+                verb: first.to_string(),
+                target: rest.trim().to_string(),
+                at: None,
+                when: None,
+                after: None,
+                to: None,
+                obj: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Turns a guessed verb token into natural words for embedding: `stroll_over` /
+/// `strollOver` -> `stroll over`. The embedder matches on meaning, so word
+/// boundaries matter more than the model's snake/camel casing.
+fn humanize_verb(verb: &str) -> String {
+    let mut out = String::with_capacity(verb.len() + 4);
+    let mut prev_lower = false;
+    for ch in verb.chars() {
+        if ch == '_' || ch == '-' {
+            out.push(' ');
+            prev_lower = false;
+            continue;
+        }
+        if ch.is_uppercase() && prev_lower {
+            out.push(' ');
+        }
+        prev_lower = ch.is_lowercase() || ch.is_ascii_digit();
+        out.push(ch);
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn resolve_verb_to_action_id(
     verb: &str,
     by_alias: &std::collections::HashMap<String, String>,
@@ -2939,7 +3126,7 @@ fn finalize_admin_result(run: &AdminRun, raw: &str, streamed: bool) -> WebResult
                 // ids (`world.spawn_entity`) so the helper can match them to the
                 // relayed activatedActions — the live path does this too. Without it
                 // Todd's ACTION_BOOK actions (gestures, spawn) never resolve.
-                normalize_structured_action_aliases(&mut value, &run.aliases);
+                normalize_structured_action_aliases(&mut value, &run.aliases, None);
                 (speech, Some(value))
             }
             None => {
@@ -3243,7 +3430,7 @@ mod tests {
             "speech": "ok",
             "actions": [{ "alias": "follow", "parameters": { "confidence": 0.8, "target": "player" } }],
         });
-        normalize_structured_action_aliases(&mut s, &aliases);
+        normalize_structured_action_aliases(&mut s, &aliases, None);
         let actions = s["actions"].as_array().unwrap();
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0]["id"], "movement.follow_target");
@@ -3259,7 +3446,7 @@ mod tests {
         let mut s = json!({
             "actions": ["follow", { "id": "combat.start" }, "teleport", { "alias": "nonsense" }],
         });
-        normalize_structured_action_aliases(&mut s, &aliases);
+        normalize_structured_action_aliases(&mut s, &aliases, None);
         let ids: Vec<&str> = s["actions"]
             .as_array()
             .unwrap()
@@ -3267,6 +3454,69 @@ mod tests {
             .map(|a| a["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["movement.follow_target", "combat.start"]);
+    }
+
+    #[test]
+    fn object_plan_single_immediate_stays_on_fast_path() {
+        let aliases = vec![("npc.gesture_wave".to_string(), "wave".to_string())];
+        let mut s = json!({ "actions": [{ "do": "wave", "target": "player" }] });
+        normalize_structured_action_aliases(&mut s, &aliases, None);
+        let actions = s["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["id"], "npc.gesture_wave");
+        assert_eq!(actions[0]["target"], "player");
+        assert!(s.get("scheduled").is_none(), "immediate action must not schedule");
+    }
+
+    #[test]
+    fn object_plan_timed_action_schedules() {
+        let aliases = vec![("npc.gesture_wave".to_string(), "wave".to_string())];
+        let mut s = json!({ "actions": [{ "do": "wave", "target": "player", "at": "6:37PM" }] });
+        normalize_structured_action_aliases(&mut s, &aliases, None);
+        assert!(s["actions"].as_array().unwrap().is_empty(), "timed action leaves actions empty");
+        let steps = s["scheduled"][0]["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0]["action_id"], "npc.gesture_wave");
+        assert_eq!(steps[0]["when"], "6:37PM");
+    }
+
+    #[test]
+    fn object_plan_travel_then_wave_is_one_ordered_chain() {
+        let aliases = vec![
+            ("movement.travel_to_location".to_string(), "travel".to_string()),
+            ("npc.gesture_wave".to_string(), "wave".to_string()),
+        ];
+        let mut s = json!({ "actions": [
+            { "do": "travel", "target": "player", "at": "7:00PM" },
+            { "do": "wave", "target": "player" },
+        ] });
+        normalize_structured_action_aliases(&mut s, &aliases, None);
+        assert!(s["actions"].as_array().unwrap().is_empty());
+        let steps = s["scheduled"][0]["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2, "order preserved as one chain");
+        // Step 1: travel — place routed to `destination`, gated on 7pm.
+        assert_eq!(steps[0]["action_id"], "movement.travel_to_location");
+        assert_eq!(steps[0]["destination"], "player");
+        assert_eq!(steps[0]["when"], "7:00PM");
+        // Step 2: wave — fires after step 1 (no time of its own).
+        assert_eq!(steps[1]["action_id"], "npc.gesture_wave");
+        assert_eq!(steps[1]["when"], Value::Null);
+    }
+
+    #[test]
+    fn object_plan_conditional_event_and_delay() {
+        let aliases = vec![("combat.start".to_string(), "attack".to_string())];
+        let mut s = json!({ "actions": [
+            { "do": "attack", "target": "Easy Pete", "when": "the player says hi", "after": "30 seconds" },
+        ] });
+        normalize_structured_action_aliases(&mut s, &aliases, None);
+        assert!(s["actions"].as_array().unwrap().is_empty(), "an event step schedules");
+        let step = &s["scheduled"][0]["steps"][0];
+        assert_eq!(step["action_id"], "combat.start");
+        assert_eq!(step["target"], "Easy Pete");
+        assert_eq!(step["event"], "the player says hi");
+        assert_eq!(step["after"], "30 seconds");
+        assert_eq!(step["when"], Value::Null, "no clock time on this step");
     }
 
     #[test]

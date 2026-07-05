@@ -115,6 +115,16 @@ fn trigger_view(trigger: &Trigger) -> (String, String) {
     }
 }
 
+/// A trigger is DEFERRED — belongs on the Schedule — when it's an in-game time or a
+/// real condition. An `immediate` trigger fires now (an instant action), which the
+/// Schedule board is NOT for.
+fn trigger_is_deferred(trigger: &Trigger) -> bool {
+    match trigger {
+        Trigger::Time { .. } => true,
+        Trigger::Condition { condition } => !matches!(condition, scheduler::Condition::Immediate),
+    }
+}
+
 fn state_label(state: TaskState) -> &'static str {
     match state {
         TaskState::Pending => "pending",
@@ -137,6 +147,12 @@ pub(crate) async fn list_scheduler(State(state): State<Arc<AppState>>) -> Json<S
     let mut tasks: Vec<TaskView> = store
         .tasks
         .iter()
+        // Only DEFERRED tasks belong here — a time or a trigger on the task or any of
+        // its steps. A task that's purely immediate (e.g. the leftover instant step of
+        // a plan whose travel was split into a journey) fired now and isn't scheduled.
+        .filter(|t| {
+            trigger_is_deferred(&t.trigger) || t.chain.iter().any(|s| trigger_is_deferred(&s.trigger))
+        })
         .map(|t| {
             let (trigger_kind, trigger_detail) = trigger_view(&t.trigger);
             let progress = if t.chain.is_empty() {
@@ -163,14 +179,19 @@ pub(crate) async fn list_scheduler(State(state): State<Arc<AppState>>) -> Json<S
         })
         .collect();
 
-    // Travel journeys share this board: a journey is a scheduled/active travel,
-    // shown alongside time-triggered actions (the Travel page is settings-only).
+    // Travel journeys share this board — but ONLY trips assigned a time ("meet me at
+    // 7pm"). An immediate "go now" trip is an instant action, not a scheduled one, so
+    // it's kept off the Schedule (it just happens).
     let now_total = scheduler::current_clock(&state).map(|c| c.total_hours());
     let jstore = movement::read_store(&state);
     for j in &jstore.journeys {
+        if !j.scheduled {
+            continue;
+        }
         let state_str = match j.state {
             JourneyState::Waiting => "pending",
             JourneyState::EnRoute => "active",
+            JourneyState::Lingering => "waiting",
             JourneyState::Arrived => "done",
             JourneyState::Cancelled => "cancelled",
             JourneyState::Failed => "failed",

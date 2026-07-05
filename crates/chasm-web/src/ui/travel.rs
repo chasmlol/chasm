@@ -110,6 +110,7 @@ fn state_label(state: JourneyState) -> &'static str {
     match state {
         JourneyState::Waiting => "waiting",
         JourneyState::EnRoute => "en route",
+        JourneyState::Lingering => "waiting there",
         JourneyState::Arrived => "arrived",
         JourneyState::Cancelled => "cancelled",
         JourneyState::Failed => "failed",

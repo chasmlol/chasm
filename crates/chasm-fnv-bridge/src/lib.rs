@@ -557,8 +557,16 @@ async fn run_turn(
                 if !action_id.is_empty() {
                     // Classify just this action against the real turn (which carries
                     // the activated executions) and build its native command body.
+                    // Aim it at the step's own target (e.g. a scheduled "attack Easy
+                    // Pete" must hit Easy Pete), defaulting to the player.
+                    let target = step
+                        .get("target")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or("player");
                     let mut synth = line.turn.clone();
-                    let single = serde_json::json!([{ "id": action_id, "target": "player" }]);
+                    let single = serde_json::json!([{ "id": action_id, "target": target }]);
                     match synth.get_mut("structured") {
                         Some(s) => s["actions"] = single,
                         None => synth["structured"] = serde_json::json!({ "actions": single }),

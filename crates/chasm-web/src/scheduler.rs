@@ -156,6 +156,14 @@ pub struct ChainStep {
     /// The game command to issue when this step fires (a companion op payload).
     /// `null` for a pure wait/marker step.
     pub command: Value,
+    /// Extra real-time delay (ms) applied AFTER the trigger is met, from an
+    /// `after:"30 seconds"` on the step. 0 = fire as soon as the trigger is met.
+    #[serde(default)]
+    pub delay_ms: u64,
+    /// Epoch ms when the trigger first became satisfied (0 = not yet). Used with
+    /// `delay_ms` to hold the step for the delay before issuing its command.
+    #[serde(default)]
+    pub armed_at_ms: i64,
     pub done: bool,
 }
 
@@ -229,11 +237,40 @@ pub enum Condition {
     NpcArrived { x: f64, y: f64, z: f64 },
     /// The owner NPC is within [`ARRIVE_RADIUS_UNITS`] of the player.
     NpcNearPlayer,
+    /// The player has said something matching `phrase` since the task was created.
+    /// Raised by [`note_player_message`] (an EVENT, not a timed poll): it sets the
+    /// task flag [`player_said_flag`] when an incoming player line matches.
+    PlayerSaid { phrase: String },
+    /// A named actor (not the player) comes near the owner NPC. Cannot be evaluated
+    /// from the current heartbeat (it only carries the player + owner positions), so
+    /// it stays false until a plugin proximity signal raises its flag. Captured now
+    /// so the intent persists and a later mod event can fire it.
+    ActorNear { name: String },
     /// A named boolean flag has been set on the task (by a game event signal),
     /// e.g. "looted". Flags are stored in [`WorldSnapshot::flags`].
     FlagSet { flag: String },
     /// Always true — an immediate step (issues its command on the next tick).
     Immediate,
+}
+
+/// The task flag raised when the player says a [`Condition::PlayerSaid`] phrase.
+/// Derived from the phrase so the event side and the predicate agree on the key.
+pub fn player_said_flag(phrase: &str) -> String {
+    format!("said:{}", phrase.trim().to_ascii_lowercase())
+}
+
+/// The "this travel step is DONE" predicate for a handed-off journey: the NPC has
+/// reached the destination. "come to me" gates on nearness to the player; a named
+/// place on arrival at its resolved position; an unresolved place doesn't block the
+/// chain (fires the next step immediately, since we can't detect its arrival).
+fn arrival_condition(journey: &crate::movement::Journey) -> Condition {
+    if crate::movement::is_player_dest(&journey.dest_name) {
+        Condition::NpcNearPlayer
+    } else if let Some(p) = journey.dest_pos {
+        Condition::NpcArrived { x: p.x, y: p.y, z: p.z }
+    } else {
+        Condition::Immediate
+    }
 }
 
 /// The world facts a condition is evaluated against on a tick. Assembled from the
@@ -255,6 +292,14 @@ impl Condition {
         match self {
             Condition::Immediate => true,
             Condition::FlagSet { flag } => world.flags.get(flag).copied().unwrap_or(false),
+            Condition::PlayerSaid { phrase } => {
+                world.flags.get(&player_said_flag(phrase)).copied().unwrap_or(false)
+            }
+            // Not evaluable from the heartbeat's player+owner positions; fires only
+            // if a plugin proximity event has raised its flag.
+            Condition::ActorNear { name } => {
+                world.flags.get(&format!("near:{}", name.to_ascii_lowercase())).copied().unwrap_or(false)
+            }
             Condition::NpcNearPlayer => match (world.player, world.npc) {
                 (Some(p), Some(n)) => within(p, n, ARRIVE_RADIUS_UNITS),
                 _ => false,
@@ -557,8 +602,11 @@ pub fn schedule_from_spec(state: &AppState, spec: &Value) -> anyhow::Result<Opti
             continue;
         }
         let when_text = st.get("when").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let event = st.get("event").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let after = st.get("after").and_then(Value::as_str).unwrap_or("").trim().to_string();
         let command_body = st.get("command_body").and_then(Value::as_str).unwrap_or("").to_string();
         let destination = st.get("destination").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let delay_ms = parse_delay_ms(&after);
 
         // A step with a destination is a TRAVEL step. When the movement system is
         // enabled it owns travel end-to-end: it measures the distance, leaves early
@@ -566,7 +614,10 @@ pub fn schedule_from_spec(state: &AppState, spec: &Value) -> anyhow::Result<Opti
         // page) — so we hand it off here and do NOT add a scheduler chain step. When
         // movement is disabled, `start_journey` returns None and we fall through to
         // the legacy instant-at-trigger-time teleport step below.
-        if !destination.is_empty() {
+        // EXCEPTION: an EVENT-gated travel ("run to X when attacked") can't be
+        // pre-timed, so it stays a chain step and issues a travel command when the
+        // event fires.
+        if !destination.is_empty() && event.is_empty() {
             let arrive_at =
                 parse_when(&when_text, clock).map(|(day, hour)| (day as f64) * 24.0 + hour);
             let who = crate::movement::Traveller {
@@ -576,7 +627,26 @@ pub fn schedule_from_spec(state: &AppState, spec: &Value) -> anyhow::Result<Opti
                 live_chat_id: str_field(spec, "live_chat_id"),
             };
             match crate::movement::start_journey(state, &who, &destination, arrive_at) {
-                Ok(Some(_)) => continue, // movement owns this step
+                Ok(Some(journey)) => {
+                    // Movement now walks the NPC. A travel step is only DONE when the
+                    // NPC ARRIVES — so if more steps follow (e.g. "come to me THEN
+                    // wave"), keep it in the chain as a gate whose completion is the
+                    // arrival, and the next step triggers off that. A trailing travel
+                    // (nothing after it) needs no gate: the journey/Travel page owns it.
+                    let has_following = i + 1 < steps_json.len();
+                    if has_following {
+                        chain.push(ChainStep {
+                            id: format!("{}_{}", i + 1, slugify(&verb)),
+                            description: format!("Travel to {destination}"),
+                            trigger: Trigger::Condition { condition: arrival_condition(&journey) },
+                            command: Value::Null, // movement already walking; this only gates
+                            delay_ms: 0,
+                            armed_at_ms: 0,
+                            done: false,
+                        });
+                    }
+                    continue;
+                }
                 Ok(None) => {}           // disabled → legacy chain step below
                 Err(error) => {
                     tracing::warn!("scheduler: movement handoff failed, using legacy travel: {error}");
@@ -584,11 +654,16 @@ pub fn schedule_from_spec(state: &AppState, spec: &Value) -> anyhow::Result<Opti
             }
         }
 
-        // Trigger: a parsed "at" time -> Time; otherwise fire as soon as the
-        // previous step is done (the chain fires one step per tick in order).
-        let trigger = match parse_when(&when_text, clock) {
-            Some((day, hour)) => Trigger::Time { day, hour },
-            None => Trigger::Condition { condition: Condition::Immediate },
+        // Trigger, in priority: an EVENT (`when` in the plan) classified to a
+        // condition/time-of-day; else a clock time -> Time; else fire as soon as
+        // the previous step is done (chain order = "then").
+        let trigger = if !event.is_empty() {
+            classify_event(&event, Some(clock))
+        } else {
+            match parse_when(&when_text, clock) {
+                Some((day, hour)) => Trigger::Time { day, hour },
+                None => Trigger::Condition { condition: Condition::Immediate },
+            }
         };
 
         // Command, in priority order:
@@ -613,15 +688,24 @@ pub fn schedule_from_spec(state: &AppState, spec: &Value) -> anyhow::Result<Opti
         } else {
             format!("{} to {}", capitalize(&verb), destination)
         };
-        let description = match parse_when(&when_text, clock) {
-            Some((_, hour)) => format!("{} at {}", label, format_hour(hour)),
-            None => label,
+        let mut description = if !event.is_empty() {
+            format!("{label} when {event}")
+        } else {
+            match parse_when(&when_text, clock) {
+                Some((_, hour)) => format!("{} at {}", label, format_hour(hour)),
+                None => label,
+            }
         };
+        if !after.is_empty() {
+            description.push_str(&format!(" (after {after})"));
+        }
         chain.push(ChainStep {
             id: format!("{}_{}", i + 1, slugify(&verb)),
             description,
             trigger,
             command,
+            delay_ms,
+            armed_at_ms: 0,
             done: false,
         });
     }
@@ -738,6 +822,50 @@ pub fn tick(state: &AppState) {
     }
 }
 
+/// EVENT hook: an incoming player line. For every non-terminal task whose current
+/// pending step waits on [`Condition::PlayerSaid`], raise that phrase's flag when
+/// the line contains it (case-insensitive) — the next tick then fires the step
+/// (honouring any `after` delay). Cheap; called once per player turn from the
+/// bridge before the NPC responds.
+pub fn note_player_message(state: &AppState, message: &str) {
+    let msg = message.to_ascii_lowercase();
+    if msg.trim().is_empty() {
+        return;
+    }
+    let mut store = read_store(state);
+    let mut changed = false;
+    for task in store.tasks.iter_mut() {
+        if task.state.is_terminal() {
+            continue;
+        }
+        let Some(step) = task.chain.iter().find(|s| !s.done) else {
+            continue;
+        };
+        let Trigger::Condition { condition: Condition::PlayerSaid { phrase } } = &step.trigger else {
+            continue;
+        };
+        let needle = phrase.trim().to_ascii_lowercase();
+        if needle.is_empty() || !msg.contains(&needle) {
+            continue;
+        }
+        let flag = player_said_flag(phrase);
+        let flags = task
+            .args
+            .entry("_flags".to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(obj) = flags.as_object_mut() {
+            obj.insert(flag, json!(true));
+            changed = true;
+            tracing::info!("scheduler: player said '{}' -> armed task {}", phrase, task.id);
+        }
+    }
+    if changed {
+        if let Err(error) = write_store(state, &store) {
+            tracing::warn!("scheduler: failed to persist player-said flags: {error}");
+        }
+    }
+}
+
 /// Evaluate one task against the clock/world. Every task is a chain of one or more
 /// steps (a single scheduled action is a chain of one). Returns `Some(updated)` if
 /// it changed (fired a step, completed, or failed), else `None`.
@@ -780,6 +908,20 @@ fn advance_chain(
             return Some(updated);
         }
         return None;
+    }
+    // Trigger met. Honour an `after` delay: arm on first satisfaction, then hold
+    // for `delay_ms` of real time before issuing (e.g. "wait 30 seconds then …").
+    if step.delay_ms > 0 {
+        let now = epoch_millis();
+        if step.armed_at_ms == 0 {
+            let mut updated = task.clone();
+            updated.state = TaskState::Active;
+            updated.chain[step_idx].armed_at_ms = now;
+            return Some(updated);
+        }
+        if now < step.armed_at_ms + step.delay_ms as i64 {
+            return None; // still waiting out the delay
+        }
     }
     let mut updated = task.clone();
     updated.state = TaskState::Active;
@@ -970,6 +1112,110 @@ pub(crate) fn bridge_root(state: &AppState) -> PathBuf {
         }
     }
     chasm_core::default_bridge_root()
+}
+
+// ===========================================================================
+// Natural-language EVENT + delay classification (the `when` / `after` fields)
+// ===========================================================================
+
+/// Classify a natural-language `when` event into a trigger. Recognised kinds:
+/// * "the player says X" / "I say X" -> [`Condition::PlayerSaid`] on phrase X.
+/// * time of day ("dark"/"night", "morning"/"dawn", "noon", "midnight",
+///   "dusk"/"evening") -> a [`Trigger::Time`] at the NEXT occurrence of that hour.
+/// * "<name> comes near"/"approaches" -> [`Condition::NpcNearPlayer`] when it is
+///   the player, else [`Condition::ActorNear`] (held until a plugin proximity
+///   signal, since the heartbeat has no third-party positions).
+/// Anything unrecognised -> a `FlagSet` that nothing raises yet, so the step holds
+/// rather than firing at the wrong moment.
+fn classify_event(event: &str, clock: Option<GameClock>) -> Trigger {
+    let e = event.trim().to_ascii_lowercase();
+    if let Some(phrase) = extract_said_phrase(&e) {
+        return Trigger::Condition { condition: Condition::PlayerSaid { phrase } };
+    }
+    let hour = if e.contains("midnight") {
+        Some(0.0)
+    } else if e.contains("dawn") || e.contains("sunrise") || e.contains("morning") {
+        Some(6.0)
+    } else if e.contains("noon") || e.contains("midday") {
+        Some(12.0)
+    } else if e.contains("dusk") || e.contains("sunset") || e.contains("evening") {
+        Some(19.0)
+    } else if e.contains("dark") || e.contains("night") {
+        Some(20.0)
+    } else {
+        None
+    };
+    if let (Some(h), Some(c)) = (hour, clock) {
+        let day = if c.hour < h { c.day as u32 } else { c.day as u32 + 1 };
+        return Trigger::Time { day, hour: h };
+    }
+    if e.contains("near") || e.contains("approach") || e.contains("comes close") || e.contains("gets close") {
+        if e.contains("player") || e.contains("you ") || e.starts_with("you") || e.contains(" me") || e.starts_with("i ") {
+            return Trigger::Condition { condition: Condition::NpcNearPlayer };
+        }
+        return Trigger::Condition { condition: Condition::ActorNear { name: proximity_actor_name(event) } };
+    }
+    Trigger::Condition { condition: Condition::FlagSet { flag: format!("event:{e}") } }
+}
+
+/// Pull the spoken phrase out of a "the player says X" style event (lowercased
+/// input). Returns `None` when the event is not about the player speaking.
+fn extract_said_phrase(e: &str) -> Option<String> {
+    let markers = [" says ", " say ", " said ", "says ", "say "];
+    let rest = markers.iter().find_map(|m| e.find(m).map(|i| &e[i + m.len()..]))?;
+    let mut phrase = rest.trim();
+    for lead in ["the word ", "word ", "the phrase ", "phrase ", "the words ", "words "] {
+        if let Some(s) = phrase.strip_prefix(lead) {
+            phrase = s.trim();
+        }
+    }
+    let phrase = phrase
+        .trim_matches(|c| c == '\'' || c == '"' || c == ' ')
+        .trim_end_matches(|c: char| matches!(c, '.' | ',' | '!' | '?'))
+        .trim_matches(|c| c == '\'' || c == '"');
+    (!phrase.is_empty()).then(|| phrase.to_string())
+}
+
+/// The named actor in a "<name> comes near" event (original casing preserved).
+fn proximity_actor_name(event: &str) -> String {
+    let lower = event.to_ascii_lowercase();
+    let cut = ["comes near", "gets near", "approaches", "comes close", "gets close", "is near", "near"]
+        .iter()
+        .filter_map(|m| lower.find(m))
+        .min();
+    let name = match cut {
+        Some(i) => &event[..i],
+        None => event,
+    };
+    name.trim()
+        .trim_start_matches("if ")
+        .trim_start_matches("when ")
+        .trim_start_matches("once ")
+        .trim()
+        .trim_end_matches(',')
+        .trim()
+        .to_string()
+}
+
+/// Parse an `after:"30 seconds"` / "5 minutes" / "an hour" delay into milliseconds
+/// of REAL time (the delay runs after the trigger is met). A bare number is
+/// seconds. Unparseable -> 0 (no delay).
+fn parse_delay_ms(after: &str) -> u64 {
+    let a = after.trim().to_ascii_lowercase();
+    if a.is_empty() {
+        return 0;
+    }
+    let digits: String = a.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let n = digits.parse::<f64>().unwrap_or(if a.starts_with('a') { 1.0 } else { 0.0 });
+    let n = if n <= 0.0 { 1.0 } else { n };
+    let unit = if a.contains("hour") {
+        3_600_000.0
+    } else if a.contains("min") {
+        60_000.0
+    } else {
+        1000.0 // seconds, or a bare number
+    };
+    (n * unit) as u64
 }
 
 // ===========================================================================
@@ -1419,6 +1665,8 @@ mod tests {
                 description: "Wave at 1:00AM".into(),
                 trigger: Trigger::Time { day: 4, hour: 1.0 },
                 command: json!({ "op": "native_action", "body": "CMD" }),
+                delay_ms: 0,
+                armed_at_ms: 0,
                 done: false,
             }],
             state: TaskState::Pending,
@@ -1492,6 +1740,8 @@ mod tests {
             description: "Loot the body".into(),
             trigger: Trigger::Condition { condition: Condition::Immediate },
             command: Value::Null,
+            delay_ms: 0,
+            armed_at_ms: 0,
             done: false,
         };
         let step2 = ChainStep {
@@ -1499,6 +1749,8 @@ mod tests {
             description: "Meet me at 1:00AM".into(),
             trigger: Trigger::Time { day: 1, hour: 1.0 },
             command: json!({ "op": "travel_to", "npc_key": "boone" }),
+            delay_ms: 0,
+            armed_at_ms: 0,
             done: false,
         };
 
@@ -1509,5 +1761,55 @@ mod tests {
         assert!(!trigger_met(&step2.trigger, Some(clock(0.0, 12.0)), &WorldSnapshot::default()));
         // Once the clock reaches day 1 / 1am → fires.
         assert!(trigger_met(&step2.trigger, Some(clock(1.0, 1.0)), &WorldSnapshot::default()));
+    }
+
+    #[test]
+    fn classify_player_said_event() {
+        let now = clock(2.0, 15.0);
+        for phrasing in ["the player says hi", "when I say hi", "I say 'hi'", "you say the word hi"] {
+            match classify_event(phrasing, Some(now)) {
+                Trigger::Condition { condition: Condition::PlayerSaid { phrase } } => {
+                    assert_eq!(phrase, "hi", "from: {phrasing}");
+                }
+                other => panic!("{phrasing} -> {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn player_said_flag_fires_only_after_match() {
+        let cond = Condition::PlayerSaid { phrase: "hi".into() };
+        let mut world = WorldSnapshot::default();
+        assert!(!cond.is_met(&world)); // nothing said yet
+        world.flags.insert(player_said_flag("hi"), true);
+        assert!(cond.is_met(&world)); // armed by note_player_message
+    }
+
+    #[test]
+    fn classify_time_of_day_and_proximity() {
+        let now = clock(3.0, 15.0); // 3pm
+        // "it gets dark" -> next 8pm, still today.
+        assert!(matches!(classify_event("it gets dark", Some(now)), Trigger::Time { day: 3, hour } if hour == 20.0));
+        // "in the morning" at 3pm -> tomorrow 6am.
+        assert!(matches!(classify_event("in the morning", Some(now)), Trigger::Time { day: 4, hour } if hour == 6.0));
+        // Player coming near -> near-player condition.
+        assert!(matches!(
+            classify_event("you come near", Some(now)),
+            Trigger::Condition { condition: Condition::NpcNearPlayer }
+        ));
+        // A named third party -> ActorNear, name preserved.
+        match classify_event("Easy Pete comes near", Some(now)) {
+            Trigger::Condition { condition: Condition::ActorNear { name } } => assert_eq!(name, "Easy Pete"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn delay_parsing() {
+        assert_eq!(parse_delay_ms("30 seconds"), 30_000);
+        assert_eq!(parse_delay_ms("5 minutes"), 300_000);
+        assert_eq!(parse_delay_ms("an hour"), 3_600_000);
+        assert_eq!(parse_delay_ms("10"), 10_000); // bare number = seconds
+        assert_eq!(parse_delay_ms(""), 0);
     }
 }

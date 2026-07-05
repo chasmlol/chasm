@@ -56,6 +56,11 @@ const ARRIVE_RADIUS_M: f64 = 6.0;
 /// before the journey is force-completed (failsafe against a stuck walk).
 const MAX_OVERRUN_HOURS: f64 = 3.0;
 
+/// After reaching a PLACE, how many in-game hours the NPC waits there (held under
+/// the travel package) before their normal AI reclaims them and they wander off —
+/// so "meet me at the saloon" gives you time to actually turn up.
+const LINGER_HOURS: f64 = 1.0;
+
 // ===========================================================================
 // Journey model
 // ===========================================================================
@@ -94,7 +99,10 @@ pub enum JourneyState {
     Waiting,
     /// Departed; being advanced along the route each tick.
     EnRoute,
-    /// Reached the destination on schedule.
+    /// Reached a place and is WAITING there (held under the travel package) for the
+    /// linger window before their normal AI reclaims them and they wander off.
+    Lingering,
+    /// Reached the destination on schedule (or finished lingering) — done.
     Arrived,
     /// Cancelled by the user.
     Cancelled,
@@ -159,6 +167,27 @@ pub struct Journey {
     pub last_emitted_pos: Option<Vec3>,
     #[serde(default)]
     pub last_error: String,
+    /// Set once the plugin has reported this traveller INSIDE a building, so we know
+    /// their start position was an interior (unusable for the exterior route) and
+    /// must be re-anchored to the front door once they step outside.
+    #[serde(default)]
+    pub saw_interior: bool,
+    /// Set once we've re-anchored the route start to the exterior front door (after
+    /// an indoor start), so it happens exactly once.
+    #[serde(default)]
+    pub reanchored: bool,
+    /// While `Lingering`, the absolute in-game hour the NPC is held at the place
+    /// until (0 when not lingering).
+    #[serde(default)]
+    pub linger_until: f64,
+    /// Set when they arrived by walking INSIDE the destination building, so the hold
+    /// keeps them inside (targets the interior door) rather than the outside entrance.
+    #[serde(default)]
+    pub arrived_inside: bool,
+    /// True when this trip was assigned a specific arrival TIME ("meet me at 7pm") vs
+    /// an immediate "go now". Only scheduled trips belong on the Schedule board.
+    #[serde(default)]
+    pub scheduled: bool,
     /// Epoch millis at creation (UI ordering).
     pub created_at_ms: i64,
 }
@@ -369,19 +398,29 @@ pub fn start_journey(
         state: JourneyState::Waiting,
         last_emitted_pos: None,
         last_error: String::new(),
+        saw_interior: false,
+        reanchored: false,
+        linger_until: 0.0,
+        arrived_inside: false,
+        scheduled: arrive_at.is_some(),
         created_at_ms: epoch_millis(),
     };
 
-    // De-dup: the same NPC re-emitting the same destination refreshes the existing
-    // non-terminal journey rather than stacking duplicates (multi-line turns / re-asks).
+    // De-dup: the same NPC re-emitting the same destination (multi-line turns, or just
+    // re-affirming "I'll be at the saloon" across turns) must NOT stack duplicates or
+    // — the bug this fixes — reset an already-departed trip back to "pending". Reuse an
+    // existing trip to the same place if it's still in progress, or finished within the
+    // last couple of minutes (a re-ask right after arriving). Only a genuinely new trip
+    // creates a new journey.
     let mut store = read_store(state);
-    if let Some(existing) = store.journeys.iter_mut().find(|j| {
-        !j.state.is_terminal() && j.npc_key == journey.npc_key && j.dest_name == journey.dest_name
+    if let Some(existing) = store.journeys.iter().find(|j| {
+        j.npc_key == journey.npc_key
+            && j.dest_name == journey.dest_name
+            && (!j.state.is_terminal() || journey.created_at_ms - j.created_at_ms < 120_000)
     }) {
-        *existing = journey.clone();
-    } else {
-        store.journeys.push(journey.clone());
+        return Ok(Some(existing.clone()));
     }
+    store.journeys.push(journey.clone());
     write_store(state, &store)?;
     tracing::info!(
         "movement: {} → '{}' ({:.0} m, depart {:.2}h, arrive {:.2}h)",
@@ -439,10 +478,47 @@ fn advance_journey(state: &AppState, journey: &Journey, now: f64) -> Option<Jour
         return None;
     }
 
-    // Live status the plugin reports: where the NPC is + whether it reached the target.
+    // Lingering: already arrived at a place, being HELD there for the linger window so
+    // their normal AI doesn't reclaim them and wander off. When the player isn't near
+    // (the usual "meet me there" case) we PIN them at the spot — invisible, and can't be
+    // fought by their sandbox. When the player IS watching we re-assert the travel
+    // package (best effort — no teleport in view). After the window: release → normal AI.
+    if journey.state == JourneyState::Lingering {
+        if now >= journey.linger_until {
+            let mut updated = journey.clone();
+            updated.state = JourneyState::Arrived;
+            tracing::info!("movement: {} finished waiting at '{}'", journey.npc_name, journey.dest_name);
+            return Some(updated);
+        }
+        let to_player = is_player_dest(&journey.dest_name);
+        let status = read_traveler_status(state, &journey.npc_key);
+        let loaded = status
+            .as_ref()
+            .filter(|s| s.journey_id == journey.id)
+            .map(|s| s.loaded)
+            .unwrap_or(false);
+        match (loaded, journey.dest_pos) {
+            (false, Some(pos)) => {
+                let _ = emit_move_to_pos(state, journey, pos, to_player);
+            }
+            _ => {
+                let _ = emit_hold(state, journey, to_player);
+            }
+        }
+        return None;
+    }
+
+    // Live status the plugin reports. Only trust it when it's FOR THIS journey —
+    // otherwise it's leftover from a previous trip (a stale `arrived=true` was making
+    // new journeys complete instantly). A stale/absent status is treated like
+    // untracked: we bootstrap a travel_step (which resets the plugin's per-journey
+    // state) and wait for a fresh report.
     let status = read_traveler_status(state, &journey.npc_key);
-    let actual = status.map(|s| s.1);
-    let mod_arrived = status.map(|s| s.2).unwrap_or(false);
+    let fresh = status.as_ref().map(|s| s.journey_id == journey.id).unwrap_or(false);
+    let (loaded, actual, mod_arrived, interior, building) = match status.as_ref().filter(|_| fresh) {
+        Some(s) => (s.loaded, Some(s.pos), s.arrived, s.interior, s.building.clone()),
+        None => (false, None, false, false, String::new()),
+    };
 
     // "come to me" tracks the player's live position; a named place uses its resolved
     // position (for the proximity check — the plugin also signals arrival directly).
@@ -453,20 +529,33 @@ fn advance_journey(state: &AppState, journey: &Journey, now: f64) -> Option<Jour
         journey.dest_pos
     };
 
-    // Arrival: the plugin signalled it, or the NPC's actual position reached the target.
-    let arrived_by_pos = matches!(
-        (actual, target_pos),
-        (Some(a), Some(d)) if a.distance_meters(d) <= ARRIVE_RADIUS_M
-    );
-    if mod_arrived || arrived_by_pos {
+    // Arrival (only from a FRESH status): the plugin signalled it; OR the NPC reached
+    // the target position out in the world; OR they walked INSIDE the destination
+    // building (the saloon), which position checks can't see (interior coords differ).
+    // Off-screen route completion is handled in the simulate branch below.
+    let arrived_by_pos = fresh
+        && !interior
+        && matches!((actual, target_pos), (Some(a), Some(d)) if a.distance_meters(d) <= ARRIVE_RADIUS_M);
+    let inside_destination = !to_player && interior && building_matches_dest(&building, &journey.dest_name);
+    if mod_arrived || arrived_by_pos || inside_destination {
         let mut updated = journey.clone();
-        updated.state = JourneyState::Arrived;
-        tracing::info!(
-            "movement: {} arrived at '{}'{}",
-            journey.npc_name,
-            journey.dest_name,
-            if journey.inside { " (inside)" } else { "" }
-        );
+        if to_player {
+            // Reached YOU — done; nothing to linger at.
+            updated.state = JourneyState::Arrived;
+            tracing::info!("movement: {} reached you", journey.npc_name);
+        } else {
+            // Reached a PLACE — wait there for the linger window before their AI reclaims them.
+            updated.state = JourneyState::Lingering;
+            updated.linger_until = now + LINGER_HOURS;
+            updated.arrived_inside = inside_destination; // hold them INSIDE, not at the entrance
+            tracing::info!(
+                "movement: {} arrived at '{}'{} — waiting {:.0}h",
+                journey.npc_name,
+                journey.dest_name,
+                if inside_destination { " (inside)" } else { "" },
+                LINGER_HOURS
+            );
+        }
         return Some(updated);
     }
 
@@ -478,25 +567,91 @@ fn advance_journey(state: &AppState, journey: &Journey, now: f64) -> Option<Jour
         return Some(updated);
     }
 
-    // (Re)issue the travel step toward the target. For an "inside" trip the target is
-    // the interior door (so the engine paths in through the load door); otherwise the
-    // resolved destination (map marker / building front door / player / NPC by name).
-    let target_form_id = if journey.inside && journey.inside_form_id != 0 {
+    let mut updated = journey.clone();
+    let mut changed = false;
+
+    if !fresh {
+        // No status for THIS journey yet (untracked, or a stale report from a previous
+        // trip) — a travel_step registers it and resets the plugin's per-journey state,
+        // so next tick reports fresh status (loaded/interior/pos) for this journey.
+        let _ = emit_travel_step(state, &updated, travel_target_form_id(&updated), to_player);
+    } else if interior {
+        // Inside a building → have the plugin step them out the front door. We do NOT
+        // simulate yet: their interior position isn't on the exterior route.
+        if !updated.saw_interior {
+            updated.saw_interior = true;
+            changed = true;
+        }
+        let _ = emit_travel_step(state, &updated, travel_target_form_id(&updated), to_player);
+    } else {
+        // Out in the world. If they just stepped out of a building, re-anchor the route
+        // start to the front door (where they are now) so the walk spans the exterior
+        // only and still lands at the scheduled arrival time.
+        if updated.saw_interior && !updated.reanchored {
+            if let Some(a) = actual {
+                updated.start_pos = Some(a);
+                updated.depart_total_hours = now; // progress 0 here, 1 at arrival
+                updated.reanchored = true;
+                changed = true;
+            }
+        }
+
+        if loaded {
+            // In / near your cell → let the engine walk them for real (you see it).
+            let _ = emit_travel_step(state, &updated, travel_target_form_id(&updated), to_player);
+        } else {
+            // Off-screen → SIMULATE: interpolate along the route by elapsed fraction and
+            // teleport them there, so intercepting them finds them genuinely en route.
+            match (updated.start_pos, target_pos.or(updated.dest_pos)) {
+                (Some(s), Some(d)) => {
+                    let frac = updated.progress(now);
+                    let _ = emit_move_to_pos(state, &updated, s.lerp(d, frac), to_player);
+                    // Route complete off-screen (reached the end at the scheduled time).
+                    if frac >= 1.0 {
+                        if to_player {
+                            updated.state = JourneyState::Arrived;
+                        } else {
+                            updated.state = JourneyState::Lingering;
+                            updated.linger_until = now + LINGER_HOURS;
+                        }
+                        changed = true;
+                        tracing::info!(
+                            "movement: {} arrived at '{}' (off-screen)",
+                            updated.npc_name,
+                            updated.dest_name
+                        );
+                    }
+                }
+                // No route positions to interpolate → fall back to the package.
+                _ => {
+                    let _ = emit_travel_step(state, &updated, travel_target_form_id(&updated), to_player);
+                }
+            }
+        }
+    }
+
+    // Mark EnRoute on first advance so the UI reflects it (unless we just completed
+    // the route off-screen above).
+    if updated.state == JourneyState::Waiting {
+        updated.state = JourneyState::EnRoute;
+        changed = true;
+    }
+
+    if changed {
+        Some(updated)
+    } else {
+        None
+    }
+}
+
+/// The ref the travel package walks toward: for an "inside" trip the interior door
+/// (so the engine paths in through the load door), else the resolved destination.
+fn travel_target_form_id(journey: &Journey) -> u64 {
+    if journey.inside && journey.inside_form_id != 0 {
         journey.inside_form_id
     } else {
         journey.dest_form_id
-    };
-    if let Err(error) = emit_travel_step(state, journey, target_form_id, to_player) {
-        tracing::warn!("movement: journey {} step failed: {error}", journey.id);
     }
-
-    // Mark EnRoute on first advance so the UI reflects it.
-    if journey.state != JourneyState::EnRoute {
-        let mut updated = journey.clone();
-        updated.state = JourneyState::EnRoute;
-        return Some(updated);
-    }
-    None
 }
 
 // ===========================================================================
@@ -519,6 +674,55 @@ fn emit_travel_step(
         "dest_name_base64": STANDARD.encode(journey.dest_name.as_bytes()),
         "dest_form_id": target_form_id.to_string(),
         "to_player": if to_player { "1" } else { "0" },
+        "journey_id": journey.id,
+    });
+    crate::scheduler::issue_companion_command(state, &cmd)
+}
+
+/// Hold the NPC at the place they've arrived: re-apply the travel package (so their
+/// normal AI can't drag them off) WITHOUT the front-door step-out (`hold` tells the
+/// plugin to skip it, so an NPC waiting *inside* the saloon isn't shoved back out).
+fn emit_hold(state: &AppState, journey: &Journey, to_player: bool) -> anyhow::Result<()> {
+    // Hold target: if they walked INSIDE the building, keep the package pointed at the
+    // interior door so they stay inside; otherwise the resolved destination.
+    let target = if journey.arrived_inside && journey.inside_form_id != 0 {
+        journey.inside_form_id
+    } else {
+        travel_target_form_id(journey)
+    };
+    let cmd = serde_json::json!({
+        "op": "travel_step",
+        "npc_key": journey.npc_key,
+        "npc_name_base64": STANDARD.encode(journey.npc_name.as_bytes()),
+        "dest_name_base64": STANDARD.encode(journey.dest_name.as_bytes()),
+        "dest_form_id": target.to_string(),
+        "to_player": if to_player { "1" } else { "0" },
+        "journey_id": journey.id,
+        "hold": "1",
+    });
+    crate::scheduler::issue_companion_command(state, &cmd)
+}
+
+/// Off-screen simulation step: teleport the NPC to an interpolated world position
+/// `pos`. The plugin anchors the MoveTo on the player (for "come to me") or the
+/// destination marker (a named place) so the placement is worldspace-correct.
+fn emit_move_to_pos(
+    state: &AppState,
+    journey: &Journey,
+    pos: Vec3,
+    to_player: bool,
+) -> anyhow::Result<()> {
+    let cmd = serde_json::json!({
+        "op": "move_to_pos",
+        "npc_key": journey.npc_key,
+        "npc_name_base64": STANDARD.encode(journey.npc_name.as_bytes()),
+        "dest_name_base64": STANDARD.encode(journey.dest_name.as_bytes()),
+        "dest_form_id": journey.dest_form_id.to_string(),
+        "to_player": if to_player { "1" } else { "0" },
+        "journey_id": journey.id,
+        "x": pos.x.to_string(),
+        "y": pos.y.to_string(),
+        "z": pos.z.to_string(),
     });
     crate::scheduler::issue_companion_command(state, &cmd)
 }
@@ -545,23 +749,56 @@ fn read_npc_position(state: &AppState) -> Option<Vec3> {
 }
 
 /// Live travel status the plugin reports for `npc_key` in the heartbeat
-/// `travelers` map: `(loaded, position, arrived)`. `loaded` = the NPC is
-/// rendered/being walked; `arrived` = it has reached its target (used for moving
-/// targets — player / another NPC — whose position chasm can't measure). `None` if
-/// the plugin isn't currently tracking this NPC.
-fn read_traveler_status(state: &AppState, npc_key: &str) -> Option<(bool, Vec3, bool)> {
+/// `travelers` map: `(loaded, position, arrived, interior)`. `loaded` = the NPC is
+/// rendered/high-process (the engine will actually walk it); `arrived` = it reached
+/// its target (for moving targets — player / another NPC — chasm can't measure);
+/// `interior` = it's currently inside a building (so we step it out the front door
+/// before simulating). `None` if the plugin isn't tracking this NPC.
+struct TravelerStatus {
+    loaded: bool,
+    pos: Vec3,
+    arrived: bool,
+    interior: bool,
+    /// The journey id this status is FOR — arrival is trusted only when it matches
+    /// the journey being advanced (else it's leftover from a previous trip).
+    journey_id: String,
+    /// The building the NPC is currently inside ("" when outside) — used to tell
+    /// "inside the destination" (arrived) from "inside his own shop" (must leave).
+    building: String,
+}
+
+fn read_traveler_status(state: &AppState, npc_key: &str) -> Option<TravelerStatus> {
     let path = crate::scheduler::bridge_root(state).join("runtime_heartbeat.json");
     let text = std::fs::read_to_string(path).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
     let t = value.get("travelers")?.get(npc_key)?;
-    let loaded = t.get("loaded").and_then(Value::as_bool).unwrap_or(false);
-    let arrived = t.get("arrived").and_then(Value::as_bool).unwrap_or(false);
-    let pos = Vec3 {
-        x: t.get("pos_x").and_then(Value::as_f64)?,
-        y: t.get("pos_y").and_then(Value::as_f64)?,
-        z: t.get("pos_z").and_then(Value::as_f64)?,
-    };
-    Some((loaded, pos, arrived))
+    Some(TravelerStatus {
+        loaded: t.get("loaded").and_then(Value::as_bool).unwrap_or(false),
+        arrived: t.get("arrived").and_then(Value::as_bool).unwrap_or(false),
+        interior: t.get("interior").and_then(Value::as_bool).unwrap_or(false),
+        journey_id: t.get("journey_id").and_then(Value::as_str).unwrap_or("").to_string(),
+        building: t.get("building").and_then(Value::as_str).unwrap_or("").to_string(),
+        pos: Vec3 {
+            x: t.get("pos_x").and_then(Value::as_f64)?,
+            y: t.get("pos_y").and_then(Value::as_f64)?,
+            z: t.get("pos_z").and_then(Value::as_f64)?,
+        },
+    })
+}
+
+/// True when the NPC's current building is (fuzzily) the journey's destination — so
+/// "inside the saloon" counts as arriving there, but "inside his own shop" does not.
+fn building_matches_dest(building: &str, dest: &str) -> bool {
+    let b = building.trim().to_lowercase();
+    let d = dest
+        .trim()
+        .to_lowercase()
+        .trim_start_matches("the ")
+        .trim_start_matches("inside ")
+        .trim_start_matches("outside ")
+        .trim()
+        .to_string();
+    !b.is_empty() && !d.is_empty() && (b.contains(&d) || d.contains(&b))
 }
 
 /// Split an "inside …" / "outside …" qualifier off a destination, returning
@@ -577,7 +814,7 @@ fn parse_inside(dest: &str) -> (bool, String) {
 }
 
 /// Words that mean "the player" as a travel destination.
-fn is_player_dest(name: &str) -> bool {
+pub(crate) fn is_player_dest(name: &str) -> bool {
     matches!(
         name.trim().to_lowercase().as_str(),
         "me" | "you" | "player" | "the player" | "here" | "myself"
@@ -773,6 +1010,11 @@ mod tests {
             state: JourneyState::Waiting,
             last_emitted_pos: None,
             last_error: String::new(),
+            saw_interior: false,
+            reanchored: false,
+            linger_until: 0.0,
+            arrived_inside: false,
+            scheduled: false,
             created_at_ms: 0,
         };
         assert_eq!(j.progress(8.0), 0.0);
