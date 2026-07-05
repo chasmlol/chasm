@@ -70,9 +70,45 @@ pub struct GlobalsStore {
         skip_serializing_if = "Option::is_none"
     )]
     pub scenario_template: Option<String>,
+    /// DYNAMIC scenario variants: per-situation overrides of the scenario
+    /// wording (companion / following / sneaking / traveling / …), selected
+    /// per turn by gamestate. Plain per-variant config keyed by the fixed
+    /// variant id (the condition catalog lives in `chasm-prompt`).
+    /// Semantics: `None` = never saved → callers use the built-in defaults;
+    /// ids missing from a saved list also fall back to their defaults.
+    #[serde(
+        default,
+        rename = "scenarioVariants",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub scenario_variants: Option<Vec<ScenarioVariantConfig>>,
     /// Forward-compat: any other keys in `globals.json` are preserved verbatim.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// Stored config of one dynamic-scenario variant. Pure data — the fixed
+/// condition/label/default-template catalog for each `id` lives in
+/// `chasm-prompt` (`scenario_variants::VARIANT_CATALOG`); this store only
+/// remembers what the user changed.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScenarioVariantConfig {
+    /// The fixed variant id ("companion", "traveling", …).
+    pub id: String,
+    /// Whether this variant participates in selection.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Selection priority (higher wins).
+    #[serde(default)]
+    pub priority: i32,
+    /// The variant's template text ("" = fall through to the next match).
+    #[serde(default)]
+    pub template: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -1242,6 +1278,64 @@ mod tests {
         repo.update_globals(|globals| globals.scenario_template = Some(String::new()))
             .unwrap();
         assert_eq!(repo.read_globals().unwrap().scenario_template.as_deref(), Some(""));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn globals_store_scenario_variants_back_compat_and_round_trip() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("chasm-test-globals-variants-{nanos}"));
+        std::fs::create_dir_all(root.join("headless")).unwrap();
+
+        // Back-compat: an EXISTING scenario-only globals.json (written before
+        // dynamic scenarios) loads with variants unset (→ built-in defaults)
+        // and the template intact.
+        std::fs::write(
+            root.join("headless").join("globals.json"),
+            r#"{ "scenarioTemplate": "Old template.", "futureKey": 7 }"#,
+        )
+        .unwrap();
+        let repo = LiveChatRepository::new(&root);
+        let store = repo.read_globals().unwrap();
+        assert_eq!(store.scenario_template.as_deref(), Some("Old template."));
+        assert!(store.scenario_variants.is_none());
+
+        // Saving variants round-trips (with serde defaults for omitted fields)
+        // and leaves the template + unknown keys untouched.
+        repo.update_globals(|globals| {
+            globals.scenario_variants = Some(vec![ScenarioVariantConfig {
+                id: "companion".to_string(),
+                enabled: false,
+                priority: 60,
+                template: "You travel with {{player_name}}.".to_string(),
+            }])
+        })
+        .unwrap();
+        let store = repo.read_globals().unwrap();
+        let variants = store.scenario_variants.as_deref().unwrap();
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].id, "companion");
+        assert!(!variants[0].enabled);
+        assert_eq!(store.scenario_template.as_deref(), Some("Old template."));
+        assert_eq!(store.extra["futureKey"], 7);
+
+        // A variant entry with only an id gets the serde defaults
+        // (enabled=true, priority=0, template="").
+        std::fs::write(
+            root.join("headless").join("globals.json"),
+            r#"{ "scenarioVariants": [ { "id": "sitting" } ] }"#,
+        )
+        .unwrap();
+        let store = repo.read_globals().unwrap();
+        let variants = store.scenario_variants.as_deref().unwrap();
+        assert_eq!(variants[0].id, "sitting");
+        assert!(variants[0].enabled);
+        assert_eq!(variants[0].priority, 0);
+        assert_eq!(variants[0].template, "");
 
         std::fs::remove_dir_all(&root).ok();
     }

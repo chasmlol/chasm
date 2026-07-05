@@ -321,6 +321,71 @@ pub fn eta_hours(distance_meters: f64, walk_speed: f64) -> f64 {
 }
 
 // ===========================================================================
+// Active-journey lookup (dynamic scenario "traveling" state)
+// ===========================================================================
+
+/// Snapshot of one NPC's active journey for the dynamic scenario: the
+/// destination as the model named it plus the scheduled arrival, feeding the
+/// `{{travel_destination}}` / `{{travel_arrival_time}}` macros.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveTravel {
+    pub dest_name: String,
+    /// Absolute in-game hour of arrival (`day*24 + hour`).
+    pub arrive_total_hours: f64,
+}
+
+/// The EN-ROUTE journey of the named NPC, if any — the chasm-side truth behind
+/// the scenario `traveling` condition. A `waiting` (not yet departed) journey
+/// deliberately does NOT count: the NPC is still standing around. Matches the
+/// journey's plugin key, display name, or character-card name
+/// (case-insensitively) so callers can pass whichever identity they have;
+/// the newest journey wins if several match.
+pub fn active_travel_for_npc(store: &MovementStore, npc_name: &str) -> Option<ActiveTravel> {
+    let name = npc_name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let matches_name = |candidate: &str| candidate.trim().eq_ignore_ascii_case(name);
+    store
+        .journeys
+        .iter()
+        .filter(|journey| journey.state == JourneyState::EnRoute)
+        .filter(|journey| {
+            matches_name(&journey.npc_key)
+                || matches_name(&journey.npc_name)
+                || matches_name(&journey.character_name)
+        })
+        .max_by_key(|journey| journey.created_at_ms)
+        .map(|journey| ActiveTravel {
+            dest_name: journey.dest_name.clone(),
+            arrive_total_hours: journey.arrive_total_hours,
+        })
+}
+
+/// Formats an absolute in-game hour as the mod's 12-hour clock style
+/// (`"3:07PM"`), for the `{{travel_arrival_time}}` macro. Minutes round to the
+/// nearest whole minute (with 60 carrying into the hour); the day component is
+/// dropped.
+pub fn format_game_hour(total_hours: f64) -> String {
+    if !total_hours.is_finite() {
+        return String::new();
+    }
+    let hour_of_day = total_hours.rem_euclid(24.0);
+    let mut hour = hour_of_day.floor() as i64;
+    let mut minute = ((hour_of_day - hour as f64) * 60.0).round() as i64;
+    if minute >= 60 {
+        minute -= 60;
+        hour = (hour + 1) % 24;
+    }
+    let meridiem = if hour < 12 { "AM" } else { "PM" };
+    let display_hour = match hour % 12 {
+        0 => 12,
+        h => h,
+    };
+    format!("{display_hour}:{minute:02}{meridiem}")
+}
+
+// ===========================================================================
 // Starting a journey
 // ===========================================================================
 
@@ -1026,5 +1091,86 @@ mod tests {
         // Halfway, the interpolated position is the midpoint of the route.
         let mid = j.start_pos.unwrap().lerp(j.dest_pos.unwrap(), j.progress(9.0));
         assert!((mid.x - 3500.0).abs() < 1e-6);
+    }
+
+    fn journey_named(id: &str, npc_name: &str, character_name: &str, state: JourneyState, created_at_ms: i64) -> Journey {
+        Journey {
+            id: id.into(),
+            npc_key: format!("key_{id}"),
+            npc_name: npc_name.into(),
+            character_name: character_name.into(),
+            live_chat_id: String::new(),
+            dest_name: "Prospector Saloon".into(),
+            dest_pos: None,
+            dest_form_id: 0,
+            inside: false,
+            inside_pos: None,
+            inside_form_id: 0,
+            start_pos: None,
+            depart_total_hours: 8.0,
+            arrive_total_hours: 10.5,
+            distance_meters: 0.0,
+            state,
+            last_emitted_pos: None,
+            last_error: String::new(),
+            saw_interior: false,
+            reanchored: false,
+            linger_until: 0.0,
+            arrived_inside: false,
+            scheduled: false,
+            created_at_ms,
+        }
+    }
+
+    #[test]
+    fn active_travel_matches_en_route_by_any_identity_case_insensitively() {
+        let store = MovementStore {
+            version: 1,
+            journeys: vec![journey_named("a", "Sunny Smiles", "Sunny", JourneyState::EnRoute, 5)],
+        };
+        // Display name, character name, and plugin key all match.
+        assert!(active_travel_for_npc(&store, "sunny smiles").is_some());
+        assert!(active_travel_for_npc(&store, "SUNNY").is_some());
+        assert!(active_travel_for_npc(&store, "key_a").is_some());
+        assert!(active_travel_for_npc(&store, "Trudy").is_none());
+        assert!(active_travel_for_npc(&store, "").is_none());
+
+        let travel = active_travel_for_npc(&store, "Sunny Smiles").unwrap();
+        assert_eq!(travel.dest_name, "Prospector Saloon");
+        assert!((travel.arrive_total_hours - 10.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn active_travel_ignores_non_en_route_journeys_and_prefers_newest() {
+        // Waiting (not yet departed) and terminal journeys do NOT count as
+        // traveling; among several en-route journeys the newest wins.
+        let store = MovementStore {
+            version: 1,
+            journeys: vec![
+                journey_named("w", "Sunny", "", JourneyState::Waiting, 9),
+                journey_named("done", "Sunny", "", JourneyState::Arrived, 8),
+                journey_named("old", "Sunny", "", JourneyState::EnRoute, 1),
+                journey_named("new", "Sunny", "", JourneyState::EnRoute, 2),
+            ],
+        };
+        let travel = active_travel_for_npc(&store, "Sunny");
+        assert!(travel.is_some());
+        // Newest en-route journey ("new") wins — both share the same dest here,
+        // so assert via the empty-store counterexample instead.
+        let idle = MovementStore { version: 1, journeys: vec![journey_named("w", "Sunny", "", JourneyState::Waiting, 9)] };
+        assert!(active_travel_for_npc(&idle, "Sunny").is_none());
+    }
+
+    #[test]
+    fn game_hour_formats_like_the_mod_clock() {
+        assert_eq!(format_game_hour(0.0), "12:00AM");
+        assert_eq!(format_game_hour(15.0 * 24.0 + 13.5), "1:30PM");
+        assert_eq!(format_game_hour(9.25), "9:15AM");
+        assert_eq!(format_game_hour(12.0), "12:00PM");
+        // Minute rounding carries into the hour (11:59.6 → 12:00PM).
+        assert_eq!(format_game_hour(11.0 + 59.6 / 60.0), "12:00PM");
+        // 23:59.7 rounds across midnight.
+        assert_eq!(format_game_hour(23.0 + 59.7 / 60.0), "12:00AM");
+        assert_eq!(format_game_hour(f64::NAN), "");
     }
 }

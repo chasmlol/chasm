@@ -16,27 +16,77 @@
 
 import { getJson, postJson, putJson, UI_API } from "./http";
 
-/** The effective global scenario template. */
+/** One dynamic-scenario variant: user config + fixed catalog facts. */
+export interface GlobalsScenarioVariantDto {
+  /** Stable id ("companion", "traveling", …) — also the condition selector. */
+  id: string;
+  /** Display label ("Companion, sneaking"). */
+  label: string;
+  /** Read-only description of the gamestate that triggers this variant. */
+  condition_hint: string;
+  enabled: boolean;
+  /** Selection priority (higher wins; ties break by catalog order). */
+  priority: number;
+  /** The variant's template ("" = fall through to the next match). */
+  template: string;
+  /** The shipped template (per-variant reset). */
+  default_template: string;
+  /** The shipped priority. */
+  default_priority: number;
+}
+
+/** The per-variant config sent back on save (catalog facts stay server-side). */
+export interface GlobalsScenarioVariantConfig {
+  id: string;
+  enabled: boolean;
+  priority: number;
+  template: string;
+}
+
+/** The gamestate flags of the preview state-picker (all default false). */
+export interface GlobalsScenarioPreviewState {
+  teammate?: boolean;
+  following?: boolean;
+  waiting?: boolean;
+  sneaking?: boolean;
+  player_sneaking?: boolean;
+  weapon_drawn?: boolean;
+  player_weapon_drawn?: boolean;
+  sitting?: boolean;
+  player_swimming?: boolean;
+  traveling?: boolean;
+}
+
+/** The effective global scenario template + dynamic variants. */
 export interface GlobalsScenarioDto {
-  /** The template in effect (saved value — may be "" = disabled — else the
-   *  built-in default). */
+  /** The DEFAULT variant's template (saved value — may be "" = disabled —
+   *  else the built-in default). */
   template: string;
   /** True when no override is saved (the built-in default is in effect). */
   is_default: boolean;
   /** The built-in default template (for "reset to default"). */
   default_template: string;
+  /** The dynamic-scenario variants, in catalog order. */
+  variants: GlobalsScenarioVariantDto[];
 }
 
-/** Request body for saving the template. */
+/** Request body for saving the template (and, optionally, the variants). */
 export interface GlobalsScenarioSaveRequest {
   /** The template text ("" allowed = omit the scenario from prompts). */
   template: string;
+  /** When present, replaces the stored variant config wholesale. */
+  variants?: GlobalsScenarioVariantConfig[];
 }
 
 /** Request body for the resolved preview. */
 export interface GlobalsScenarioPreviewRequest {
-  /** The draft template to preview; omitted → the saved/effective one. */
+  /** The draft default template to preview; omitted → the saved one. */
   template?: string;
+  /** Draft variant configs (the editor state), used with `state`. */
+  variants?: GlobalsScenarioVariantConfig[];
+  /** State-picker flags: when present the backend runs real variant
+   *  selection against them and previews the winner. */
+  state?: GlobalsScenarioPreviewState;
 }
 
 /** The resolved preview of a template against the latest recorded macros. */
@@ -50,6 +100,10 @@ export interface GlobalsScenarioPreviewDto {
   /** Present when the preview degrades (no recorded macros yet, empty
    *  template) or carries a caveat (participants includes every NPC). */
   note?: string;
+  /** The variant the state-picker selection matched (id + label); only
+   *  present when the request carried a `state`. */
+  variant_id?: string;
+  variant_label?: string;
 }
 
 export const globalsApi = {

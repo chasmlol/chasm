@@ -484,8 +484,14 @@ struct TurnContext {
     /// (`{{participants}}`) are merged per speaker in `prepare_speaker_turn`.
     scenario_macros: BTreeMap<String, String>,
     /// The effective global scenario template (Globals store value, else the
-    /// built-in default; empty = user disabled the scenario component).
+    /// built-in default; empty = user disabled the scenario component). With
+    /// dynamic scenarios this is the DEFAULT variant's template — the fallback
+    /// when no situation variant matches.
     scenario_template: String,
+    /// The dynamic-scenario variants (stored config merged over the built-in
+    /// catalog defaults). Per-speaker gamestate picks at most ONE of these —
+    /// else `scenario_template` — in `prepare_speaker_turn`.
+    scenario_variants: Vec<chasm_prompt::ScenarioVariant>,
     /// Action-book scopes the request supplies (`actionBookScopes`). Gates
     /// scope-restricted actions (e.g. admin-only spawn). Empty for regular NPCs
     /// unless the helper sends them.
@@ -598,6 +604,7 @@ fn resolve_turn_context(state: &Arc<AppState>, id: &str, body: &Value) -> WebRes
         macros.clone()
     };
     let scenario_template = global_scenario_template(state);
+    let scenario_variants = global_scenario_variants(state);
 
     Ok(TurnContext {
         live_chat,
@@ -611,6 +618,7 @@ fn resolve_turn_context(state: &Arc<AppState>, id: &str, body: &Value) -> WebRes
         macros,
         scenario_macros,
         scenario_template,
+        scenario_variants,
         requested_scopes: parse_action_book_scopes(body),
         orchestrator,
     })
@@ -636,6 +644,74 @@ pub(crate) fn global_scenario_template(state: &AppState) -> String {
             chasm_prompt::DEFAULT_SCENARIO_TEMPLATE.to_string()
         }
     }
+}
+
+/// The effective dynamic-scenario variants: the stored per-variant configs
+/// merged over the built-in catalog defaults (missing id → shipped default;
+/// stored ids the catalog doesn't know are kept and simply never match, so a
+/// newer config file degrades gracefully). Read fresh per request, like the
+/// template. Shared with the Globals UI endpoints so the page edits exactly
+/// what generation runs.
+pub(crate) fn global_scenario_variants(state: &AppState) -> Vec<chasm_prompt::ScenarioVariant> {
+    let stored = match state.repository.read_globals() {
+        Ok(store) => store.scenario_variants,
+        Err(error) => {
+            tracing::warn!(
+                "globals store read failed ({error}); using the default scenario variants"
+            );
+            None
+        }
+    };
+    merge_scenario_variants(stored.as_deref())
+}
+
+/// Pure merge half of [`global_scenario_variants`]: stored configs win by id
+/// over the catalog defaults; unknown stored ids are appended verbatim.
+pub(crate) fn merge_scenario_variants(
+    stored: Option<&[chasm_st_compat::ScenarioVariantConfig]>,
+) -> Vec<chasm_prompt::ScenarioVariant> {
+    let mut variants = chasm_prompt::default_variants();
+    let Some(stored) = stored else {
+        return variants;
+    };
+    for config in stored {
+        let id = config.id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let as_variant = chasm_prompt::ScenarioVariant {
+            id: id.to_string(),
+            enabled: config.enabled,
+            priority: config.priority,
+            template: config.template.clone(),
+        };
+        match variants.iter_mut().find(|variant| variant.id == id) {
+            Some(existing) => *existing = as_variant,
+            None => variants.push(as_variant),
+        }
+    }
+    variants
+}
+
+/// The macro table one speaker's scenario resolves against: the turn's table
+/// plus the movement-store travel macros (`{{travel_destination}}`,
+/// `{{travel_arrival_time}}` — empty strings when the NPC isn't traveling, so
+/// they always appear in recorded/preview tables without leaking `{{`).
+fn scenario_macros_with_travel(
+    turn_macros: &BTreeMap<String, String>,
+    travel: Option<&crate::movement::ActiveTravel>,
+) -> BTreeMap<String, String> {
+    let mut macros = turn_macros.clone();
+    let (dest, arrival) = match travel {
+        Some(travel) => (
+            travel.dest_name.clone(),
+            crate::movement::format_game_hour(travel.arrive_total_hours),
+        ),
+        None => (String::new(), String::new()),
+    };
+    macros.insert("travel_destination".to_string(), dest);
+    macros.insert("travel_arrival_time".to_string(), arrival);
+    macros
 }
 
 /// Merges the BACKEND-COMPUTED macros for one prompted character over the
@@ -994,11 +1070,31 @@ fn prepare_speaker_turn_traced(
     // part of the retrieval scan text above.
     //
     let (in_combat, combat_with) = combat_state_from_metadata(&ctx.player_metadata);
-    // The scenario is ALWAYS the normal global scenario (combat does not touch it);
-    // combat is handled purely by the depth-1 combat directive pushed below.
+    // DYNAMIC scenario: pick the wording variant for THIS speaker from INTERNAL
+    // game state only — the mod-reported `metadata.npc_state` flags plus chasm's
+    // own movement store (an en-route journey = traveling). Exactly one scenario
+    // is injected per turn (the winner, resolved through the same macro pipeline
+    // as always). Combat still does not touch the scenario; the depth-1 combat
+    // directive pushed below stays the only combat surface. Missing npc_state
+    // (old mod, admin path, another bridge) → all flags false → default variant.
+    let travel = crate::movement::active_travel_for_npc(
+        &crate::movement::read_store(state),
+        &speaker_name,
+    );
+    let mut npc_state = chasm_prompt::NpcStateFlags::from_metadata(&ctx.player_metadata);
+    npc_state.traveling = travel.is_some();
+    let selected =
+        chasm_prompt::select_scenario(&ctx.scenario_variants, &ctx.scenario_template, &npc_state);
+    if selected.variant_id != "default" {
+        tracing::debug!(
+            "dynamic scenario: '{speaker_name}' matched variant '{}'",
+            selected.variant_id
+        );
+    }
+    let scenario_macros = scenario_macros_with_travel(&ctx.scenario_macros, travel.as_ref());
     let global_scenario = resolve_global_scenario(
-        &ctx.scenario_template,
-        &ctx.scenario_macros,
+        selected.template,
+        &scenario_macros,
         &other_npc_names(&ctx.live_chat, &speaker_participant_id),
     );
     trace_generate_stage(trace_id, "gen_assemble_enter");
@@ -3918,6 +4014,139 @@ mod tests {
         );
         assert!(!empty.contains("{{"), "no unresolved macros: {empty}");
         assert!(empty.contains("You are in a conversation with the player."));
+    }
+
+    // --- Dynamic scenario (variant selection + travel macros) --------------
+
+    #[test]
+    fn merge_scenario_variants_overrides_by_id_and_keeps_unknown() {
+        // No stored config → the full built-in catalog at its defaults.
+        let defaults = merge_scenario_variants(None);
+        assert_eq!(defaults.len(), chasm_prompt::VARIANT_CATALOG.len());
+        assert!(defaults.iter().all(|variant| variant.enabled));
+
+        // A stored config overrides its catalog entry wholesale; unknown ids
+        // survive the merge (forward-compat) but can never match a condition.
+        let stored = vec![
+            chasm_st_compat::ScenarioVariantConfig {
+                id: "companion".to_string(),
+                enabled: false,
+                priority: 7,
+                template: "custom".to_string(),
+            },
+            chasm_st_compat::ScenarioVariantConfig {
+                id: "from_the_future".to_string(),
+                enabled: true,
+                priority: 10_000,
+                template: "??".to_string(),
+            },
+        ];
+        let merged = merge_scenario_variants(Some(&stored));
+        assert_eq!(merged.len(), chasm_prompt::VARIANT_CATALOG.len() + 1);
+        let companion = merged.iter().find(|variant| variant.id == "companion").unwrap();
+        assert!(!companion.enabled);
+        assert_eq!(companion.priority, 7);
+        assert_eq!(companion.template, "custom");
+        // Other catalog entries keep their shipped defaults.
+        let sitting = merged.iter().find(|variant| variant.id == "sitting").unwrap();
+        assert!(sitting.enabled);
+        assert_eq!(
+            sitting.template,
+            chasm_prompt::variant_def("sitting").unwrap().default_template
+        );
+        // The unknown id never wins selection despite its huge priority.
+        let flags = chasm_prompt::NpcStateFlags { teammate: true, ..Default::default() };
+        assert_eq!(
+            chasm_prompt::select_scenario(&merged, "D", &flags).variant_id,
+            "default", // companion is disabled above, so the fallback wins
+        );
+    }
+
+    #[test]
+    fn dynamic_scenario_selects_by_npc_state_and_resolves_travel_macros() {
+        let variants = merge_scenario_variants(None);
+
+        // A companion turn: metadata npc_state (bridge spelling) picks the
+        // companion variant, which resolves through the normal macro pipeline.
+        let metadata = json!({ "npcState": { "teammate": true } });
+        let flags = chasm_prompt::NpcStateFlags::from_metadata(&metadata);
+        let selected = chasm_prompt::select_scenario(
+            &variants,
+            chasm_prompt::DEFAULT_SCENARIO_TEMPLATE,
+            &flags,
+        );
+        assert_eq!(selected.variant_id, "companion");
+        let macros: BTreeMap<String, String> = [
+            ("player_name".to_string(), "Courier".to_string()),
+            ("time_of_day".to_string(), "2:32PM".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let resolved = resolve_global_scenario(selected.template, &macros, &[]);
+        assert!(resolved.contains("traveling with Courier as their companion"));
+        assert!(!resolved.contains("{{"), "no unresolved macros: {resolved}");
+
+        // A traveling turn: the movement store is the truth, and the travel
+        // macros feed the template.
+        let store = crate::movement::MovementStore {
+            version: 1,
+            journeys: vec![crate::movement::Journey {
+                id: "j1".to_string(),
+                npc_key: "sunny_smiles".to_string(),
+                npc_name: "Sunny Smiles".to_string(),
+                character_name: "Sunny".to_string(),
+                live_chat_id: String::new(),
+                dest_name: "Prospector Saloon".to_string(),
+                dest_pos: None,
+                dest_form_id: 0,
+                inside: false,
+                inside_pos: None,
+                inside_form_id: 0,
+                start_pos: None,
+                depart_total_hours: 8.0,
+                arrive_total_hours: 15.0 * 24.0 + 13.5,
+                distance_meters: 0.0,
+                state: crate::movement::JourneyState::EnRoute,
+                last_emitted_pos: None,
+                last_error: String::new(),
+                saw_interior: false,
+                reanchored: false,
+                linger_until: 0.0,
+                arrived_inside: false,
+                scheduled: false,
+                created_at_ms: 1,
+            }],
+        };
+        let travel = crate::movement::active_travel_for_npc(&store, "Sunny Smiles");
+        assert!(travel.is_some());
+        let mut flags = chasm_prompt::NpcStateFlags::from_metadata(&Value::Null);
+        flags.traveling = travel.is_some();
+        let selected = chasm_prompt::select_scenario(
+            &variants,
+            chasm_prompt::DEFAULT_SCENARIO_TEMPLATE,
+            &flags,
+        );
+        assert_eq!(selected.variant_id, "traveling");
+        let macros = scenario_macros_with_travel(&macros, travel.as_ref());
+        let resolved = resolve_global_scenario(selected.template, &macros, &[]);
+        assert!(resolved.contains("traveling to Prospector Saloon"));
+        assert!(resolved.contains("arrive around 1:30PM"));
+
+        // No npc_state at all (old mod / admin path): default variant, and the
+        // travel macros resolve to EMPTY rather than leaking.
+        let flags = chasm_prompt::NpcStateFlags::from_metadata(&json!({}));
+        let selected = chasm_prompt::select_scenario(
+            &variants,
+            chasm_prompt::DEFAULT_SCENARIO_TEMPLATE,
+            &flags,
+        );
+        assert_eq!(selected.variant_id, "default");
+        let idle_macros = scenario_macros_with_travel(&BTreeMap::new(), None);
+        assert_eq!(idle_macros.get("travel_destination").map(String::as_str), Some(""));
+        assert_eq!(idle_macros.get("travel_arrival_time").map(String::as_str), Some(""));
+        let resolved =
+            resolve_global_scenario("To {{travel_destination}} at {{travel_arrival_time}}.", &idle_macros, &[]);
+        assert_eq!(resolved, "To  at .");
     }
 
     // --- Admin / "Todd" single-character generation ------------------------

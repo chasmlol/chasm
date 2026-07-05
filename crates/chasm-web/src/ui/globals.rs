@@ -29,8 +29,8 @@ use axum::{extract::State, Json};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::generate::{active_live_chat, latest_chat_macros};
-use crate::{orchestrator, AppState, WebError, WebResult};
+use crate::generate::{active_live_chat, latest_chat_macros, merge_scenario_variants};
+use crate::{movement, orchestrator, AppState, WebError, WebResult};
 
 /// Builds a `WebError` carrying `message` (rendered as the JSON error body).
 fn web_err(message: impl Into<String>) -> WebError {
@@ -41,12 +41,35 @@ fn web_err(message: impl Into<String>) -> WebError {
 #[derive(Serialize)]
 pub(crate) struct UiGlobalsScenario {
     /// The EFFECTIVE template: the saved value when one exists (may be empty =
-    /// scenario disabled), else the built-in default.
+    /// scenario disabled), else the built-in default. This is the DEFAULT
+    /// variant of the dynamic-scenario system — the fallback wording when no
+    /// situation variant below matches.
     pub template: String,
     /// True when no override is saved (the built-in default is in effect).
     pub is_default: bool,
     /// The built-in default template (for the reset affordance).
     pub default_template: String,
+    /// The dynamic-scenario variants (stored config merged over the built-in
+    /// catalog), in catalog order. Selection order is by `priority` (desc).
+    pub variants: Vec<UiScenarioVariant>,
+}
+
+/// One dynamic-scenario variant as the UI sees it: the user-editable config
+/// plus the FIXED catalog facts (label, condition, shipped defaults).
+#[derive(Serialize)]
+pub(crate) struct UiScenarioVariant {
+    pub id: String,
+    /// Display label ("Companion, sneaking"). Empty for unknown stored ids.
+    pub label: String,
+    /// Read-only description of the state that triggers this variant.
+    pub condition_hint: String,
+    pub enabled: bool,
+    pub priority: i32,
+    pub template: String,
+    /// The shipped template (per-variant reset affordance).
+    pub default_template: String,
+    /// The shipped priority (reorder reset affordance).
+    pub default_priority: i32,
 }
 
 /// `POST /api/ui/v1/globals/scenario/preview` response.
@@ -64,16 +87,41 @@ pub(crate) struct UiGlobalsPreview {
     /// template) or needs a caveat (participants preview includes every NPC).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// The variant the state-picker selection matched (only when the request
+    /// carried a `state` object): its id and display label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant_label: Option<String>,
 }
 
 /// The current scenario view (shared by GET and PUT responses).
 fn scenario_view(state: &AppState) -> WebResult<UiGlobalsScenario> {
-    let stored = state.repository.read_globals()?.scenario_template;
-    let is_default = stored.is_none();
+    let globals = state.repository.read_globals()?;
+    let is_default = globals.scenario_template.is_none();
+    let variants = merge_scenario_variants(globals.scenario_variants.as_deref())
+        .into_iter()
+        .map(|variant| {
+            let def = chasm_prompt::variant_def(&variant.id);
+            UiScenarioVariant {
+                label: def.map(|d| d.label.to_string()).unwrap_or_default(),
+                condition_hint: def.map(|d| d.condition_hint.to_string()).unwrap_or_default(),
+                default_template: def.map(|d| d.default_template.to_string()).unwrap_or_default(),
+                default_priority: def.map(|d| d.default_priority).unwrap_or_default(),
+                id: variant.id,
+                enabled: variant.enabled,
+                priority: variant.priority,
+                template: variant.template,
+            }
+        })
+        .collect();
     Ok(UiGlobalsScenario {
-        template: stored.unwrap_or_else(|| chasm_prompt::DEFAULT_SCENARIO_TEMPLATE.to_string()),
+        template: globals
+            .scenario_template
+            .unwrap_or_else(|| chasm_prompt::DEFAULT_SCENARIO_TEMPLATE.to_string()),
         is_default,
         default_template: chasm_prompt::DEFAULT_SCENARIO_TEMPLATE.to_string(),
+        variants,
     })
 }
 
@@ -84,11 +132,16 @@ pub(crate) async fn get_scenario(
     Ok(Json(scenario_view(&state)?))
 }
 
-/// `PUT /api/ui/v1/globals/scenario` — save the template.
+/// `PUT /api/ui/v1/globals/scenario` — save the template (and, optionally,
+/// the dynamic-scenario variants).
 ///
-/// Request: `{ "template": "…" }` (string, required; empty allowed = disable
-/// the scenario component). Saving text identical to the built-in default
-/// clears the override so the store stays pristine (`is_default` flips back).
+/// Request: `{ "template": "…", "variants"?: [{ id, enabled, priority,
+/// template }] }`. `template` is required (empty allowed = disable the
+/// scenario component); saving text identical to the built-in default clears
+/// the override so the store stays pristine (`is_default` flips back).
+/// `variants` (when present) replaces the stored variant config wholesale; a
+/// list identical to the shipped defaults clears the override the same way.
+/// Omitting `variants` (an older client) leaves the stored variants untouched.
 pub(crate) async fn put_scenario(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
@@ -99,29 +152,114 @@ pub(crate) async fn put_scenario(
         .ok_or_else(|| web_err("globals scenario save requires a string 'template'"))?
         .to_string();
 
+    let variants: Option<Vec<chasm_st_compat::ScenarioVariantConfig>> = match body.get("variants")
+    {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            serde_json::from_value(value.clone())
+                .map_err(|error| web_err(format!("invalid 'variants' payload: {error}")))?,
+        ),
+    };
+
     state.repository.update_globals(|globals| {
         globals.scenario_template = if template == chasm_prompt::DEFAULT_SCENARIO_TEMPLATE {
             None
         } else {
             Some(template.clone())
         };
+        if let Some(variants) = &variants {
+            globals.scenario_variants =
+                if variants_equal_defaults(variants) { None } else { Some(variants.clone()) };
+        }
     })?;
     Ok(Json(scenario_view(&state)?))
+}
+
+/// True when a submitted variant list is EXACTLY the shipped catalog defaults
+/// (same ids, all enabled at default priority/template, nothing extra) — the
+/// pristine state we store as `None`, mirroring the template behavior.
+fn variants_equal_defaults(variants: &[chasm_st_compat::ScenarioVariantConfig]) -> bool {
+    let defaults = chasm_prompt::default_variants();
+    variants.len() == defaults.len()
+        && variants.iter().all(|config| {
+            defaults.iter().any(|default| {
+                default.id == config.id
+                    && config.enabled == default.enabled
+                    && config.priority == default.priority
+                    && config.template == default.template
+            })
+        })
 }
 
 /// `POST /api/ui/v1/globals/scenario/preview` — resolve a template through the
 /// latest recorded gamestate macros + computed macros. No generation runs.
 ///
-/// Request: `{ "template": "…" }` — optional; when omitted the saved/effective
-/// template is previewed. An empty recorded table is NOT an error: the
-/// template still resolves (gamestate macros → empty) with `note` explaining.
+/// Request: `{ "template"?, "variants"?, "state"? }` — all optional.
+/// * `template` — the default-variant draft; omitted → the saved/effective one.
+/// * `state` — the STATE-PICKER: an object of gamestate flags (`teammate`,
+///   `sneaking`, `player_sneaking`, `traveling`, …). When present, the preview
+///   runs the SAME variant selection as a real turn against those flags
+///   (using the `variants` drafts when given, else the stored config) and
+///   resolves the winning template; `variant_id`/`variant_label` report the
+///   match. Absent → the old template-only preview.
+/// * `variants` — draft variant configs from the editor, `[{ id, enabled,
+///   priority, template }]`, merged over the catalog like generation does.
+///
+/// An empty recorded table is NOT an error: the template still resolves
+/// (gamestate macros → empty) with `note` explaining.
 pub(crate) async fn preview_scenario(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> WebResult<Json<UiGlobalsPreview>> {
-    let template = match body.get("template").and_then(Value::as_str) {
+    let default_template = match body.get("template").and_then(Value::as_str) {
         Some(template) => template.to_string(),
         None => scenario_view(&state)?.template,
+    };
+
+    // State-picker selection (only when the request carries a `state` object).
+    let picked_state = body.get("state").filter(|value| value.is_object());
+    let (template, variant_id, variant_label, travel) = match picked_state {
+        None => (default_template.clone(), None, None, None),
+        Some(picked) => {
+            let variants = match body.get("variants") {
+                None | Some(Value::Null) => crate::generate::global_scenario_variants(&state),
+                Some(value) => {
+                    let configs: Vec<chasm_st_compat::ScenarioVariantConfig> =
+                        serde_json::from_value(value.clone()).map_err(|error| {
+                            web_err(format!("invalid 'variants' payload: {error}"))
+                        })?;
+                    merge_scenario_variants(Some(&configs))
+                }
+            };
+            // The picker sends the flags as a flat object — the raw
+            // `npc_state` spelling `NpcStateFlags` already accepts.
+            let mut flags =
+                chasm_prompt::NpcStateFlags::from_metadata(&json!({ "npc_state": picked }));
+            flags.traveling = picked
+                .get("traveling")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let selected =
+                chasm_prompt::select_scenario(&variants, &default_template, &flags);
+            let label = chasm_prompt::variant_def(selected.variant_id)
+                .map(|def| def.label.to_string())
+                .unwrap_or_else(|| "Default".to_string());
+            // Travel macros for the preview: the newest live en-route journey
+            // when one exists, else sample values so a "traveling" preview
+            // still reads like a sentence.
+            let travel = flags.traveling.then(|| {
+                newest_live_travel(&state).unwrap_or(movement::ActiveTravel {
+                    dest_name: "Prospector Saloon".to_string(),
+                    arrive_total_hours: 15.0,
+                })
+            });
+            (
+                selected.template.to_string(),
+                Some(selected.variant_id.to_string()),
+                Some(label),
+                travel,
+            )
+        }
     };
 
     // Latest recorded gamestate table (the same source the Gamestate page and
@@ -153,6 +291,17 @@ pub(crate) async fn preview_scenario(
         chasm_prompt::participants_macro(&player_name, &npc_names),
     );
 
+    // Travel macros, exactly like a real turn: empty when not traveling.
+    let (travel_dest, travel_arrival) = match &travel {
+        Some(travel) => (
+            travel.dest_name.clone(),
+            movement::format_game_hour(travel.arrive_total_hours),
+        ),
+        None => (String::new(), String::new()),
+    };
+    macros.insert("travel_destination".to_string(), travel_dest);
+    macros.insert("travel_arrival_time".to_string(), travel_arrival);
+
     let resolved = chasm_prompt::apply_macros(&template, &macros);
 
     let mut notes: Vec<String> = Vec::new();
@@ -176,11 +325,34 @@ pub(crate) async fn preview_scenario(
                 .to_string(),
         );
     }
+    if variant_id.is_some() && travel.is_some() && newest_live_travel(&state).is_none() {
+        notes.push(
+            "No live journey right now — travel macros use sample values in this preview."
+                .to_string(),
+        );
+    }
 
     Ok(Json(UiGlobalsPreview {
         resolved,
         macros: serde_json::to_value(&macros).unwrap_or_else(|_| json!({})),
         updated_at,
         note: (!notes.is_empty()).then(|| notes.join(" ")),
+        variant_id,
+        variant_label,
     }))
+}
+
+/// The newest live EN-ROUTE journey (any NPC) — the state-picker preview's
+/// source for realistic travel macros.
+fn newest_live_travel(state: &AppState) -> Option<movement::ActiveTravel> {
+    let store = movement::read_store(state);
+    store
+        .journeys
+        .iter()
+        .filter(|journey| journey.state == movement::JourneyState::EnRoute)
+        .max_by_key(|journey| journey.created_at_ms)
+        .map(|journey| movement::ActiveTravel {
+            dest_name: journey.dest_name.clone(),
+            arrive_total_hours: journey.arrive_total_hours,
+        })
 }

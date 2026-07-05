@@ -30,6 +30,12 @@ pub use macros::{apply_macros, macros_from_metadata, macros_from_value};
 pub mod scenario;
 pub use scenario::{participants_macro, readable_list, DEFAULT_SCENARIO_TEMPLATE};
 
+pub mod scenario_variants;
+pub use scenario_variants::{
+    condition_matches, default_variants, select_scenario, variant_def, NpcStateFlags,
+    ScenarioVariant, SelectedScenario, VariantDef, VARIANT_CATALOG,
+};
+
 use regex::RegexBuilder;
 use serde_json::Value;
 use chasm_core::{

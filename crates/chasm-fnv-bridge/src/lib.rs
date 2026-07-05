@@ -979,6 +979,13 @@ fn generate_body(
             // the depth-1 combat alert. Defaults keep peaceful turns unchanged.
             "inCombat": request.metadata.get("in_combat").cloned().unwrap_or(json!(false)),
             "combatWith": request.metadata.get("combat_with").cloned().unwrap_or_else(|| json!([])),
+            // Gamestate flags for the RESPONDING NPC (`metadata.npc_state`,
+            // flat snake_case bools: teammate/following/waiting/sneaking/…),
+            // sent by the mod when it can resolve the speaker. Forwarded
+            // verbatim so the generate path can pick the dynamic scenario
+            // variant. The empty-object default keeps old-mod requests
+            // unchanged (all flags parse false → default variant).
+            "npcState": request.metadata.get("npc_state").cloned().unwrap_or_else(|| json!({})),
         },
     })
 }
@@ -1433,5 +1440,66 @@ mod turn_body_tests {
         );
         assert_eq!(body["metadata"]["inCombat"], json!(false));
         assert_eq!(body["metadata"]["combatWith"], json!([]));
+    }
+
+    /// The mod puts `npc_state` (flat snake_case bools for the responding NPC)
+    /// in the request metadata; the generate body must forward it verbatim as
+    /// `npcState` so prompt assembly can pick the dynamic scenario variant.
+    #[test]
+    fn generate_body_forwards_npc_state() {
+        let config = default_config();
+        let mut request = NativeRequest {
+            request_id: "req_state_1".to_string(),
+            npc_key: "sunny_smiles".to_string(),
+            ..Default::default()
+        };
+        request.metadata.insert(
+            "npc_state".to_string(),
+            json!({
+                "teammate": true,
+                "following": true,
+                "sneaking": true,
+                "player_sneaking": true,
+                "weapon_drawn": false,
+            }),
+        );
+        let body = generate_body(
+            &config,
+            &request,
+            "Stay low.",
+            &json!({}),
+            &[],
+            2.0,
+            140.0,
+            "Goodsprings",
+        );
+        assert_eq!(body["metadata"]["npcState"]["teammate"], json!(true));
+        assert_eq!(body["metadata"]["npcState"]["following"], json!(true));
+        assert_eq!(body["metadata"]["npcState"]["sneaking"], json!(true));
+        assert_eq!(body["metadata"]["npcState"]["player_sneaking"], json!(true));
+        assert_eq!(body["metadata"]["npcState"]["weapon_drawn"], json!(false));
+    }
+
+    /// A request without `npc_state` (old mod build) carries the empty-object
+    /// default, which parses to all-false flags → the default scenario variant.
+    #[test]
+    fn generate_body_defaults_npc_state_when_absent() {
+        let config = default_config();
+        let request = NativeRequest {
+            request_id: "req_state_2".to_string(),
+            npc_key: "easy_pete".to_string(),
+            ..Default::default()
+        };
+        let body = generate_body(
+            &config,
+            &request,
+            "Howdy.",
+            &json!({}),
+            &[],
+            2.0,
+            140.0,
+            "Goodsprings",
+        );
+        assert_eq!(body["metadata"]["npcState"], json!({}));
     }
 }
