@@ -92,10 +92,13 @@ impl HttpStreamSink {
     }
 
     /// Serialize one event value to a `\n`-terminated NDJSON line and enqueue it.
-    /// A closed receiver (client hung up) is ignored — the turn finishes regardless.
-    fn emit(&self, event: Value) {
-        if let Ok(line) = serde_json::to_string(&event) {
-            let _ = self.tx.send(format!("{line}\n"));
+    /// Returns `false` when the receiver is gone (the client hung up) — the caller
+    /// decides whether that abandons the turn. A serialization failure only skips
+    /// the one line and reports the channel as alive.
+    fn emit(&self, event: Value) -> bool {
+        match serde_json::to_string(&event) {
+            Ok(line) => self.tx.send(format!("{line}\n")).is_ok(),
+            Err(_) => true,
         }
     }
 }
@@ -138,7 +141,7 @@ impl TurnSink for HttpStreamSink {
         // chasm client) so a client can render the subtitle before/while the audio
         // plays, then the audio itself as an `audio.chunk`.
         if !caption.trim().is_empty() {
-            self.emit(json!({
+            let _ = self.emit(json!({
                 "type": "speech.delta",
                 "requestId": request.request_id,
                 "index": index,
@@ -164,7 +167,17 @@ impl TurnSink for HttpStreamSink {
         if !extra_meta.is_empty() {
             event["metadata"] = meta_lines_to_object(extra_meta);
         }
-        self.emit(event);
+        // Dead silence: when the client hung up mid-turn (the plugin abandons a reply
+        // whose speaker died), abort the turn here instead of generating the rest of
+        // the line into a dead channel. The error rides the existing sink plumbing —
+        // it cancels the TTS stream and drops the LLM generation stream (which
+        // cancels the runtime's slot), so no new protocol is involved.
+        if !self.emit(event) {
+            anyhow::bail!(
+                "HTTP turn client disconnected (request {}); abandoning generation",
+                request.request_id
+            );
+        }
         // The HTTP client plays the streamed bytes directly; there is no on-disk
         // file, but we still return a stable name + index for parity with FileSink.
         Ok(WrittenChunk {
@@ -535,6 +548,31 @@ mod tests {
             .decode(chunk["audio"]["data"].as_str().unwrap())
             .expect("audio.data is base64");
         assert_eq!(decoded, b"RIFFmock-wav-bytes");
+    }
+
+    /// Dead silence: when the HTTP client hangs up mid-turn (the plugin abandons a
+    /// reply whose speaker died), the first audio chunk emitted into the dead channel
+    /// aborts the turn — the remaining generation is cancelled instead of streaming
+    /// into the void.
+    #[tokio::test]
+    async fn disconnected_client_aborts_turn() {
+        let config = test_config();
+        let request = test_request();
+        let client = MockChasm {
+            reply_text: "You'll never hear this line.".into(),
+            audio: b"RIFFmock-wav-bytes".to_vec(),
+        };
+
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        drop(rx); // the client hung up before any output arrived
+        let sink = HttpStreamSink::new(tx);
+        let error = chasm_fnv_bridge::run_turn_with_sink(&config, &client, &sink, &request)
+            .await
+            .expect_err("a dead channel should abort the turn at the first audio chunk");
+        assert!(
+            error.to_string().contains("disconnected"),
+            "unexpected error: {error:#}"
+        );
     }
 
     /// The `action` sink event: a triggering game_master is surfaced as an `action`
