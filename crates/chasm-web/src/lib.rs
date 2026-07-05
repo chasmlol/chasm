@@ -3878,6 +3878,8 @@ mod tests {
             visible_reason: "speaker".to_string(),
             injected: None,
             turn_actions: Vec::new(),
+            in_combat: false,
+            combat_with: Vec::new(),
         }
     }
 

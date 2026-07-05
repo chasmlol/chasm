@@ -28,7 +28,7 @@ pub mod macros;
 pub use macros::{apply_macros, macros_from_metadata, macros_from_value};
 
 pub mod scenario;
-pub use scenario::{participants_macro, DEFAULT_SCENARIO_TEMPLATE};
+pub use scenario::{participants_macro, readable_list, DEFAULT_SCENARIO_TEMPLATE};
 
 use regex::RegexBuilder;
 use serde_json::Value;
@@ -2315,6 +2315,8 @@ mod tests {
             visible_reason: String::new(),
             injected: None,
             turn_actions: Vec::new(),
+            in_combat: false,
+            combat_with: Vec::new(),
         };
         // Empty name + player role => "user: ...".
         assert_eq!(format_chat_vector_line(&msg), "user: Where's the doctor?");

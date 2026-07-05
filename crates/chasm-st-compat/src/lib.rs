@@ -798,9 +798,9 @@ fn extract_live_metadata(message: &STJsonlChatMessage) -> Option<HeadlessLiveMet
 /// `(None, [])` so pre-feature messages render as "no data recorded".
 fn extract_chasm_metadata(
     message: &STJsonlChatMessage,
-) -> (Option<InjectedView>, Vec<ActionView>) {
+) -> (Option<InjectedView>, Vec<ActionView>, bool, Vec<String>) {
     let Some(blob) = message.extra.get("chasm") else {
-        return (None, Vec::new());
+        return (None, Vec::new(), false, Vec::new());
     };
 
     let injected = blob.get("injected").map(|injected| InjectedView {
@@ -819,7 +819,24 @@ fn extract_chasm_metadata(
         .map(|items| items.iter().filter_map(parse_action_view).collect())
         .unwrap_or_default();
 
-    (injected, turn_actions)
+    // Combat state this turn was generated under (absent on pre-feature messages).
+    let in_combat = blob
+        .get("in_combat")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let combat_with = blob
+        .get("combat_with")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    (injected, turn_actions, in_combat, combat_with)
 }
 
 /// Parses an array of injected-entry objects, skipping anything that isn't an
@@ -975,7 +992,7 @@ fn to_message_view(
     live: &HeadlessLiveMetadata,
     visible_reason: String,
 ) -> MessageView {
-    let (injected, turn_actions) = extract_chasm_metadata(message);
+    let (injected, turn_actions, in_combat, combat_with) = extract_chasm_metadata(message);
     MessageView {
         id: format!("m_{index}"),
         role: role_for_message(message).to_string(),
@@ -1005,11 +1022,13 @@ fn to_message_view(
         visible_reason,
         injected,
         turn_actions,
+        in_combat,
+        combat_with,
     }
 }
 
 fn to_fallback_message_view(index: usize, message: &STJsonlChatMessage) -> MessageView {
-    let (injected, turn_actions) = extract_chasm_metadata(message);
+    let (injected, turn_actions, in_combat, combat_with) = extract_chasm_metadata(message);
     MessageView {
         id: format!("m_{index}"),
         role: role_for_message(message).to_string(),
@@ -1037,6 +1056,8 @@ fn to_fallback_message_view(index: usize, message: &STJsonlChatMessage) -> Messa
         visible_reason: "fallback".to_string(),
         injected,
         turn_actions,
+        in_combat,
+        combat_with,
     }
 }
 

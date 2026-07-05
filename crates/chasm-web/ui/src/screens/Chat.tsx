@@ -8,6 +8,7 @@ import {
   Swords,
   Zap,
   AlertCircle,
+  AlertTriangle,
   Search,
 } from "lucide-react";
 
@@ -467,8 +468,10 @@ function ContextStrip({ message }: { message: ChatMessageDto }) {
   // group (green), so here we only surface executed actions with no offered twin.
   const extraExecuted = message.executed_actions.filter((a) => !a.offered);
   const hasExtraExecuted = extraExecuted.length > 0;
+  // This NPC turn was generated mid-fight — surfaced as a prominent red badge.
+  const hasCombat = message.in_combat;
 
-  if (!hasLore && !hasQuests && !hasOffered && !hasExtraExecuted) {
+  if (!hasLore && !hasQuests && !hasOffered && !hasExtraExecuted && !hasCombat) {
     // Keep player turns quiet; only annotate NPC turns that genuinely recorded
     // nothing (so a missing strip never looks like a bug).
     if (message.role === "npc" && message.no_context) {
@@ -483,6 +486,22 @@ function ContextStrip({ message }: { message: ChatMessageDto }) {
 
   return (
     <div className="mt-2 flex flex-wrap items-start gap-x-4 gap-y-2 pl-0.5">
+      {hasCombat && (
+        <ChipGroup
+          icon={<AlertTriangle className="size-3" strokeWidth={2.5} />}
+          label="In combat"
+          tone="combat"
+        >
+          {message.combat_with.length > 0 ? (
+            message.combat_with.map((name, i) => (
+              <CombatChip key={`${name}-${i}`} name={name} />
+            ))
+          ) : (
+            <CombatChip name="an enemy" />
+          )}
+        </ChipGroup>
+      )}
+
       {hasLore && (
         <ChipGroup
           icon={<BookText className="size-3" strokeWidth={2} />}
@@ -534,13 +553,14 @@ function ContextStrip({ message }: { message: ChatMessageDto }) {
   );
 }
 
-type ChipTone = "lore" | "quest" | "action" | "executed";
+type ChipTone = "lore" | "quest" | "action" | "executed" | "combat";
 
 const GROUP_LABEL_TONE: Record<ChipTone, string> = {
   lore: "text-[var(--color-accent)]",
   quest: "text-[var(--color-npc)]",
   action: "text-[var(--muted-foreground)]",
   executed: "text-[var(--color-player)]",
+  combat: "text-[var(--color-danger)]",
 };
 
 function ChipGroup({
@@ -631,6 +651,23 @@ function OfferedChip({ action }: { action: OfferedActionDto }) {
       <span className="max-w-[14rem] truncate">
         {action.title || action.id}
       </span>
+    </span>
+  );
+}
+
+function CombatChip({ name }: { name: string }) {
+  // Alarming red to match the in-prompt combat alert: this turn was spoken
+  // mid-fight, with `name` being who the NPC was up against.
+  return (
+    <span
+      className={cn(
+        CHIP_BASE,
+        "border-[color-mix(in_srgb,var(--color-danger)_60%,var(--border))] bg-[color-mix(in_srgb,var(--color-danger)_18%,transparent)] text-[var(--color-danger)]",
+      )}
+      title={`In combat with ${name}`}
+    >
+      <AlertTriangle className="size-3" strokeWidth={2.5} />
+      <span className="max-w-[14rem] truncate">{name}</span>
     </span>
   );
 }

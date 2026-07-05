@@ -905,6 +905,11 @@ fn generate_body(
             // Gamestate page — this body's `metadata` is otherwise built from
             // scratch, so without this line the mod's table would be dropped.
             "macros": request.metadata.get("macros").cloned().unwrap_or_else(|| json!({})),
+            // Combat state for the responding NPC, sent by the mod when it is in
+            // combat (absent otherwise). Forwarded so the generate path can inject
+            // the depth-1 combat alert. Defaults keep peaceful turns unchanged.
+            "inCombat": request.metadata.get("in_combat").cloned().unwrap_or(json!(false)),
+            "combatWith": request.metadata.get("combat_with").cloned().unwrap_or_else(|| json!([])),
         },
     })
 }
@@ -1286,5 +1291,64 @@ mod turn_body_tests {
         );
         assert_eq!(body["traceId"], json!("req_45109828_1"));
         assert_eq!(body["message"], json!("Hi there, Pete."));
+    }
+
+    /// The mod puts `in_combat` / `combat_with` in the request metadata when the
+    /// responding NPC is fighting; the generate body must forward them as
+    /// `inCombat` / `combatWith` so prompt assembly can raise the combat alert.
+    #[test]
+    fn generate_body_forwards_combat_state() {
+        let config = default_config();
+        let mut request = NativeRequest {
+            request_id: "req_combat_1".to_string(),
+            npc_key: "easy_pete".to_string(),
+            ..Default::default()
+        };
+        request
+            .metadata
+            .insert("in_combat".to_string(), json!(true));
+        request.metadata.insert(
+            "combat_with".to_string(),
+            json!(["Raider", "Powder Ganger"]),
+        );
+        let body = generate_body(
+            &config,
+            &request,
+            "Behind you!",
+            &json!({}),
+            &[],
+            2.0,
+            140.0,
+            "Goodsprings",
+        );
+        assert_eq!(body["metadata"]["inCombat"], json!(true));
+        assert_eq!(
+            body["metadata"]["combatWith"],
+            json!(["Raider", "Powder Ganger"])
+        );
+    }
+
+    /// A peaceful turn (no combat metadata) still carries the fields at their
+    /// defaults, so the generate path never has to special-case their absence.
+    #[test]
+    fn generate_body_defaults_combat_state_when_absent() {
+        let config = default_config();
+        let request = NativeRequest {
+            request_id: "req_peace_1".to_string(),
+            npc_key: "easy_pete".to_string(),
+            ..Default::default()
+        };
+        let body = generate_body(
+            &config,
+            &request,
+            "Howdy.",
+            &json!({}),
+            &[],
+            2.0,
+            140.0,
+            "Goodsprings",
+        );
+        assert_eq!(body["metadata"]["inCombat"], json!(false));
+        assert_eq!(body["metadata"]["combatWith"], json!([]));
     }
 }

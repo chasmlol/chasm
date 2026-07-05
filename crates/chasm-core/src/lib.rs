@@ -337,6 +337,14 @@ pub struct MessageView {
     /// The structured actions the NPC chose this turn — the "actions executed"
     /// for v1. Empty for player turns and pre-feature messages.
     pub turn_actions: Vec<ActionView>,
+    /// Whether this NPC turn was generated while the NPC was in combat (read from
+    /// `extra.chasm.in_combat`). `false` for player turns and pre-feature messages.
+    #[serde(default)]
+    pub in_combat: bool,
+    /// Display names of who the NPC was fighting this turn (from
+    /// `extra.chasm.combat_with`). Empty unless `in_combat`.
+    #[serde(default)]
+    pub combat_with: Vec<String>,
 }
 
 /// One lore/quest/action entry that was injected into a single turn's prompt,

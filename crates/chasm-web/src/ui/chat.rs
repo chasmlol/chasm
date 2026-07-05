@@ -140,6 +140,11 @@ pub(crate) struct UiChatMessage {
     /// message (player turns + messages persisted before the feature existed),
     /// so the UI can show a quiet "no context recorded" note instead of nothing.
     pub no_context: bool,
+    /// `true` when this NPC turn was generated while the NPC was in combat, so
+    /// the UI can tag the message with an "In combat" badge.
+    pub in_combat: bool,
+    /// Display names of who the NPC was fighting this turn (empty unless in combat).
+    pub combat_with: Vec<String>,
 }
 
 /// One NPC conversation thread (everything addressed to / spoken by one NPC).
@@ -241,7 +246,8 @@ fn project_message(message: &MessageView) -> UiChatMessage {
     let no_context = injected_lore.is_empty()
         && injected_quests.is_empty()
         && offered_actions.is_empty()
-        && executed_actions.is_empty();
+        && executed_actions.is_empty()
+        && !message.in_combat;
 
     UiChatMessage {
         id: message.id.clone(),
@@ -256,6 +262,8 @@ fn project_message(message: &MessageView) -> UiChatMessage {
         offered_actions,
         executed_actions,
         no_context,
+        in_combat: message.in_combat,
+        combat_with: message.combat_with.clone(),
     }
 }
 

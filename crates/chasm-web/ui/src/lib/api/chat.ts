@@ -57,6 +57,10 @@ export interface ChatMessageDto {
   executed_actions: ExecutedActionDto[];
   /** True when no injected/offered/executed context was recorded. */
   no_context: boolean;
+  /** True when this NPC turn was generated while the NPC was in combat. */
+  in_combat: boolean;
+  /** Display names of who the NPC was fighting this turn (empty unless in combat). */
+  combat_with: string[];
 }
 
 /** One NPC conversation thread (everything spoken by / to one NPC). */

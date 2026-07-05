@@ -62,7 +62,7 @@ pub fn participants_macro(player_name: &str, other_npc_names: &[String]) -> Stri
 
 /// Joins names as a readable English list: `a` · `a and b` · `a, b, and c`
 /// (Oxford comma, so long NPC groups stay unambiguous).
-fn readable_list(names: &[String]) -> String {
+pub fn readable_list(names: &[String]) -> String {
     match names {
         [] => String::new(),
         [only] => only.clone(),

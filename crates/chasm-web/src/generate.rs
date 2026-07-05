@@ -533,6 +533,11 @@ struct TurnPlan {
     /// `finalize_turn` can persist them onto the produced message's
     /// `extra.chasm.injected` for the per-message panel.
     injected: InjectedView,
+    /// Whether the mod reported this NPC in combat this turn, and who with —
+    /// persisted onto `extra.chasm.{in_combat,combat_with}` so the chat UI can
+    /// tag the message (and mirrors exactly what the depth-1 alert saw).
+    in_combat: bool,
+    combat_with: Vec<String>,
 }
 
 /// Resolves the request-level (speaker-agnostic) context. Fails synchronously
@@ -670,6 +675,68 @@ fn resolve_global_scenario(
         .trim()
         .to_string()
 }
+
+/// Extracts the combat state the mod forwarded on this turn's request metadata:
+/// `(in_combat, combatant_display_names)`. Names are trimmed with blanks dropped.
+/// Returns `(false, [])` when not in combat.
+fn combat_state_from_metadata(player_metadata: &Value) -> (bool, Vec<String>) {
+    let in_combat = player_metadata
+        .get("inCombat")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !in_combat {
+        return (false, Vec::new());
+    }
+    let names: Vec<String> = player_metadata
+        .get("combatWith")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    (true, names)
+}
+
+/// The combat directive — the whole combat framing, injected at depth 1 AFTER
+/// the persona so it is the last thing the model reads before replying (where a
+/// small model weights it hardest). The scenario is left untouched.
+///
+/// When one of the combatants is the player being spoken to (their name matches
+/// `player_name`), it says so explicitly — the NPC must understand the person
+/// talking to them IS attacking them, not a bystander.
+fn format_combat_directive(names: &[String], player_name: &str) -> String {
+    let player = player_name.trim();
+    let player_is_attacker =
+        !player.is_empty() && names.iter().any(|name| name.eq_ignore_ascii_case(player));
+    let who = if names.is_empty() {
+        "an enemy".to_string()
+    } else {
+        chasm_prompt::readable_list(names)
+    };
+    let situation = if player_is_attacker {
+        format!(
+            "The person speaking to you — {player} — is attacking you RIGHT NOW. You are trading \
+             blows with them this very second."
+        )
+    } else {
+        format!("You are in a life-or-death fight with {who} RIGHT NOW.")
+    };
+    format!(
+        "\u{26a0}\u{26a0} YOU ARE IN COMBAT \u{26a0}\u{26a0}\n{situation} This is NOT a conversation \
+         and NOT the time for pleasantries — ignore how calm or friendly their words sound. Reply the \
+         way someone actually would mid-fight: frightened or enraged, shouting, cursing, breathless, \
+         snapping out threats or orders. Keep it SHORT, loud, and frantic. Never be calm, polite, \
+         measured, or chatty. You are ALREADY fighting — do NOT choose an attack action; express the \
+         fight in your words."
+    )
+}
+
 
 /// The newest macros-bearing turn of one live chat: `(send_date, macros)` from
 /// the persisted `extra.chasm.macros` blobs `finalize_turn` writes.
@@ -913,19 +980,21 @@ fn prepare_speaker_turn_traced(
         }),
         _ => None,
     };
-    // GLOBAL scenario for THIS speaker: the Globals template resolved with the
-    // turn's macro table + computed macros ({{participants}} excludes the
-    // speaker being prompted). NOT given to the assembler (Some("") omits the
-    // old card-scenario slot): its per-turn timestamp there busted the LLM
-    // prompt cache every turn. build_chat_messages injects it late instead.
-    // Deliberately NOT part of the retrieval scan text above.
+    // GLOBAL scenario for THIS speaker, injected LATE at depth 1 by
+    // build_chat_messages (just before the newest line) — its per-turn timestamp
+    // in the cached head busted the LLM prompt cache every turn. Deliberately NOT
+    // part of the retrieval scan text above.
+    //
+    let (in_combat, combat_with) = combat_state_from_metadata(&ctx.player_metadata);
+    // The scenario is ALWAYS the normal global scenario (combat does not touch it);
+    // combat is handled purely by the depth-1 combat directive pushed below.
     let global_scenario = resolve_global_scenario(
         &ctx.scenario_template,
         &ctx.scenario_macros,
         &other_npc_names(&ctx.live_chat, &speaker_participant_id),
     );
     trace_generate_stage(trace_id, "gen_assemble_enter");
-    let (assembled, injected) = chasm_prompt::assemble_prompt_with_retrieval_collect(
+    let (mut assembled, injected) = chasm_prompt::assemble_prompt_with_retrieval_collect(
         &state.repository,
         &speaker_view,
         &history,
@@ -936,6 +1005,28 @@ fn prepare_speaker_turn_traced(
         Some(""),
     );
     trace_generate_stage(trace_id, "gen_assemble_done");
+
+    // Combat is handled entirely here: a blunt behavioural directive that
+    // build_chat_messages injects at DEPTH 1, DEAD LAST (after the persona), so it
+    // is the final, most-salient thing before generation. The scenario is left
+    // untouched. Exposed as the `combat_alert` component for prompt inspection.
+    if in_combat {
+        let player_name = ctx.scenario_macros.get("player_name").map_or("", String::as_str);
+        let directive = format_combat_directive(&combat_with, player_name);
+        let char_count = directive.chars().count();
+        assembled.components.push(chasm_core::PromptComponentView {
+            order: assembled.components.len(),
+            group: "system".to_string(),
+            key: "combat_alert".to_string(),
+            label: "Combat alert".to_string(),
+            role: "system".to_string(),
+            status: "included".to_string(),
+            note: "Depth-1 combat directive, injected last while the NPC is in combat (mod-driven)."
+                .to_string(),
+            content: directive,
+            char_count,
+        });
+    }
 
     let scene_roster = build_scene_roster(state, ctx, &speaker_participant_id, &speaker_name);
     let chat_messages = build_chat_messages(
@@ -980,6 +1071,8 @@ fn prepare_speaker_turn_traced(
         location,
         chat_messages,
         injected,
+        in_combat,
+        combat_with,
     })
 }
 
@@ -1197,8 +1290,22 @@ fn build_chat_messages(
         .filter(included)
         .filter(|component| !VOLATILE_KEYS.contains(&component.key.as_str()))
         .filter(|component| component.key != "player_persona")
+        // The combat directive is per-turn state injected at depth 1 (below): keep
+        // it OUT of the cached head like the persona.
+        .filter(|component| component.key != "combat_alert")
         .map(|component| component.content.clone())
         .collect();
+    // The combat directive, injected at depth 1 DEAD LAST (see below) when the NPC
+    // is in combat. `None` (nothing injected) on peaceful turns.
+    let combat_alert: Option<String> = assembled
+        .components
+        .iter()
+        .find(|component| {
+            component.key == "combat_alert"
+                && component.status == "included"
+                && !component.content.is_empty()
+        })
+        .map(|component| component.content.clone());
     // The persona, wrapped as a depth-1 directive. `None` (nothing injected)
     // when no persona is present — byte-identical prompt for personaless turns.
     let persona_reminder: Option<String> = assembled
@@ -1404,6 +1511,20 @@ fn build_chat_messages(
         messages.insert(insert_at, persona_message);
     }
 
+    // COMBAT DIRECTIVE dead last of all — inserted AFTER the persona so it is the
+    // final system message before the newest player line. An active fight must be
+    // the single most salient instruction at generation time, out-weighing the
+    // persona's calm "react to their appearance" cue. Present only while in combat.
+    if let Some(combat_alert) = combat_alert {
+        let combat_message = json!({ "role": "system", "content": combat_alert });
+        let insert_at = if messages.len() > 1 {
+            messages.len() - 1
+        } else {
+            messages.len()
+        };
+        messages.insert(insert_at, combat_message);
+    }
+
     messages
 }
 
@@ -1573,7 +1694,14 @@ fn finalize_turn(
     // `extra.chasm`, ADDITIVE to the existing `headless` block (the
     // `/api/headless/v1/*` response shapes the mod sees are unchanged — this
     // only enriches the persisted message on disk).
-    let chasm_extra = build_chasm_extra(&plan.injected, structured.as_ref(), &aliases, macros);
+    let chasm_extra = build_chasm_extra(
+        &plan.injected,
+        structured.as_ref(),
+        &aliases,
+        macros,
+        plan.in_combat,
+        &plan.combat_with,
+    );
 
     let live = json!({
         "liveChatId": plan.live_chat_id,
@@ -1675,6 +1803,8 @@ fn build_chasm_extra(
     structured: Option<&Value>,
     aliases: &[(String, String)],
     macros: &BTreeMap<String, String>,
+    in_combat: bool,
+    combat_with: &[String],
 ) -> Value {
     let turn_actions = structured
         .map(|structured| chasm_prompt::turn_actions_from_structured(structured, aliases))
@@ -1683,6 +1813,10 @@ fn build_chasm_extra(
         "injected": serde_json::to_value(injected).unwrap_or_else(|_| json!({})),
         "turn_actions": serde_json::to_value(&turn_actions).unwrap_or_else(|_| json!([])),
         "macros": serde_json::to_value(macros).unwrap_or_else(|_| json!({})),
+        // Combat state this turn was generated under, so the chat UI can tag the
+        // message. Always present (false / [] when peaceful) for a stable shape.
+        "in_combat": in_combat,
+        "combat_with": serde_json::to_value(combat_with).unwrap_or_else(|_| json!([])),
     })
 }
 
@@ -2596,6 +2730,8 @@ fn admin_message_view(index: usize, message: &STJsonlChatMessage) -> MessageView
         // Admin history is only used to assemble the next prompt, never rendered.
         injected: None,
         turn_actions: Vec::new(),
+        in_combat: false,
+        combat_with: Vec::new(),
     }
 }
 
@@ -3285,6 +3421,98 @@ mod tests {
     }
 
     #[test]
+    fn combat_state_gates_on_flag_and_parses_names() {
+        // Not in combat -> (false, []): peaceful turns keep the normal scenario.
+        assert_eq!(combat_state_from_metadata(&json!({})), (false, Vec::new()));
+        assert_eq!(
+            combat_state_from_metadata(&json!({ "inCombat": false, "combatWith": ["Raider"] })),
+            (false, Vec::new()),
+            "explicit inCombat=false must not trip combat"
+        );
+
+        // In combat: names parsed, trimmed, blanks dropped.
+        assert_eq!(
+            combat_state_from_metadata(&json!({ "inCombat": true, "combatWith": ["Raider", " ", "Viper"] })),
+            (true, vec!["Raider".to_string(), "Viper".to_string()])
+        );
+        // In combat with no resolvable names still flags combat (empty list).
+        assert_eq!(
+            combat_state_from_metadata(&json!({ "inCombat": true })),
+            (true, Vec::new())
+        );
+    }
+
+    #[test]
+    fn combat_directive_names_the_player_attacker() {
+        // Player is one of the combatants -> explicit "person speaking to you".
+        let d = format_combat_directive(&["Courier".to_string()], "Courier");
+        assert!(d.contains("YOU ARE IN COMBAT"));
+        assert!(d.contains("The person speaking to you"));
+        assert!(d.contains("Courier"));
+        assert!(d.contains("SHORT, loud, and frantic"));
+
+        // Non-player combatant(s) -> generic fight line, no "person speaking".
+        let d2 = format_combat_directive(&["Raider".to_string(), "Viper".to_string()], "Courier");
+        assert!(d2.contains("life-or-death fight with Raider and Viper"));
+        assert!(!d2.contains("person speaking to you"));
+
+        // Empty list -> "an enemy" fallback; empty player name never misfires.
+        assert!(format_combat_directive(&[], "").contains("an enemy"));
+    }
+
+    #[test]
+    fn combat_directive_injects_after_persona_at_the_very_bottom() {
+        let mut assembled = chasm_core::PromptAssemblyView::default();
+        let component = |key: &str, content: &str| chasm_core::PromptComponentView {
+            order: 0,
+            group: "system".to_string(),
+            key: key.to_string(),
+            label: String::new(),
+            role: "system".to_string(),
+            status: "included".to_string(),
+            note: String::new(),
+            content: content.to_string(),
+            char_count: content.chars().count(),
+        };
+        assembled.components = vec![
+            component("character", "You are Chet."),
+            component("player_persona", "Player persona:\nCourier is brave."),
+            component("combat_alert", "\u{26a0}\u{26a0} YOU ARE IN COMBAT \u{26a0}\u{26a0} fight!"),
+        ];
+        let history = vec![
+            MessageView {
+                role: "player".to_string(),
+                content: "hello".to_string(),
+                ..Default::default()
+            },
+            MessageView {
+                role: "assistant".to_string(),
+                content: "hi there".to_string(),
+                ..Default::default()
+            },
+        ];
+        let messages = build_chat_messages(
+            &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "",
+        );
+        // Not in the cached head.
+        assert!(!messages[0]["content"].as_str().unwrap().contains("YOU ARE IN COMBAT"));
+        // The combat directive is the LAST system message, right before the newest
+        // line — below even the persona.
+        let last_system = messages[messages.len() - 2]["content"].as_str().unwrap();
+        assert!(last_system.contains("YOU ARE IN COMBAT"));
+        assert_eq!(messages[messages.len() - 1]["content"], "hi there");
+        let persona_idx = messages
+            .iter()
+            .position(|m| m["content"].as_str().unwrap_or("").contains("face to face"))
+            .expect("persona present");
+        let combat_idx = messages
+            .iter()
+            .position(|m| m["content"].as_str().unwrap_or("").contains("YOU ARE IN COMBAT"))
+            .expect("combat directive present");
+        assert!(combat_idx > persona_idx, "combat directive must sit below the persona");
+    }
+
+    #[test]
     fn resolves_global_scenario_with_computed_participants() {
         let macros: BTreeMap<String, String> = [
             ("player_name".to_string(), "Courier".to_string()),
@@ -3423,7 +3651,18 @@ mod tests {
         .into_iter()
         .collect();
 
-        let extra = build_chasm_extra(&injected, Some(&structured), &aliases, &macros);
+        let extra = build_chasm_extra(
+            &injected,
+            Some(&structured),
+            &aliases,
+            &macros,
+            true,
+            &["Raider".to_string(), "Powder Ganger".to_string()],
+        );
+
+        // Combat state is recorded on the blob for the chat UI tag.
+        assert_eq!(extra["in_combat"], json!(true));
+        assert_eq!(extra["combat_with"], json!(["Raider", "Powder Ganger"]));
 
         // injected groups round-trip under the documented keys.
         assert_eq!(extra["injected"]["lore"][0]["id"], "Goodsprings");
@@ -3448,10 +3687,13 @@ mod tests {
 
         // A plain-text turn (no structured output) -> empty turn_actions, but the
         // injected set is still recorded; no macros that turn -> empty object.
-        let text_extra = build_chasm_extra(&injected, None, &aliases, &BTreeMap::new());
+        let text_extra = build_chasm_extra(&injected, None, &aliases, &BTreeMap::new(), false, &[]);
         assert!(text_extra["turn_actions"].as_array().unwrap().is_empty());
         assert_eq!(text_extra["injected"]["lore"][0]["id"], "Goodsprings");
         assert!(text_extra["macros"].as_object().unwrap().is_empty());
+        // Peaceful turn -> in_combat false, empty combat_with (stable shape).
+        assert_eq!(text_extra["in_combat"], json!(false));
+        assert!(text_extra["combat_with"].as_array().unwrap().is_empty());
     }
 
     #[test]
