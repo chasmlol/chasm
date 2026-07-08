@@ -358,6 +358,13 @@ pub struct MessageView {
     /// render them as dim narration instead of spoken dialogue.
     #[serde(default)]
     pub witnessed: bool,
+    /// True for an EPHEMERAL world line — a point-in-time READ (a room search, an
+    /// inventory scan, a `find_action` listing) persisted so it shows in the chat
+    /// UI, but filtered out of the model's prompt on every LATER turn: by then it
+    /// is stale (the item he "is holding" may already be gone). Only real action
+    /// beats persist across turns. `false` for everything else.
+    #[serde(default)]
+    pub ephemeral: bool,
 }
 
 /// One lore/quest/action entry that was injected into a single turn's prompt,

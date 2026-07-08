@@ -451,6 +451,16 @@ pub fn get_native_game_master_action(config: &BridgeConfig, turn: &Value) -> Gam
             }
         }
     }
+    // GIVE: a native errand like LOOT, but reversed - the NPC walks to the player
+    // and hands over a carried item (`items` holds the exact name, pinned by the
+    // grammar from his inventory scan). Its own command shape (no loot plan).
+    for action in &structured {
+        if normalize_structured_action_id(action) == "world.give_item" {
+            if let Some(gm) = base(action, "GIVE") {
+                return gm;
+            }
+        }
+    }
 
     for action in &structured {
         if normalize_structured_action_id(action) == "combat.start" && is_player_action_target(action) {
@@ -1360,6 +1370,32 @@ fn build_native_action_command_lines(
         });
     }
 
+    // GIVE: carries the exact item name (from the inventory-pinned `items` field)
+    // in loot_items_base64 - the plugin walks the NPC to the player and hands it
+    // over. Its own command like LOOT, so it never rides the trusted-script path.
+    if action == "GIVE" {
+        let lines = vec![
+            NATIVE_ACTION_COMMAND_VERSION.to_string(),
+            format!("request_id={}", encode_command_value(&request_id)),
+            format!("npc_key={}", encode_command_value(&native_npc_key)),
+            format!("npc_name={}", encode_command_value(&native_npc_name)),
+            "action=GIVE".to_string(),
+            format!("action_id={}", encode_command_value(&gm.action_id)),
+            format!("confidence={}", encode_command_value(&gm.confidence)),
+            format!(
+                "reason={}",
+                encode_command_value(if gm.reason.is_empty() { source } else { &gm.reason })
+            ),
+            format!("player_text={}", encode_base64_utf8(&player_text)),
+            format!("loot_items_base64={}", encode_base64_utf8(&gm.items)),
+        ];
+        return Some(BuiltCommand {
+            request_id,
+            format: NATIVE_ACTION_COMMAND_VERSION,
+            lines,
+        });
+    }
+
     let force_legacy = action == "ATTACK";
     if !force_legacy && trusted_engine == TRUSTED_FNV_ACTION_ENGINE && !trusted_script.is_empty() {
         let args = match resolve_trusted_execution_arguments(&execution, &primary, request) {
@@ -1504,7 +1540,7 @@ pub fn write_native_game_master_command(
         return false;
     }
     let action = gm.action.trim().to_uppercase();
-    if !["ATTACK", "FOLLOW", "STOP_FOLLOW", "LOOT", "ACTION_BOOK"].contains(&action.as_str()) {
+    if !["ATTACK", "FOLLOW", "STOP_FOLLOW", "LOOT", "GIVE", "ACTION_BOOK"].contains(&action.as_str()) {
         return false;
     }
     if actor.native_npc_key.trim().is_empty() && actor.native_npc_name.trim().is_empty() {
@@ -1783,6 +1819,76 @@ mod tests {
 container|Oven
 container|Desk")
         )));
+    }
+
+    /// give_item classifies as a native GIVE errand (its own command, NOT a loot
+    /// plan): the plugin walks the NPC to the player and hands over the exact
+    /// carried item, which rides in loot_items_base64.
+    #[test]
+    fn give_step_classifies_and_builds_give_command() {
+        let turn = json!({
+            "speaker": { "name": "chamzy" },
+            "message": { "content": "Here." },
+            "structured": { "actions": [
+                { "action": "give", "target": "", "items": "Stimpak",
+                  "id": "world.give_item", "parameters": {}, "reason": "Action give." }
+            ]}
+        });
+        let gm = get_native_game_master_action(&cfg(), &turn);
+        assert_eq!(gm.action, "GIVE");
+        assert!(gm.should_trigger);
+        assert_eq!(gm.action_id, "world.give_item");
+        assert_eq!(gm.items, "Stimpak");
+        let actor = ActionActor {
+            native_npc_key: "chamzy".into(),
+            native_npc_name: "chamzy".into(),
+            ..Default::default()
+        };
+        let cmd = build_native_action_command_lines(&request(), &actor, &gm, "src")
+            .expect("command built");
+        assert_eq!(cmd.format, NATIVE_ACTION_COMMAND_VERSION);
+        assert!(cmd.lines.contains(&"action=GIVE".to_string()));
+        let b64 = |v: &str| base64::engine::general_purpose::STANDARD.encode(v.as_bytes());
+        assert!(cmd.lines.contains(&format!("loot_items_base64={}", b64("Stimpak"))));
+        // GIVE is NOT a loot step - it must not fold into the loot aggregate.
+        let gms = get_native_game_master_actions_per_step(&cfg(), &turn);
+        assert!(aggregate_loot_steps(&gms).is_none());
+    }
+
+    /// Regression: write_native_game_master_command had an action WHITELIST that
+    /// omitted GIVE, so give_item classified + built a correct command but was
+    /// silently dropped before the file was written (the live "he emits give_item
+    /// but never hands it over" bug). GIVE must reach the control/actions dir like
+    /// LOOT. (The classification test above bypassed this gate by calling the
+    /// builder directly - this one drives the real write path end-to-end.)
+    #[test]
+    fn give_command_reaches_control_actions_dir() {
+        let base = std::env::temp_dir().join(format!("chasm-give-regr-{}", now_epoch_millis()));
+        let root = base.join("bridge");
+        std::fs::create_dir_all(&root).expect("mk temp root");
+        let mut config = cfg();
+        config.native_bridge_roots = vec![root.clone()];
+        let gm = GameMaster {
+            action: "GIVE".into(),
+            action_id: "world.give_item".into(),
+            items: "Stimpak".into(),
+            confidence: "1.00".into(),
+            should_trigger: true,
+            ..GameMaster::none()
+        };
+        let actor = ActionActor {
+            native_npc_key: "chamzy".into(),
+            native_npc_name: "chamzy".into(),
+            ..Default::default()
+        };
+        let queued = write_native_game_master_command(&config, &request(), &actor, &gm, "src");
+        assert!(queued, "GIVE must be queued (whitelist regression)");
+        let dir = root.join("control").join("actions");
+        let files: Vec<_> = std::fs::read_dir(&dir).expect("actions dir").flatten().collect();
+        assert_eq!(files.len(), 1, "exactly one GIVE command file written");
+        let body = std::fs::read_to_string(files[0].path()).expect("read command");
+        assert!(body.contains("action=GIVE"), "command carries action=GIVE: {body}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn follow_turn() -> Value {

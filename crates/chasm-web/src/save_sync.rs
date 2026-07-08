@@ -1806,9 +1806,8 @@ fn handle_save_sync_event(
         }
         crate::scheduler::restore_scheduler_store(data_root, &checkpoint_id);
         crate::movement::restore_movement_store(data_root, &checkpoint_id);
-        // In-flight action loops belong to the old timeline (the plugin cleared
-        // its loot/event state too) - drop the carried toolsets.
-        crate::generate::clear_active_toolsets();
+        // (No action-loop toolsets to drop on reload: discovery is turn-local now,
+        // so nothing is carried between turns in the first place.)
         // Pending (not yet flushed) witnessed-event bundles belong to the
         // just-abandoned timeline; already-flushed lines rolled back with the
         // chat checkpoint above.

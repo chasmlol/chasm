@@ -3961,6 +3961,7 @@ mod tests {
             combat_with: Vec::new(),
             interstitial: false,
             witnessed: false,
+            ephemeral: false,
         }
     }
 

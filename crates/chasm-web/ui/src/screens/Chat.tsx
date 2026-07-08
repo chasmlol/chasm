@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Trash2 } from "lucide-react";
 import {
@@ -388,7 +388,16 @@ function MessageStream({ thread }: { thread: ChatThreadDto }) {
   return (
     <ol className="mx-auto flex max-w-3xl flex-col gap-3 pb-6">
       {thread.messages.map((message) => (
-        <MessageRow key={message.id} message={message} />
+        <Fragment key={message.id}>
+          <MessageRow message={message} />
+          {/* Executed actions are their OWN line now (see ActionLine): decoupled
+              from the speech bubble, since with the freeform loop what he SAID and
+              what he DID are separate beats. Purely visual - the actions ride
+              message metadata and are never fed back into the model's prompt. */}
+          {message.executed_actions.length > 0 && (
+            <ActionLine speaker={message.speaker} actions={message.executed_actions} />
+          )}
+        </Fragment>
       ))}
     </ol>
   );
@@ -421,6 +430,21 @@ function MessageRow({ message }: { message: ChatMessageDto }) {
         </div>
       </li>
     );
+  }
+
+  // A SILENT action turn (no speech) used to render an empty NPC header just to
+  // carry its executed-action chip. Executed actions now have their own line, so
+  // if there's no text AND no other per-turn context to show, this row would be
+  // blank noise - skip it entirely and let the ActionLine stand alone.
+  const hasText = message.text.trim() !== "";
+  const hasStrip =
+    message.injected_lore.length > 0 ||
+    message.injected_quests.length > 0 ||
+    message.offered_actions.length > 0 ||
+    message.in_combat ||
+    (message.role === "npc" && message.no_context);
+  if (!hasText && !hasStrip) {
+    return null;
   }
   return (
     <li className="flex gap-3">
@@ -480,6 +504,70 @@ function MessageRow({ message }: { message: ChatMessageDto }) {
   );
 }
 
+// A standalone chat line for the actions an NPC EXECUTED on a turn - its own row,
+// labelled "action", in the executed-green, decoupled from the speech bubble. With
+// the freeform loop what he SAID and what he DID are separate beats, so they read
+// as separate lines. This is PURELY visual: the actions come from turn metadata
+// and are never part of the message text fed back to the model.
+function ActionLine({
+  speaker,
+  actions,
+}: {
+  speaker: string;
+  actions: ExecutedActionDto[];
+}) {
+  return (
+    <li className="flex gap-3">
+      <span className="mt-0.5 grid size-8 shrink-0 place-items-center rounded-full bg-[color-mix(in_srgb,var(--color-player)_22%,transparent)] text-[var(--color-player)]">
+        <Zap className="size-4" strokeWidth={2.5} />
+      </span>
+
+      <div className="min-w-0 flex-1">
+        <div className="flex items-baseline gap-2">
+          <span className="text-sm font-semibold text-[var(--foreground)]">
+            {speaker}
+          </span>
+          <span className="rounded-full border border-[var(--border)] bg-[var(--color-ink-850)] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-player)]">
+            action
+          </span>
+        </div>
+        <div className="mt-1 flex flex-col gap-1.5">
+          {actions.map((a, i) => (
+            <div
+              key={`${a.id}-${i}`}
+              // A FULL bubble like a world / speech line (not a truncated chip):
+              // the complete action he entered, in the executed-green, monospace
+              // like the world log since it's the structured beat he emitted.
+              className="whitespace-pre-wrap break-words rounded-2xl rounded-tl-sm border border-[color-mix(in_srgb,var(--color-player)_38%,var(--border))] bg-[color-mix(in_srgb,var(--color-player)_10%,var(--card))] px-3.5 py-2.5 font-mono text-[12px] leading-relaxed text-[color-mix(in_srgb,var(--color-player)_85%,var(--foreground))]"
+            >
+              {actionFullText(a)}
+            </div>
+          ))}
+        </div>
+      </div>
+    </li>
+  );
+}
+
+// The complete action the NPC emitted, spelled out in full (no truncation) - the
+// verb, its canonical id when it differs from the label, the target, and any
+// remaining params. This is exactly what he "typed" on the turn. `reason` is left
+// out on purpose: the freeform NPC schema is {action, target, items}, so reason is
+// a backend-filled placeholder (e.g. `Action "take_items".`), not his words.
+function actionFullText(a: ExecutedActionDto): string {
+  const parts: string[] = [a.label || a.id || "(action)"];
+  if (a.id && a.id !== a.label) {
+    parts.push(`(${a.id})`);
+  }
+  if (a.target) {
+    parts.push(`→ ${a.target}`);
+  }
+  if (a.params && a.params !== "{}") {
+    parts.push(a.params);
+  }
+  return parts.join(" ");
+}
+
 function RoleBadge({ role }: { role: string }) {
   const tone =
     role === "world"
@@ -507,15 +595,14 @@ function ContextStrip({ message }: { message: ChatMessageDto }) {
   const hasLore = message.injected_lore.length > 0;
   const hasQuests = message.injected_quests.length > 0;
   const hasOffered = message.offered_actions.length > 0;
-  // Executed actions that weren't in the offered set still deserve a green chip
-  // (native / relayed actions). Offered-and-executed are shown via the offered
-  // group (green), so here we only surface executed actions with no offered twin.
-  const extraExecuted = message.executed_actions.filter((a) => !a.offered);
-  const hasExtraExecuted = extraExecuted.length > 0;
+  // Executed actions are NOT shown here anymore — they render as their own green
+  // "action" line (ActionLine), decoupled from the turn's injection context.
+  // This strip keeps only what was INJECTED into the turn (lore / quests) plus
+  // the combat flag.
   // This NPC turn was generated mid-fight — surfaced as a prominent red badge.
   const hasCombat = message.in_combat;
 
-  if (!hasLore && !hasQuests && !hasOffered && !hasExtraExecuted && !hasCombat) {
+  if (!hasLore && !hasQuests && !hasOffered && !hasCombat) {
     // Keep player turns quiet; only annotate NPC turns that genuinely recorded
     // nothing (so a missing strip never looks like a bug).
     if (message.role === "npc" && message.no_context) {
@@ -582,17 +669,6 @@ function ContextStrip({ message }: { message: ChatMessageDto }) {
         </ChipGroup>
       )}
 
-      {hasExtraExecuted && (
-        <ChipGroup
-          icon={<Zap className="size-3" strokeWidth={2} />}
-          label="Executed"
-          tone="executed"
-        >
-          {extraExecuted.map((a, i) => (
-            <ExecutedChip key={`${a.id}-${i}`} action={a} />
-          ))}
-        </ChipGroup>
-      )}
     </div>
   );
 }
@@ -716,30 +792,3 @@ function CombatChip({ name }: { name: string }) {
   );
 }
 
-function ExecutedChip({ action }: { action: ExecutedActionDto }) {
-  const detail = [
-    action.target ? `target: ${action.target}` : "",
-    action.params && action.params !== "{}" ? action.params : "",
-    action.reason ? action.reason : "",
-  ]
-    .filter(Boolean)
-    .join(" · ");
-  const title = `${action.label}${action.id && action.id !== action.label ? ` (${action.id})` : ""}${
-    detail ? ` · ${detail}` : ""
-  }`;
-  return (
-    <span
-      className={cn(
-        CHIP_BASE,
-        "border-[color-mix(in_srgb,var(--color-player)_55%,var(--border))] bg-[color-mix(in_srgb,var(--color-player)_16%,transparent)] text-[var(--color-player)]",
-      )}
-      title={title}
-    >
-      <Zap className="size-3" strokeWidth={2.5} />
-      <span className="max-w-[14rem] truncate">{action.label}</span>
-      {action.target && (
-        <span className="text-[var(--color-player)]/70">→ {action.target}</span>
-      )}
-    </span>
-  );
-}

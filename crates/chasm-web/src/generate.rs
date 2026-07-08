@@ -326,14 +326,14 @@ pub async fn generate_stream_core(
             let mut persisted_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut agent_rounds: usize = 0;
             let mut final_collected = String::new();
-            // A continuation turn inherits the TOOLS he found (find_action results)
-            // so he doesn't re-discover them every step - but NOT the room scan.
-            // The room is re-searched each turn so the list is always CURRENT: a
-            // just-taken item is gone, nothing stale lingers, no re-picking thin
-            // air. (A player turn starts fully fresh.)
-            let is_continuation = world_event_text(&ctx.player_metadata).is_some();
-            let inherited = inherit_loop_discovery(&plan.live_chat_id, &plan.speaker_name, is_continuation);
-            let mut discovered_actions: Vec<String> = inherited.actions;
+            // EVERY turn starts FRESH - nothing discovered on a past turn carries
+            // over. Discovery (find_action results, room/inventory scans) is working
+            // memory that goes stale the instant the turn ends; carrying it forward
+            // let a continuation turn re-fire a dead tool (re-give an item already
+            // handed over, re-scan a room). Only the action BEATS persist (the World:
+            // outcome lines in history); to do anything on a continuation turn he
+            // re-discovers from those beats, exactly like a player turn.
+            let mut discovered_actions: Vec<String> = Vec::new();
             let mut discovered_containers: Vec<String> = Vec::new();
             // A container just opened (its contents ride the action-beat text) makes
             // those contents the items he can take right now - seed the pin from them.
@@ -465,11 +465,15 @@ pub async fn generate_stream_core(
                         }
                     }
                     // give_item is the same two-step, over his OWN inventory: a bare
-                    // give triggers the inventory check (reuse check_inventory) so he
-                    // sees his real items, then picks from the pinned grammar; "[none]"
-                    // declines; a real pick runs the give (transfer NPC -> player)
-                    // through the mod's give_item worldq op - no walking, so it rides
-                    // the query channel, not the native loot-errand command.
+                    // give triggers a GIVE-scan (reads his inventory, but frames the
+                    // result as "pick one to give" - NOT the check_inventory report,
+                    // whose "you are carrying: X" wording made him just SPEAK his items
+                    // instead of giving), then he picks from the pinned grammar;
+                    // "[none]" declines. A REAL pick falls through as a world step,
+                    // dispatched natively as a GIVE command (the mod walks him to the
+                    // player and hands it over via the same engine package + transfer
+                    // the loot actions use) - exactly like take_items, no invented
+                    // channel.
                     if id.as_deref() == Some("world.give_item") {
                         let pick = fields
                             .as_ref()
@@ -483,11 +487,9 @@ pub async fn generate_stream_core(
                             continue;
                         }
                         if discovered_inventory.is_empty() {
-                            queries.push(("chasm.check_inventory".to_string(), String::new()));
-                        } else {
-                            queries.push(("chasm.give_item".to_string(), pick));
+                            queries.push(("chasm.give_scan".to_string(), String::new()));
+                            continue;
                         }
-                        continue;
                     }
                     kept.push(step);
                 }
@@ -542,7 +544,7 @@ pub async fn generate_stream_core(
                 // lists loose items in the world (take_items' choice) - kept in
                 // separate buckets so a room search and an inventory check don't
                 // cross-contaminate the two grammars.
-                let bucket = if query_id == "chasm.check_inventory" {
+                let bucket = if query_id == "chasm.check_inventory" || query_id == "chasm.give_scan" {
                     &mut discovered_inventory
                 } else {
                     &mut discovered_items
@@ -562,7 +564,10 @@ pub async fn generate_stream_core(
                 // Persist what he SAW into the chat so the player can watch the
                 // loop unfold - searches, found actions, nearby people, inventory.
                 if !outcome.text.trim().is_empty() {
-                    append_world_line(&state, &plan.live_chat_id, &format!("[{}]", outcome.text.trim()));
+                    // A READ (search / inventory scan / find_action listing): show it
+                    // in the UI, but mark it ephemeral so it never feeds a LATER turn -
+                    // it is stale by then. Only action beats persist across turns.
+                    append_world_line_ext(&state, &plan.live_chat_id, &format!("[{}]", outcome.text.trim()), true);
                 }
                 results.push_str(&outcome.text);
                 results.push('\n');
@@ -600,19 +605,8 @@ pub async fn generate_stream_core(
                 Ok(turn) => {
                     report_guard.defuse();
                     dispatch_chasm_world_steps(&state, &ctx, &plan, &turn);
-                    let dispatched = turn
-                        .pointer("/structured/actions")
-                        .and_then(Value::as_array)
-                        .map(|a| !a.is_empty())
-                        .unwrap_or(false);
-                    update_loop_discovery(
-                        &plan.live_chat_id,
-                        &plan.speaker_name,
-                        &discovered_containers,
-                        &discovered_items,
-                        &discovered_actions,
-                        dispatched,
-                    );
+                    // Nothing to carry forward: discovery is turn-local now, so the
+                    // next turn (continuation or player) rebuilds it from scratch.
                     turns.push(turn)
                 }
                 Err(error) => {
@@ -817,84 +811,6 @@ struct TurnPlan {
     /// guard puts them back - a swallowed report meant the NPC never told the
     /// player about the milk (observed live).
     errand_reports: Vec<String>,
-}
-
-/// Resolves the request-level (speaker-agnostic) context. Fails synchronously
-/// for the conditions the helper surfaces as a non-200 (missing chat / segment).
-/// The DISCOVERY STATE of an in-flight action loop, keyed by conversation+NPC.
-/// A world-event turn ("[You picked up X.]") is a CONTINUATION of the action
-/// that spawned it, so it inherits what the spawning turn had discovered - the
-/// expanded action GROUPS and the CONTAINERS a search found in the room. Both
-/// travel with the cause->effect chain, so he searches a room ONCE and then
-/// loots it across many turns without re-searching every step (he re-searches
-/// only when HE chooses to, which refreshes it). Player turns start FRESH (a
-/// small action space, a clean slate). Lives exactly as long as the loop:
-/// cleared the moment a turn emits no action, or the game reloads. No timer.
-#[derive(Clone, Default)]
-struct LoopDiscovery {
-    /// Container/body names a search revealed (pins loot targets in the grammar).
-    containers: Vec<String>,
-    /// Loose item names a scan / open container revealed (pins take_items' items).
-    items: Vec<String>,
-    /// Action ids `find_action` has turned up this loop - they, plus find_action
-    /// itself, ARE the grammar enum. Everything else is un-emittable until found.
-    actions: Vec<String>,
-}
-
-static ACTIVE_LOOP: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, LoopDiscovery>>,
-> = std::sync::OnceLock::new();
-
-fn toolset_key(live_chat_id: &str, speaker: &str) -> String {
-    format!("{live_chat_id}|{}", speaker.to_lowercase())
-}
-
-/// What a CONTINUATION turn inherits (world events only; player turns start
-/// fresh, so they pass `is_continuation = false` and get an empty slate).
-fn inherit_loop_discovery(live_chat_id: &str, speaker: &str, is_continuation: bool) -> LoopDiscovery {
-    if !is_continuation {
-        return LoopDiscovery::default();
-    }
-    let map = ACTIVE_LOOP.get_or_init(Default::default);
-    let map = map.lock().unwrap_or_else(|e| e.into_inner());
-    map.get(&toolset_key(live_chat_id, speaker)).cloned().unwrap_or_default()
-}
-
-/// After a turn: carry its discovery forward if it dispatched an action (its
-/// outcome spawns a continuation that needs the same tools + room knowledge);
-/// clear otherwise (no action = loop over).
-fn update_loop_discovery(
-    live_chat_id: &str,
-    speaker: &str,
-    containers: &[String],
-    items: &[String],
-    actions: &[String],
-    dispatched: bool,
-) {
-    let map = ACTIVE_LOOP.get_or_init(Default::default);
-    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
-    let key = toolset_key(live_chat_id, speaker);
-    if dispatched && !(containers.is_empty() && items.is_empty() && actions.is_empty()) {
-        map.insert(
-            key,
-            LoopDiscovery {
-                containers: containers.to_vec(),
-                items: items.to_vec(),
-                actions: actions.to_vec(),
-            },
-        );
-    } else {
-        map.remove(&key);
-    }
-}
-
-/// Drop every in-flight loop - a game reload is a new timeline; any loop that
-/// was mid-flight belongs to the old one (its continuation events were cleared
-/// plugin-side too).
-pub fn clear_active_toolsets() {
-    if let Some(map) = ACTIVE_LOOP.get() {
-        map.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    }
 }
 
 /// A world-event turn ("You open the Refrigerator. Inside: ...") carries its
@@ -2081,8 +1997,27 @@ fn build_chat_messages(
         if message_view.content.trim().is_empty() {
             continue;
         }
+        // EPHEMERAL world lines - a room search, an inventory scan, a find_action
+        // listing - are point-in-time READS: true when they ran, stale by now (the
+        // item he "was holding" may already be gone). They show in the UI but must
+        // not linger in the prompt across turns, or he re-obeys a dead snapshot.
+        // The loop that ran them already saw them via the in-loop [QUERY RESULT];
+        // only action beats survive here. Nothing lingers across turns but beats.
+        if message_view.ephemeral {
+            continue;
+        }
+        // "world" lines (search results, pickups, hand-offs, gestures, arrivals -
+        // the game narrating an OUTCOME to the NPC) are INPUT, exactly like a player
+        // line: the NPC reacts to them and freely decides what to do next. They are
+        // persisted is_user=true for this reason; mapping them to "assistant" (the
+        // old `_` catch-all) made the model read them as its OWN past output, so the
+        // last real "user" turn it saw was the player's PREVIOUS request - and it
+        // answered THAT again (re-giving, cascading, stale replies). As "user" the
+        // world outcome is the latest turn the NPC responds to. Same for every
+        // action - no per-action special-casing. Mirrors the in-loop [QUERY RESULT],
+        // which is already fed as "user".
         let base_role = match message_view.role.as_str() {
-            "player" => "user",
+            "player" | "world" => "user",
             "system" => "system",
             _ => "assistant",
         };
@@ -2106,6 +2041,15 @@ fn build_chat_messages(
                 "user",
                 format!("{}: {}", message_view.speaker_name, message_view.content),
             )
+        } else if message_view.role == "world" {
+            // The game narrating a COMPLETED outcome (a search result, a pickup, a
+            // hand-off, an arrival). Label it "World:" so the model can tell it apart
+            // from the player's OWN words - both ride the `user` role, and without the
+            // label a line like "[You handed the Hammer to the player.]" got read as an
+            // instruction to obey ("As you command" -> tried to re-give it -> "I don't
+            // have a hammer"). The system prompt (NPC_STRUCTURED_OUTPUT_INSTRUCTION)
+            // explains what a World line is; here we just tag it.
+            ("user", format!("World: {}", message_view.content))
         } else {
             (base_role, message_view.content.clone())
         };
@@ -2398,11 +2342,28 @@ impl Drop for ErrandReportGuard {
 /// NPC's own record of what happened. NO generation: it is memory he reads on
 /// his next turn, not a prompt that fires one.
 pub fn append_world_line(state: &AppState, live_chat_id: &str, text: &str) {
+    append_world_line_ext(state, live_chat_id, text, false);
+}
+
+/// Like [`append_world_line`] but marks the line EPHEMERAL: it still shows in the
+/// chat UI, yet is filtered out of the model's prompt on every LATER turn (see the
+/// skip in `build_chat_messages`). Point-in-time READS - a room search, an
+/// inventory scan, a `find_action` listing - are true the instant they run and
+/// STALE by the next turn (the item he "is holding" may already be given away), so
+/// they must NOT linger in context. Only real action beats persist across turns.
+/// (Within the turn that ran the read, the loop still sees it via the in-loop
+/// [QUERY RESULT], so this never starves the current decision.)
+fn append_world_line_ext(state: &AppState, live_chat_id: &str, text: &str, ephemeral: bool) {
     let Ok(live_chat) = state.repository.get_live_chat(live_chat_id) else {
         return;
     };
     let Some(segment) = current_segment(&live_chat) else {
         return;
+    };
+    let extra = if ephemeral {
+        json!({ "chasm": { "ephemeral": true } })
+    } else {
+        json!({})
     };
     let message = STJsonlChatMessage {
         name: "World".to_string(),
@@ -2410,7 +2371,7 @@ pub fn append_world_line(state: &AppState, live_chat_id: &str, text: &str) {
         is_system: false,
         send_date: Some(now_iso()),
         mes: text.to_string(),
-        extra: json!({}),
+        extra,
         original_avatar: None,
     };
     if let Err(error) = state.repository.append_segment_message(&segment, &message) {
@@ -2518,6 +2479,7 @@ fn dispatch_chasm_world_steps(
         if id.is_empty()
             || id == "world.loot_container"
             || id == "world.take_items"
+            || id == "world.give_item"
             || id == "movement.travel_to_location"
         {
             continue;
@@ -3132,12 +3094,24 @@ async fn agent_execute_query(
     if action_id == chasm_prompt::FIND_ACTION_ID {
         return agent_find_action(state, agent, topic);
     }
-    // give_item's actual transfer: NOT a book query the model emits, but the
-    // second step of give_item, rerouted here with the chosen item as `topic`.
-    // The mod hands that named item from the NPC to the player and reports back.
-    if action_id == "chasm.give_item" {
-        let (text, _, _) = agent_mod_query(state, "give_item", speaker_name, topic).await;
-        return QueryOutcome { text, ..Default::default() };
+    // give_item's inventory scan: reads his OWN carried items (a legit READ) and
+    // reveals the names so give_item's grammar can pin to them - the give analogue
+    // of search_area for take. A NEUTRAL observation, not a command: it presents
+    // what he holds and how to give; whether/what he gives is HIS call (give_item
+    // an exact name, "[none]", or more across the loop - his free choice).
+    if action_id == "chasm.give_scan" {
+        let (_text, _containers, items) = agent_mod_query(state, "npc_inventory", speaker_name, "").await;
+        if items.is_empty() {
+            return QueryOutcome {
+                text: "You are carrying nothing you could give.".to_string(),
+                ..Default::default()
+            };
+        }
+        return QueryOutcome {
+            text: format!("You are holding: {}.", items.join(", ")),
+            items,
+            ..Default::default()
+        };
     }
     let text = match action_id {
         "chasm.who_is_here" => {
@@ -3224,7 +3198,7 @@ fn agent_find_action(state: &Arc<AppState>, agent: &AgentLoopCtx, query: &str) -
     let listing = chasm_prompt::describe_found_actions(&agent.book_entries, &ids);
     QueryOutcome {
         text: format!(
-            "Things you can do that match \"{query}\":\n{listing}\nEmit one now using the exact verb; if it only looks or checks, leave your speech empty and read the result."
+            "Things you can do that match \"{query}\":\n{listing}"
         ),
         actions: ids,
         ..Default::default()
@@ -4506,6 +4480,7 @@ fn admin_message_view(index: usize, message: &STJsonlChatMessage) -> MessageView
         combat_with: Vec::new(),
         interstitial: false,
         witnessed: false,
+        ephemeral: false,
     }
 }
 

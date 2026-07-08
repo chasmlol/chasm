@@ -87,7 +87,9 @@ Each step: {"action": "...", "target": "...", "items": "...", "time": "", "condi
 - "items": what to take, when taking things. "" otherwise.
 - "time"/"condition"/"delay": ONLY when the player asked for a later clock time, an event to wait for, or a delay - that puts the step on your schedule instead of doing it now. Otherwise leave them "".
 
-You act in a loop: do something, the world tells you what happened, then you decide your next step from what it said. Act only on what you have seen."#;
+You act in a loop: do something, the world tells you what happened, then you decide your next step from what it said. Act only on what you have seen.
+
+Lines that begin with "World:" are the game itself narrating what has ALREADY happened - a search result, a pickup, an item you handed over, someone arriving. They are finished facts, NOT orders from the player. React however you see fit: say something, take another action, or do nothing. In particular, "World: [You handed the X to the player.]" means the hand-off is DONE - never read it as an instruction to hand X over again."#;
 
 /// Verbatim from `src/headless/quest-books.js` `QUEST_BOOK_STRUCTURED_OUTPUT_INSTRUCTION`.
 pub const QUEST_BOOK_STRUCTURED_OUTPUT_INSTRUCTION: &str = concat!(
@@ -641,15 +643,15 @@ fn actions_from_array(
                         .map(|a| a.to_string())
                         .unwrap_or_default()
                 });
-            // take_items carries the item in `items` (target is forced empty by the
-            // grammar), so surface that as the chip's target for a readable
-            // "take_items -> Boxing Gloves".
+            // take_items / give_item carry the item in `items` (target is forced
+            // empty by the grammar), so surface that as the chip's target for a
+            // readable "take_items -> Boxing Gloves" / "give_item -> Stimpak".
             let target = object
                 .get("target")
                 .and_then(Value::as_str)
                 .filter(|t| !t.trim().is_empty())
                 .or_else(|| {
-                    (id == "world.take_items")
+                    (id == "world.take_items" || id == "world.give_item")
                         .then(|| object.get("items").and_then(Value::as_str))
                         .flatten()
                 })
@@ -2701,6 +2703,7 @@ mod tests {
             combat_with: Vec::new(),
             interstitial: false,
             witnessed: false,
+            ephemeral: false,
         };
         // Empty name + player role => "user: ...".
         assert_eq!(format_chat_vector_line(&msg), "user: Where's the doctor?");

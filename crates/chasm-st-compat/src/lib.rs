@@ -895,6 +895,19 @@ fn message_is_interstitial(message: &STJsonlChatMessage) -> bool {
         .unwrap_or(false)
 }
 
+/// True when a persisted world line is an EPHEMERAL read (a search/scan/find_action
+/// result). The generation path stamps `extra.chasm.ephemeral = true` on these so
+/// the UI still shows them but the prompt builder drops them from every later turn
+/// (they are stale by then). Only action beats persist across turns.
+fn message_is_ephemeral(message: &STJsonlChatMessage) -> bool {
+    message
+        .extra
+        .get("chasm")
+        .and_then(|blob| blob.get("ephemeral"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Parses an array of injected-entry objects, skipping anything that isn't an
 /// object. Each field defaults to empty so a partial record still renders.
 fn parse_injected_entries(value: Option<&Value>) -> Vec<InjectedEntryView> {
@@ -1083,6 +1096,7 @@ fn to_message_view(
         combat_with,
         interstitial: message_is_interstitial(message),
         witnessed,
+        ephemeral: message_is_ephemeral(message),
     }
 }
 
@@ -1120,6 +1134,7 @@ fn to_fallback_message_view(index: usize, message: &STJsonlChatMessage) -> Messa
         combat_with,
         interstitial: message_is_interstitial(message),
         witnessed,
+        ephemeral: message_is_ephemeral(message),
     }
 }
 
