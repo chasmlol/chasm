@@ -2700,6 +2700,7 @@ mod tests {
             in_combat: false,
             combat_with: Vec::new(),
             interstitial: false,
+            witnessed: false,
         };
         // Empty name + player role => "user: ...".
         assert_eq!(format_chat_vector_line(&msg), "user: Where's the doctor?");
