@@ -181,6 +181,18 @@ fn normalize_event(raw: &Value, seq: u64, now: &str) -> Option<Value> {
             out.insert("actors".into(), json!(actors));
         }
     }
+    // Who actually WITNESSED the event (stamped by witness::annotate_witnessed_by
+    // at ingest — the effective list after the sight/subject/scope filters). An
+    // empty array is meaningful: it happened, and nobody saw it.
+    if let Some(witnessed) = obj.get("witnessedBy").and_then(Value::as_array) {
+        let witnessed: Vec<Value> = witnessed
+            .iter()
+            .filter(|w| w.is_string())
+            .take(16)
+            .cloned()
+            .collect();
+        out.insert("witnessedBy".into(), json!(witnessed));
+    }
     if let Some(data) = obj.get("data").filter(|d| d.is_object()) {
         out.insert("data".into(), data.clone());
     }
@@ -190,6 +202,19 @@ fn normalize_event(raw: &Value, seq: u64, now: &str) -> Option<Value> {
 /// Append a batch to the current log. Dedups by event id against the existing
 /// log, assigns `seq`, and returns the number of events actually appended.
 pub(crate) fn append_events(data_root: &Path, incoming: &[Value]) -> anyhow::Result<usize> {
+    Ok(append_events_detailed(data_root, incoming)?.len())
+}
+
+/// [`append_events`], returning the RAW incoming events that were actually
+/// appended (post-dedup, pre-normalize). This is the witness fan-out's input:
+/// raw events still carry the plugin's `witnesses` field, which `normalize_event`
+/// deliberately drops so the stored log stays byte-compatible — and because only
+/// newly-appended events are returned, a redelivered bridge batch can never
+/// fan out (and double-insert history lines) twice.
+pub(crate) fn append_events_detailed(
+    data_root: &Path,
+    incoming: &[Value],
+) -> anyhow::Result<Vec<Value>> {
     let path = current_file(data_root);
     let mut events = read_events_file(&path);
     let mut seen: HashSet<String> = events
@@ -203,7 +228,7 @@ pub(crate) fn append_events(data_root: &Path, incoming: &[Value]) -> anyhow::Res
         .map(|s| s + 1)
         .unwrap_or(1);
     let now = now_iso();
-    let mut appended = 0usize;
+    let mut appended: Vec<Value> = Vec::new();
     for raw in incoming.iter().take(MAX_BATCH_EVENTS) {
         let Some(event) = normalize_event(raw, next_seq, &now) else {
             continue;
@@ -213,17 +238,37 @@ pub(crate) fn append_events(data_root: &Path, incoming: &[Value]) -> anyhow::Res
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        if !id.is_empty() && !seen.insert(id) {
+        if !id.is_empty() && !seen.insert(id.clone()) {
             continue; // Redelivered batch — already logged.
         }
         events.push(event);
         next_seq += 1;
-        appended += 1;
+        // Hand back the raw event, but with the normalized id (raw events may
+        // arrive without one) so downstream consumers key on the stored id.
+        let mut raw_out = raw.clone();
+        if let Some(map) = raw_out.as_object_mut() {
+            map.insert("id".into(), json!(id));
+        }
+        appended.push(raw_out);
     }
-    if appended > 0 {
+    if !appended.is_empty() {
         write_events_file(&path, &events)?;
     }
     Ok(appended)
+}
+
+/// The distinct event `type`s present in the current log, for the Triggers
+/// page's dynamic catalog union (future plugin types appear automatically).
+pub(crate) fn observed_event_types(data_root: &Path) -> Vec<String> {
+    let mut types: Vec<String> = read_events_file(&current_file(data_root))
+        .iter()
+        .filter_map(|e| e.get("type").and_then(Value::as_str))
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    types.sort();
+    types.dedup();
+    types
 }
 
 // ---------------------------------------------------------------------------
@@ -310,10 +355,33 @@ pub async fn ingest_events(
         return Err(web_err("body.events must be an array."));
     };
     let data_root = state.config.active_profile_paths().content_root();
-    let appended = tokio::task::spawn_blocking(move || append_events(&data_root, &events))
-        .await
-        .map_err(|e| web_err(e.to_string()))??;
-    Ok(Json(json!({ "status": "ok", "appended": appended })))
+    let appended = tokio::task::spawn_blocking(move || {
+        // Stamp each event's EFFECTIVE witnesses (post sight/subject/scope
+        // filtering) before it is stored, so the Events page can show who saw
+        // what — including "nobody" when the player was hidden.
+        let settings = crate::witness::read_trigger_settings(&data_root);
+        let mut events = events;
+        for event in &mut events {
+            crate::witness::annotate_witnessed_by(&settings, event);
+        }
+        append_events_detailed(&data_root, &events)
+    })
+    .await
+    .map_err(|e| web_err(e.to_string()))??;
+    // Witness fan-out (crate::witness): each newly-appended event that carries a
+    // `witnesses` list is bundled into those NPCs' pending narration. Post-dedup
+    // by construction (only appended events reach here), so redelivered batches
+    // never double-insert. Best-effort: a fan-out failure never fails ingest.
+    if !appended.is_empty() {
+        let count = appended.len();
+        let fan_state = Arc::clone(&state);
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::witness::fan_out_events(&fan_state, &appended)
+        })
+        .await;
+        return Ok(Json(json!({ "status": "ok", "appended": count })));
+    }
+    Ok(Json(json!({ "status": "ok", "appended": 0 })))
 }
 
 /// `GET /api/ui/v1/events` — the Events page projection: the current log's
@@ -388,6 +456,52 @@ mod tests {
         let seqs: Vec<u64> = events.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
         assert_eq!(seqs, vec![1, 2, 3]);
         assert_eq!(summaries(root.path()), vec!["First", "Second", "Third"]);
+    }
+
+    /// The witness fan-out consumes `append_events_detailed`'s return value:
+    /// only NEWLY appended events come back (a redelivered batch fans out
+    /// nothing — history lines can never double-insert), the raw `witnesses`
+    /// field survives on them, and the STORED events never carry it (the
+    /// on-disk log stays byte-compatible).
+    #[test]
+    fn append_detailed_returns_only_new_events_with_witnesses() {
+        let root = TempRoot::new("witness-fanout");
+        let incoming = json!({
+            "id": "w1",
+            "type": "item",
+            "summary": "Picked up 3 items",
+            "witnesses": ["easy_pete", "companion:0"],
+        });
+        let appended = append_events_detailed(root.path(), &[incoming.clone()]).unwrap();
+        assert_eq!(appended.len(), 1);
+        assert_eq!(appended[0]["witnesses"], json!(["easy_pete", "companion:0"]));
+
+        // Redelivery (bridge crash between POST and archive): nothing to fan out.
+        let redelivered = append_events_detailed(root.path(), &[incoming]).unwrap();
+        assert!(redelivered.is_empty());
+
+        // The stored log never carries the raw capture fields…
+        let stored = &read_events_file(&current_file(root.path()))[0];
+        assert!(stored.get("witnesses").is_none());
+        assert_eq!(stored["summary"], "Picked up 3 items");
+    }
+
+    /// …but the ingest-stamped EFFECTIVE list (`witnessedBy`) IS stored, so
+    /// the Events page can show who saw each event.
+    #[test]
+    fn append_keeps_the_witnessed_by_annotation() {
+        let root = TempRoot::new("witnessedby");
+        let incoming = json!({
+            "id": "w2",
+            "type": "theft",
+            "summary": "Stole a thing",
+            "witnesses": ["easy_pete"],
+            "witnessedBy": ["easy_pete"],
+        });
+        append_events_detailed(root.path(), &[incoming]).unwrap();
+        let stored = &read_events_file(&current_file(root.path()))[0];
+        assert_eq!(stored["witnessedBy"], json!(["easy_pete"]));
+        assert!(stored.get("witnesses").is_none(), "raw capture list still dropped");
     }
 
     #[test]

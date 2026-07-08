@@ -145,6 +145,9 @@ pub(crate) struct UiChatMessage {
     pub in_combat: bool,
     /// Display names of who the NPC was fighting this turn (empty unless in combat).
     pub combat_with: Vec<String>,
+    /// `true` for witnessed-event narration lines (the event-log witness
+    /// fan-out), so the UI renders them dim/italic instead of as dialogue.
+    pub witnessed: bool,
 }
 
 /// One NPC conversation thread (everything addressed to / spoken by one NPC).
@@ -251,7 +254,8 @@ fn project_message(message: &MessageView) -> UiChatMessage {
         // Interstitial speech fragments (a line said mid-loop) intentionally
         // carry no context - it rides the canonical turn message - so they must
         // not render as "no turn context recorded".
-        && !message.interstitial;
+        && !message.interstitial
+        && !message.witnessed;
 
     UiChatMessage {
         id: message.id.clone(),
@@ -268,6 +272,7 @@ fn project_message(message: &MessageView) -> UiChatMessage {
         no_context,
         in_combat: message.in_combat,
         combat_with: message.combat_with.clone(),
+        witnessed: message.witnessed,
     }
 }
 

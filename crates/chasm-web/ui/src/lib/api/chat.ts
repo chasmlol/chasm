@@ -61,6 +61,8 @@ export interface ChatMessageDto {
   in_combat: boolean;
   /** Display names of who the NPC was fighting this turn (empty unless in combat). */
   combat_with: string[];
+  /** True for witnessed-event narration lines (rendered dim/italic, not as dialogue). */
+  witnessed: boolean;
 }
 
 /** One NPC conversation thread (everything spoken by / to one NPC). */

@@ -244,6 +244,11 @@ pub async fn generate_stream_core(
     let ctx = resolve_turn_context(&state, &id, &body)?;
     trace_generate_stage(trace_id.as_deref(), "gen_ctx_resolved");
 
+    // Flush pending witnessed-event bundles for this chat's participants FIRST,
+    // so every narration line lands in history BEFORE the player's new message
+    // (the NPC reads events-then-question, in the order they happened).
+    crate::witness::flush_for_live_chat(&state, &ctx.live_chat);
+
     // Persist the player message immediately (mirrors the Node append-user step
     // that happens before speaker selection).
     if !ctx.message.is_empty() {
@@ -649,6 +654,10 @@ pub async fn generate(
     let ctx = resolve_turn_context(&state, &id, &body)?;
     trace_generate_stage(trace_id.as_deref(), "gen_ctx_resolved");
 
+    // Witnessed-event narration flushes before the player line (see the
+    // streaming path for the ordering rationale).
+    crate::witness::flush_for_live_chat(&state, &ctx.live_chat);
+
     // Persist the player message once (before speaker selection, like Node).
     if !ctx.message.is_empty() {
         persist_player_message_ctx(&state, &ctx)?;
@@ -745,6 +754,11 @@ struct TurnContext {
     /// Global orchestrator knobs (enabled / max_speakers / temperature / prompt),
     /// loaded from `AppSettings` at request time.
     orchestrator: orchestrator::OrchestratorSettings,
+    /// Witness-trigger reaction turn (`body.reaction.narration`): the NPC speaks
+    /// unprompted about what they just saw. The narration line itself is already
+    /// in history (flushed before the reaction was enqueued); this carries it
+    /// again for the depth-1 directive. `None` on ordinary turns.
+    reaction: Option<String>,
 }
 
 /// Whether a turn's requested action-book scopes mark it as the admin/gamemaster
@@ -1014,6 +1028,18 @@ fn resolve_turn_context(state: &Arc<AppState>, id: &str, body: &Value) -> WebRes
     let scenario_template = global_scenario_template(state);
     let scenario_variants = global_scenario_variants(state);
 
+    // Witness-trigger reaction marker: `{ "reaction": { "narration": "…" } }`
+    // (or a bare string). Regular turns don't carry it.
+    let reaction = body.get("reaction").and_then(|reaction| {
+        reaction
+            .get("narration")
+            .and_then(Value::as_str)
+            .or_else(|| reaction.as_str())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    });
+
     Ok(TurnContext {
         live_chat,
         segment,
@@ -1029,6 +1055,7 @@ fn resolve_turn_context(state: &Arc<AppState>, id: &str, body: &Value) -> WebRes
         scenario_variants,
         requested_scopes: parse_action_book_scopes(body),
         orchestrator,
+        reaction,
     })
 }
 
@@ -1226,6 +1253,26 @@ fn format_combat_directive(names: &[String], player_name: &str) -> String {
          snapping out threats or orders. Keep it SHORT, loud, and frantic. Never be calm, polite, \
          measured, or chatty. You are ALREADY fighting — do NOT choose an attack action; express the \
          fight in your words."
+    )
+}
+
+/// The witness-reaction directive — injected at depth 1 (like the combat
+/// directive) on a trigger-fired reaction turn: the NPC speaks UNPROMPTED about
+/// something they just watched happen. The witnessed narration is already the
+/// last line of history; this tells the model that line is what to react to.
+fn format_witness_reaction_directive(narration: &str, player_name: &str) -> String {
+    let player = if player_name.trim().is_empty() {
+        "the player".to_string()
+    } else {
+        player_name.trim().to_string()
+    };
+    format!(
+        "This just happened, moments ago:\n{narration}\n\
+         Nobody spoke to you — you are speaking up on your own. Say one or two SHORT spoken \
+         sentences in your own voice about it: comment, question, announce yourself, or \
+         challenge {player}, exactly as your character honestly would. Do not narrate or \
+         describe the scene; just speak. If it changes how you feel about {player}, let \
+         that show."
     )
 }
 
@@ -1577,6 +1624,27 @@ fn prepare_speaker_turn_traced(
         });
     }
 
+    // Witness-trigger reaction turn: a depth-1 directive telling the NPC to
+    // speak unprompted about the (already-persisted) narration line. Same
+    // injection mechanics as the combat directive above.
+    if let Some(narration) = &ctx.reaction {
+        let player_name = ctx.scenario_macros.get("player_name").map_or("", String::as_str);
+        let directive = format_witness_reaction_directive(narration, player_name);
+        let char_count = directive.chars().count();
+        assembled.components.push(chasm_core::PromptComponentView {
+            order: assembled.components.len(),
+            group: "system".to_string(),
+            key: "witness_reaction".to_string(),
+            label: "Witness reaction".to_string(),
+            role: "system".to_string(),
+            status: "included".to_string(),
+            note: "Depth-1 reaction directive for a witnessed-event trigger turn (event-driven)."
+                .to_string(),
+            content: directive,
+            char_count,
+        });
+    }
+
     let scene_roster = build_scene_roster(state, ctx, &speaker_participant_id, &speaker_name);
     let query_instruction =
         chasm_prompt::npc_actions_instruction(&action_book_entries(state), &ctx.requested_scopes);
@@ -1853,9 +1921,10 @@ fn build_chat_messages(
         .filter(included)
         .filter(|component| !VOLATILE_KEYS.contains(&component.key.as_str()))
         .filter(|component| component.key != "player_persona")
-        // The combat directive is per-turn state injected at depth 1 (below): keep
-        // it OUT of the cached head like the persona.
+        // The combat + witness-reaction directives are per-turn state injected
+        // at depth 1 (below): keep them OUT of the cached head like the persona.
         .filter(|component| component.key != "combat_alert")
+        .filter(|component| component.key != "witness_reaction")
         .map(|component| component.content.clone())
         .collect();
     // The combat directive, injected at depth 1 DEAD LAST (see below) when the NPC
@@ -1865,6 +1934,17 @@ fn build_chat_messages(
         .iter()
         .find(|component| {
             component.key == "combat_alert"
+                && component.status == "included"
+                && !component.content.is_empty()
+        })
+        .map(|component| component.content.clone());
+    // The witness-reaction directive, depth-1 next to the persona (below) on a
+    // trigger-fired reaction turn. `None` on ordinary turns.
+    let witness_reaction: Option<String> = assembled
+        .components
+        .iter()
+        .find(|component| {
+            component.key == "witness_reaction"
                 && component.status == "included"
                 && !component.content.is_empty()
         })
@@ -2091,6 +2171,19 @@ fn build_chat_messages(
         let msg = json!({ "role": "system", "content": note });
         let insert_at = if messages.len() > 1 { messages.len() - 1 } else { messages.len() };
         messages.insert(insert_at, msg);
+    }
+
+    // Witness-reaction directive, depth-1 right before the persona: on a
+    // reaction turn the newest history line IS the witnessed narration, so this
+    // lands directly next to what the NPC is reacting to.
+    if let Some(witness_reaction) = witness_reaction {
+        let reaction_message = json!({ "role": "system", "content": witness_reaction });
+        let insert_at = if messages.len() > 1 {
+            messages.len() - 1
+        } else {
+            messages.len()
+        };
+        messages.insert(insert_at, reaction_message);
     }
 
     // Player persona LAST, so it lands closest to the newest player line — the
@@ -4412,6 +4505,7 @@ fn admin_message_view(index: usize, message: &STJsonlChatMessage) -> MessageView
         in_combat: false,
         combat_with: Vec::new(),
         interstitial: false,
+        witnessed: false,
     }
 }
 

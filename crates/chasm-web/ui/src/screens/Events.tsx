@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { History, Loader2, Search } from "lucide-react";
+import { Eye, EyeOff, History, Loader2, Search } from "lucide-react";
 
 import { eventsApi, type EventDto } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -16,8 +16,20 @@ const EVENT_TYPE_ORDER = [
   "combat",
   "shooting",
   "death",
+  "murder",
+  "theft",
+  "pickpocket",
+  "lockpick",
+  "hacking",
+  "weapon",
+  "sneak",
   "location",
+  "arrival",
   "item",
+  "trade",
+  "repair",
+  "injury",
+  "rads",
   "conversation",
   "quest",
   "level",
@@ -40,9 +52,24 @@ const TYPE_BADGE: Record<string, string> = {
     "border-[var(--color-danger)]/40 bg-[var(--color-danger)]/10 text-[var(--color-danger)]",
   location:
     "border-[var(--color-accent)]/40 bg-[var(--color-accent)]/10 text-[var(--color-accent)]",
+  arrival:
+    "border-[var(--color-accent)]/30 bg-[var(--color-accent)]/5 text-[var(--color-accent)]",
   item: "border-[var(--color-npc)]/40 bg-[var(--color-npc)]/10 text-[var(--color-npc)]",
   conversation:
     "border-[var(--color-player)]/40 bg-[var(--color-player)]/10 text-[var(--color-player)]",
+  // Crime beats read red like combat; skill beats take the accent tint.
+  murder:
+    "border-[var(--color-danger)]/40 bg-[var(--color-danger)]/10 text-[var(--color-danger)]",
+  theft:
+    "border-[var(--color-danger)]/30 bg-[var(--color-danger)]/5 text-[var(--color-danger)]",
+  pickpocket:
+    "border-[var(--color-danger)]/30 bg-[var(--color-danger)]/5 text-[var(--color-danger)]",
+  lockpick:
+    "border-[var(--color-accent)]/40 bg-[var(--color-accent)]/10 text-[var(--color-accent)]",
+  hacking:
+    "border-[var(--color-accent)]/40 bg-[var(--color-accent)]/10 text-[var(--color-accent)]",
+  trade:
+    "border-[var(--color-npc)]/30 bg-[var(--color-npc)]/5 text-[var(--color-npc)]",
 };
 
 /** In-game clock when we have it; otherwise a short wall-clock fallback. */
@@ -58,10 +85,28 @@ function eventWhen(event: EventDto): string {
   });
 }
 
+/** Pretty display name for a native NPC witness key: "easy_pete" → "Easy
+ *  Pete", "companion:3" → "Companion 3", ref-scoped suffixes dropped. */
+function witnessLabel(key: string): string {
+  const companion = key.match(/^companion:(\d+)$/);
+  if (companion) return `Companion ${companion[1]}`;
+  return key
+    .replace(/__ref_[0-9a-f]+$/i, "")
+    .split("_")
+    .map((word) => (word ? word[0].toUpperCase() + word.slice(1) : word))
+    .join(" ");
+}
+
 function matchesSearch(event: EventDto, needle: string): boolean {
   if (!needle) return true;
   if (event.summary.toLowerCase().includes(needle)) return true;
   if (event.location?.toLowerCase().includes(needle)) return true;
+  if (
+    (event.witnessedBy ?? []).some((key) =>
+      witnessLabel(key).toLowerCase().includes(needle),
+    )
+  )
+    return true;
   return (event.actors ?? []).some((actor) =>
     actor.name.toLowerCase().includes(needle),
   );
@@ -120,6 +165,26 @@ function EventRow({ event }: { event: EventDto }) {
       <span className="min-w-0 flex-1 truncate text-sm" title={event.summary}>
         {event.summary}
       </span>
+      {event.witnessedBy &&
+        (event.witnessedBy.length > 0 ? (
+          <span
+            className="flex max-w-56 shrink-0 items-center gap-1 text-xs text-[var(--muted-foreground)]"
+            title={`Witnessed by ${event.witnessedBy.map(witnessLabel).join(", ")}`}
+          >
+            <Eye className="size-3.5 shrink-0" />
+            <span className="truncate">
+              {event.witnessedBy.map(witnessLabel).join(", ")}
+            </span>
+          </span>
+        ) : (
+          <span
+            className="flex shrink-0 items-center gap-1 text-xs text-[var(--muted-foreground)] opacity-60"
+            title="Nobody witnessed this (out of range, or you were hidden)"
+          >
+            <EyeOff className="size-3.5 shrink-0" />
+            unseen
+          </span>
+        ))}
       {event.location && (
         <span
           className="max-w-48 shrink-0 truncate text-xs text-[var(--muted-foreground)]"

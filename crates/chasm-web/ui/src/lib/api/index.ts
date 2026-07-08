@@ -27,6 +27,7 @@ export * from "./relationships";
 export * from "./events";
 export * from "./scheduler";
 export * from "./travel";
+export * from "./triggers";
 
 import { systemApi } from "./system";
 import { booksApi } from "./books";
@@ -43,6 +44,7 @@ import { relationshipsApi } from "./relationships";
 import { eventsApi } from "./events";
 import { schedulerApi } from "./scheduler";
 import { travelApi } from "./travel";
+import { triggersApi } from "./triggers";
 
 export {
   systemApi,
@@ -60,6 +62,7 @@ export {
   eventsApi,
   schedulerApi,
   travelApi,
+  triggersApi,
 };
 
 /**
@@ -83,4 +86,5 @@ export const api = {
   events: eventsApi,
   scheduler: schedulerApi,
   travel: travelApi,
+  triggers: triggersApi,
 };

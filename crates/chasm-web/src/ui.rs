@@ -166,6 +166,10 @@ pub(crate) fn api_router() -> Router<Arc<AppState>> {
         // crate::event_log next to save_sync, so the handler is registered from
         // there like the trace viewer below) -----------------------------------
         .route("/events", get(crate::event_log::events_view))
+        // --- triggers (witness-memory + reaction triggers; the fan-out lives in
+        // crate::witness next to event_log — this is its settings round-trip) ---
+        .route("/triggers", get(crate::witness::triggers_view))
+        .route("/triggers/save", post(crate::witness::triggers_save))
         // --- scheduler (NPC "cronjob" tasks: read-only list + cancel + a test
         // hook to raise a condition flag; the in-game clock rides the view) -----
         .route("/scheduler", get(scheduler::list_scheduler))

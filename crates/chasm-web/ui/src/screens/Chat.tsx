@@ -10,6 +10,7 @@ import {
   AlertCircle,
   AlertTriangle,
   Search,
+  Eye,
 } from "lucide-react";
 
 import {
@@ -397,6 +398,30 @@ function MessageRow({ message }: { message: ChatMessageDto }) {
   const isPlayer = message.role === "player";
   const isSystem = message.role === "system";
   const isWorld = message.role === "world";
+
+  // Witnessed-event narration (the event-log witness fan-out): a subtle
+  // stage-direction line, not a dialogue bubble — the NPC SAW this happen;
+  // nobody spoke it.
+  if (message.witnessed) {
+    return (
+      <li className="flex gap-3">
+        <span
+          className="mt-0.5 grid size-8 shrink-0 place-items-center rounded-full text-[var(--muted-foreground)] opacity-60"
+          title="Witnessed by this character"
+        >
+          <Eye className="size-4" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div
+            className="mt-1.5 whitespace-pre-wrap text-[13px] italic leading-relaxed text-[var(--muted-foreground)]"
+            title={message.timestamp}
+          >
+            {message.text}
+          </div>
+        </div>
+      </li>
+    );
+  }
   return (
     <li className="flex gap-3">
       <span

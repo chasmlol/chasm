@@ -834,9 +834,9 @@ fn extract_live_metadata(message: &STJsonlChatMessage) -> Option<HeadlessLiveMet
 /// `(None, [])` so pre-feature messages render as "no data recorded".
 fn extract_chasm_metadata(
     message: &STJsonlChatMessage,
-) -> (Option<InjectedView>, Vec<ActionView>, bool, Vec<String>) {
+) -> (Option<InjectedView>, Vec<ActionView>, bool, Vec<String>, bool) {
     let Some(blob) = message.extra.get("chasm") else {
-        return (None, Vec::new(), false, Vec::new());
+        return (None, Vec::new(), false, Vec::new(), false);
     };
 
     let injected = blob.get("injected").map(|injected| InjectedView {
@@ -872,7 +872,13 @@ fn extract_chasm_metadata(
         })
         .unwrap_or_default();
 
-    (injected, turn_actions, in_combat, combat_with)
+    // Witnessed-event narration marker (set by the event-log witness fan-out).
+    let witnessed = blob
+        .get("witnessed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    (injected, turn_actions, in_combat, combat_with, witnessed)
 }
 
 /// True when a persisted message is an interstitial speech fragment (a line the
@@ -1042,7 +1048,8 @@ fn to_message_view(
     live: &HeadlessLiveMetadata,
     visible_reason: String,
 ) -> MessageView {
-    let (injected, turn_actions, in_combat, combat_with) = extract_chasm_metadata(message);
+    let (injected, turn_actions, in_combat, combat_with, witnessed) =
+        extract_chasm_metadata(message);
     MessageView {
         id: format!("m_{index}"),
         role: role_for_message(message).to_string(),
@@ -1075,11 +1082,13 @@ fn to_message_view(
         in_combat,
         combat_with,
         interstitial: message_is_interstitial(message),
+        witnessed,
     }
 }
 
 fn to_fallback_message_view(index: usize, message: &STJsonlChatMessage) -> MessageView {
-    let (injected, turn_actions, in_combat, combat_with) = extract_chasm_metadata(message);
+    let (injected, turn_actions, in_combat, combat_with, witnessed) =
+        extract_chasm_metadata(message);
     MessageView {
         id: format!("m_{index}"),
         role: role_for_message(message).to_string(),
@@ -1110,6 +1119,7 @@ fn to_fallback_message_view(index: usize, message: &STJsonlChatMessage) -> Messa
         in_combat,
         combat_with,
         interstitial: message_is_interstitial(message),
+        witnessed,
     }
 }
 

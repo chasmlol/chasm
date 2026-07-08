@@ -671,6 +671,17 @@ fn advance_journey(state: &AppState, journey: &Journey, now: f64) -> Option<Jour
                 LINGER_HOURS
             );
         }
+        // Witness system: the traveler remembers the trip ("You have traveled
+        // to…"), the Events page gets an `arrival` row, and — when `arrival`
+        // is trigger-enabled — they announce themselves. Best-effort; never
+        // blocks the journey completing.
+        crate::witness::on_npc_travel_completed(
+            state,
+            &journey.npc_key,
+            &journey.npc_name,
+            &journey.dest_name,
+            to_player,
+        );
         return Some(updated);
     }
 

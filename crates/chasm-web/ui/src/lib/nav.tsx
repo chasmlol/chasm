@@ -26,6 +26,7 @@ import {
   Keyboard,
   Activity,
   Download,
+  Zap,
 } from "lucide-react";
 
 // ===========================================================================
@@ -82,6 +83,12 @@ export const NAV_GROUPS: NavGroup[] = [
         label: "Events",
         path: "events",
         icon: History,
+      },
+      {
+        key: "triggers",
+        label: "Triggers",
+        path: "triggers",
+        icon: Zap,
       },
       {
         key: "gamestate",

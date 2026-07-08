@@ -353,6 +353,11 @@ pub struct MessageView {
     /// recorded" note. `false` for full turns and pre-feature messages.
     #[serde(default)]
     pub interstitial: bool,
+    /// `true` for witnessed-event narration lines the event-log fan-out inserts
+    /// into an NPC's history (from `extra.chasm.witnessed`), so the chat UI can
+    /// render them as dim narration instead of spoken dialogue.
+    #[serde(default)]
+    pub witnessed: bool,
 }
 
 /// One lore/quest/action entry that was injected into a single turn's prompt,

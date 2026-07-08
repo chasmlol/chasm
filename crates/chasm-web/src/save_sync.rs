@@ -1809,6 +1809,10 @@ fn handle_save_sync_event(
         // In-flight action loops belong to the old timeline (the plugin cleared
         // its loot/event state too) - drop the carried toolsets.
         crate::generate::clear_active_toolsets();
+        // Pending (not yet flushed) witnessed-event bundles belong to the
+        // just-abandoned timeline; already-flushed lines rolled back with the
+        // chat checkpoint above.
+        crate::witness::clear_pending();
         return Ok(result);
     }
 

@@ -62,6 +62,7 @@ mod trace_routes;
 mod tts_api;
 mod ui;
 mod warmup;
+mod witness;
 
 pub struct AppState {
     pub config: AppConfig,
@@ -396,6 +397,16 @@ pub fn router(config: AppConfig) -> Router {
             }
         }
 
+        // Seed the bridge triggers file too (control/triggers.cfg), so the
+        // plugin knows which event types are instant/trigger-enabled even if
+        // the Triggers screen is never opened this session (saves rewrite it;
+        // see witness::triggers_save).
+        {
+            let data_root = state.config.active_profile_paths().content_root();
+            let trigger_settings = witness::read_trigger_settings(&data_root);
+            witness::push_trigger_config(&state, &trigger_settings);
+        }
+
         let bridge_state = Arc::clone(&state);
         tokio::spawn(async move {
             fnv_bridge::spawn_in_process(bridge_state).await;
@@ -455,6 +466,19 @@ pub fn router(config: AppConfig) -> Router {
                 ticker.tick().await;
                 let s = Arc::clone(&movement_state);
                 let _ = tokio::task::spawn_blocking(move || movement::tick(&s)).await;
+            }
+        });
+
+        // Witness-memory tick: flush pending witnessed-event bundles into NPC
+        // chat histories once they go quiet (see crate::witness). Same shape as
+        // the scheduler/movement ticks; fire-and-forget.
+        let witness_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                ticker.tick().await;
+                let s = Arc::clone(&witness_state);
+                let _ = tokio::task::spawn_blocking(move || witness::tick(&s)).await;
             }
         });
     }
@@ -3936,6 +3960,7 @@ mod tests {
             in_combat: false,
             combat_with: Vec::new(),
             interstitial: false,
+            witnessed: false,
         }
     }
 

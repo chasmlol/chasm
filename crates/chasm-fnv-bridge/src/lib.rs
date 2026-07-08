@@ -330,6 +330,13 @@ async fn run_turn(
 
     let admin = admin::is_admin_request(request);
     let distance_meters = npc::native_distance_meters(request);
+    // Witness-trigger reaction turn (metadata `reaction`, relayed by the plugin
+    // from the chasm-written control/reactions queue). Computed up front: it
+    // bypasses the empty-message placeholder AND the distance gate below.
+    let is_reaction = request
+        .metadata
+        .get("reaction")
+        .is_some_and(|reaction| reaction.is_object());
 
     // Per-turn stage trace (Settings → Tracing waterfall). Best-effort and
     // clock-local to this turn; see `trace.rs`. Makes first-vs-later-turn cost
@@ -344,8 +351,12 @@ async fn run_turn(
         }),
     );
 
-    // Distance gate — skipped for admin (Todd is heard from anywhere).
-    if !admin && distance_meters.is_finite() && distance_meters > config.native_max_distance_meters {
+    // Distance gate — skipped for admin (Todd is heard from anywhere) and for
+    // witness reactions: the witness radius (12m) is wider than the speaking
+    // gate (10m), and the NPC may have drifted a step between witnessing and
+    // the queue being consumed — rejecting the turn here silently ate valid
+    // reactions. Positional TTS handles the extra distance naturally.
+    if !admin && !is_reaction && distance_meters.is_finite() && distance_meters > config.native_max_distance_meters {
         let resp = OutgoingResponse {
             status: "0".into(),
             error: format!(
@@ -370,9 +381,11 @@ async fn run_turn(
         );
     }
     let message = message.trim().to_string();
-    // An errand-completion turn is DELIBERATELY message-less: the mod files it
-    // when the NPC finishes a job, and the pending errand report (injected
-    // depth-1 by chasm) does the prompting. Empty messages are neither
+    // An errand-completion or world-event turn is DELIBERATELY message-less: the
+    // mod files it when the NPC finishes a job or a world event fires, and the
+    // pending report/event (injected depth-1 by chasm) does the prompting. A
+    // reaction turn likewise carries no player text — the NPC speaks unprompted
+    // about the narration already in their history. Empty messages are neither
     // persisted nor appended to the prompt, so nothing fake enters history.
     let flag = |key: &str| {
         request
@@ -382,7 +395,7 @@ async fn run_turn(
             .unwrap_or(false)
     };
     let synthetic = flag("errand_completion") || flag("world_event");
-    if message.is_empty() && !synthetic {
+    if message.is_empty() && !synthetic && !is_reaction {
         write_placeholder(sink, request)?;
         trace.stage("final_response_written");
         return Ok(());
@@ -1021,8 +1034,22 @@ fn generate_body(
     location: &str,
 ) -> Value {
     let scopes = actions::action_book_scopes(config, &request.npc_key, location);
+    // Witness-trigger reaction turn: forward the reaction block (chasm injects
+    // the depth-1 directive from it) and force the witnessing NPC as the
+    // speaker — a reaction is that ONE NPC speaking, never an orchestrated
+    // group turn. Absent (null) on ordinary turns, which is how chasm-web's
+    // optional readers treat "no reaction".
+    let reaction = request.metadata.get("reaction").filter(|r| r.is_object());
+    let force_participant_id = reaction.and_then(|_| {
+        participants
+            .iter()
+            .find(|p| p.native_npc_key == request.npc_key)
+            .map(|p| p.participant_id.clone())
+    });
     json!({
         "message": message,
+        "reaction": reaction.cloned().unwrap_or(Value::Null),
+        "forceParticipantId": force_participant_id,
         // The game request's trace id, so the generate pipeline can correlate the
         // LLM usage/timings capture (tokens/sec, prompt_ms) to this request's
         // trace even on the in-process path where no HTTP header exists.
@@ -1590,5 +1617,59 @@ mod turn_body_tests {
             "Goodsprings",
         );
         assert_eq!(body["metadata"]["npcState"], json!({}));
+    }
+
+    /// A witness-trigger reaction request (metadata `reaction`) must forward the
+    /// reaction block AND force the witnessing NPC as the speaker; ordinary
+    /// turns carry both as null so chasm-web's optional readers ignore them.
+    #[test]
+    fn generate_body_forwards_reaction_and_forces_the_witness() {
+        let config = default_config();
+        let mut request = NativeRequest {
+            request_id: "req_reaction_1".to_string(),
+            npc_key: "easy_pete".to_string(),
+            ..Default::default()
+        };
+        request.metadata.insert(
+            "reaction".to_string(),
+            json!({ "narration": "The Courier unequipped their Vault 21 jumpsuit" }),
+        );
+        let witness = npc::NpcParticipant {
+            participant_id: "npc:easy_pete".to_string(),
+            character_id: "Easy Pete".to_string(),
+            character_name: "Easy Pete".to_string(),
+            native_npc_key: "easy_pete".to_string(),
+            native_npc_name: "Easy Pete".to_string(),
+            voice_type_key: String::new(),
+            voice_type_name: String::new(),
+            distance_meters: Some(3.0),
+            distance_game_units: Some(210.0),
+            under_crosshair: false,
+        };
+        let body = generate_body(
+            &config,
+            &request,
+            "",
+            &json!({}),
+            &[witness],
+            3.0,
+            210.0,
+            "Goodsprings",
+        );
+        assert_eq!(
+            body["reaction"]["narration"],
+            json!("The Courier unequipped their Vault 21 jumpsuit")
+        );
+        assert_eq!(body["forceParticipantId"], json!("npc:easy_pete"));
+
+        // Ordinary turn: both null.
+        let plain = NativeRequest {
+            request_id: "req_plain_1".to_string(),
+            npc_key: "easy_pete".to_string(),
+            ..Default::default()
+        };
+        let body = generate_body(&config, &plain, "Howdy.", &json!({}), &[], 2.0, 140.0, "Goodsprings");
+        assert_eq!(body["reaction"], Value::Null);
+        assert_eq!(body["forceParticipantId"], Value::Null);
     }
 }

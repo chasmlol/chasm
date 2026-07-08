@@ -26,6 +26,10 @@ export interface EventDto {
   gameDay?: number;
   location?: string;
   actors?: EventActorDto[];
+  /** Native NPC keys that actually WITNESSED the event (post sight/scope
+   *  filtering). Empty array = it happened unobserved; absent = an event from
+   *  before witness tracking. */
+  witnessedBy?: string[];
   data?: Record<string, unknown>;
 }
 
