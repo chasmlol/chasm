@@ -505,6 +505,48 @@ pub fn start_journey(
 /// One movement tick: advance every non-terminal journey against the in-game
 /// clock. Persists only if something changed. Never propagates a failure — a bad
 /// journey is marked `failed` and logged, the rest proceed.
+/// End a Lingering journey NOW (the errand chained on this journey finished -
+/// no reason to keep standing there). Returns true when one was released.
+pub fn finish_journey_linger(state: &AppState, npc: &str) -> bool {
+    let mut store = read_store(state);
+    let mut released = false;
+    for journey in store.journeys.iter_mut() {
+        if journey.state == JourneyState::Lingering
+            && (journey.npc_name.eq_ignore_ascii_case(npc) || journey.npc_key.eq_ignore_ascii_case(npc))
+        {
+            journey.state = JourneyState::Arrived;
+            let _ = emit_end_travel(state, journey);
+            tracing::info!("movement: {} released early from '{}' (errand done)", journey.npc_name, journey.dest_name);
+            released = true;
+        }
+    }
+    if released {
+        let _ = write_store(state, &store);
+    }
+    released
+}
+
+/// Cancel an active journey ("stop travelling"): mark it done and release the
+/// traveller to their own AI wherever they are. Returns true when one existed.
+pub fn cancel_journey(state: &AppState, npc: &str) -> bool {
+    let mut store = read_store(state);
+    let mut cancelled = false;
+    for journey in store.journeys.iter_mut() {
+        if !journey.state.is_terminal()
+            && (journey.npc_name.eq_ignore_ascii_case(npc) || journey.npc_key.eq_ignore_ascii_case(npc))
+        {
+            journey.state = JourneyState::Arrived;
+            let _ = emit_end_travel(state, journey);
+            tracing::info!("movement: journey to '{}' cancelled for {}", journey.dest_name, journey.npc_name);
+            cancelled = true;
+        }
+    }
+    if cancelled {
+        let _ = write_store(state, &store);
+    }
+    cancelled
+}
+
 pub fn tick(state: &AppState) {
     let mut store = read_store(state);
     if store.active_count() == 0 {
@@ -552,7 +594,8 @@ fn advance_journey(state: &AppState, journey: &Journey, now: f64) -> Option<Jour
         if now >= journey.linger_until {
             let mut updated = journey.clone();
             updated.state = JourneyState::Arrived;
-            tracing::info!("movement: {} finished waiting at '{}'", journey.npc_name, journey.dest_name);
+            let _ = emit_end_travel(state, journey);
+            tracing::info!("movement: {} finished waiting at '{}' - released to their own AI", journey.npc_name, journey.dest_name);
             return Some(updated);
         }
         let to_player = is_player_dest(&journey.dest_name);
@@ -607,9 +650,16 @@ fn advance_journey(state: &AppState, journey: &Journey, now: f64) -> Option<Jour
         if to_player {
             // Reached YOU — done; nothing to linger at.
             updated.state = JourneyState::Arrived;
+            let _ = emit_end_travel(state, journey);
+            emit_travel_event_turn(state, journey, "[You arrive back at the player.]");
             tracing::info!("movement: {} reached you", journey.npc_name);
         } else {
             // Reached a PLACE — wait there for the linger window before their AI reclaims them.
+            emit_travel_event_turn(
+                state,
+                journey,
+                &format!("[You arrive at {}.]", journey.dest_name),
+            );
             updated.state = JourneyState::Lingering;
             updated.linger_until = now + LINGER_HOURS;
             updated.arrived_inside = inside_destination; // hold them INSIDE, not at the entrance
@@ -626,6 +676,11 @@ fn advance_journey(state: &AppState, journey: &Journey, now: f64) -> Option<Jour
 
     // Failsafe: a long overrun with no arrival → give up (don't sit forever).
     if now >= journey.arrive_total_hours + MAX_OVERRUN_HOURS {
+        crate::generate::append_world_line(
+            state,
+            &journey.live_chat_id,
+            &format!("[You couldn't make it to {}.]", journey.dest_name),
+        );
         let mut updated = journey.clone();
         updated.state = JourneyState::Failed;
         updated.last_error = "target not reached".into();
@@ -747,6 +802,33 @@ fn emit_travel_step(
 /// Hold the NPC at the place they've arrived: re-apply the travel package (so their
 /// normal AI can't drag them off) WITHOUT the front-door step-out (`hold` tells the
 /// plugin to skip it, so an NPC waiting *inside* the saloon isn't shoved back out).
+/// Release the traveller back to their own AI: the plugin removes the travel
+/// package and re-evaluates, so a companion's follow package brings them back
+/// to the player and a villager's routine reclaims them. Without this, every
+/// finished journey left the package latched and the NPC stood at the
+/// destination FOREVER (observed live).
+/// An ARRIVAL goes back as a world-event TURN (via the plugin) so freeform
+/// "go there, then X" continues; failures are SILENT chat lines - he learns
+/// what happened, nothing invites an immediate retry loop.
+fn emit_travel_event_turn(state: &AppState, journey: &Journey, text: &str) {
+    let cmd = serde_json::json!({
+        "op": "world_event",
+        "npc_key": journey.npc_key,
+        "npc_name_base64": STANDARD.encode(journey.npc_name.as_bytes()),
+        "text_base64": STANDARD.encode(text.as_bytes()),
+    });
+    let _ = crate::scheduler::issue_companion_command(state, &cmd);
+}
+
+fn emit_end_travel(state: &AppState, journey: &Journey) -> anyhow::Result<()> {
+    let cmd = serde_json::json!({
+        "op": "end_travel",
+        "npc_key": journey.npc_key,
+        "npc_name_base64": STANDARD.encode(journey.npc_name.as_bytes()),
+    });
+    crate::scheduler::issue_companion_command(state, &cmd)
+}
+
 fn emit_hold(state: &AppState, journey: &Journey, to_player: bool) -> anyhow::Result<()> {
     // Hold target: if they walked INSIDE the building, keep the package pointed at the
     // interior door so they stay inside; otherwise the resolved destination.

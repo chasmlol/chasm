@@ -396,19 +396,22 @@ function MessageStream({ thread }: { thread: ChatThreadDto }) {
 function MessageRow({ message }: { message: ChatMessageDto }) {
   const isPlayer = message.role === "player";
   const isSystem = message.role === "system";
+  const isWorld = message.role === "world";
   return (
     <li className="flex gap-3">
       <span
         className={cn(
           "mt-0.5 grid size-8 shrink-0 place-items-center rounded-full text-[12px] font-semibold",
-          isPlayer
-            ? "bg-[color-mix(in_srgb,var(--color-player)_22%,transparent)] text-[var(--color-player)]"
-            : isSystem
-              ? "bg-[var(--color-ink-700)] text-[var(--muted-foreground)]"
-              : "bg-[color-mix(in_srgb,var(--color-npc)_22%,transparent)] text-[var(--color-npc)]",
+          isWorld
+            ? "bg-[color-mix(in_srgb,var(--color-world,#c9a227)_22%,transparent)] text-[var(--color-world,#c9a227)]"
+            : isPlayer
+              ? "bg-[color-mix(in_srgb,var(--color-player)_22%,transparent)] text-[var(--color-player)]"
+              : isSystem
+                ? "bg-[var(--color-ink-700)] text-[var(--muted-foreground)]"
+                : "bg-[color-mix(in_srgb,var(--color-npc)_22%,transparent)] text-[var(--color-npc)]",
         )}
       >
-        {message.initial || "?"}
+        {isWorld ? "◆" : message.initial || "?"}
       </span>
 
       <div className="min-w-0 flex-1">
@@ -428,9 +431,23 @@ function MessageRow({ message }: { message: ChatMessageDto }) {
           )}
         </div>
 
-        <div className="mt-1 whitespace-pre-wrap rounded-2xl rounded-tl-sm border border-[var(--border)] bg-[var(--card)] px-3.5 py-2.5 text-[13px] leading-relaxed text-[var(--foreground)]">
-          {message.text}
-        </div>
+        {/* A silent action turn has no spoken text - it exists only to carry its
+            executed-action chip below. Skip the bubble so it doesn't render an
+            empty box; the context strip still shows the chip. */}
+        {message.text.trim() !== "" && (
+          <div
+            className={cn(
+              "mt-1 whitespace-pre-wrap rounded-2xl rounded-tl-sm border px-3.5 py-2.5 text-[13px] leading-relaxed",
+              // World lines (searches, opens, pickups) read as a game log: a
+              // distinct amber, monospace, muted so they don't look like speech.
+              isWorld
+                ? "border-[color-mix(in_srgb,var(--color-world,#c9a227)_35%,var(--border))] bg-[color-mix(in_srgb,var(--color-world,#c9a227)_8%,var(--card))] font-mono text-[12px] text-[color-mix(in_srgb,var(--color-world,#c9a227)_75%,var(--foreground))]"
+                : "border-[var(--border)] bg-[var(--card)] text-[var(--foreground)]",
+            )}
+          >
+            {message.text}
+          </div>
+        )}
 
         <ContextStrip message={message} />
       </div>
@@ -440,11 +457,13 @@ function MessageRow({ message }: { message: ChatMessageDto }) {
 
 function RoleBadge({ role }: { role: string }) {
   const tone =
-    role === "player"
-      ? "text-[var(--color-player)]"
-      : role === "system"
-        ? "text-[var(--muted-foreground)]"
-        : "text-[var(--color-npc)]";
+    role === "world"
+      ? "text-[var(--color-world,#c9a227)]"
+      : role === "player"
+        ? "text-[var(--color-player)]"
+        : role === "system"
+          ? "text-[var(--muted-foreground)]"
+          : "text-[var(--color-npc)]";
   return (
     <span
       className={cn(

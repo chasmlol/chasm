@@ -10,6 +10,8 @@ import { getJson, postJson, UI_API } from "./http";
 
 /** LLM generation sampling. Mirrors `LlmConfig` (ui/config.rs). */
 export interface LlmConfig {
+  /** Experiment: constrain NPC action verbs to the book lexicon via grammar. */
+  npc_action_enum: boolean;
   temperature: number;
   top_p: number;
   top_k: number;

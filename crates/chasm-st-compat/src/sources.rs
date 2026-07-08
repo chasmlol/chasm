@@ -244,6 +244,17 @@ struct RawActionEntry {
     alias: Option<String>,
     #[serde(default)]
     short_name: Option<String>,
+    /// Verbs the model may name this action by (`"kill"`, `"take him out"`).
+    /// Resolution-layer data only: matched (slugged, exact/per-phrase) when the
+    /// emitted verb isn't the alias, BEFORE the semantic guess snap. Never used
+    /// for keyword activation, so plain words are safe (no regex/substring keys).
+    #[serde(default)]
+    verbs: Vec<String>,
+    /// Action group this entry belongs to (e.g. "loot"). Grouped entries are
+    /// HIDDEN from the always-injected prompt surface and revealed on demand by
+    /// the `list actions` meta-query; "" = ungrouped (always visible).
+    #[serde(default)]
+    group: String,
     #[serde(default)]
     risk_tier: String,
     #[serde(default)]
@@ -358,6 +369,9 @@ struct RawActionBook {
     catalogs: BTreeMap<String, RawCatalog>,
     #[serde(default)]
     entries: BTreeMap<String, RawActionEntry>,
+    /// Group name -> one-line blurb for the always-injected ACTION GROUPS list.
+    #[serde(default)]
+    groups: BTreeMap<String, String>,
 }
 
 /// A single action-book entry, normalized to the resolved shape that the
@@ -377,6 +391,11 @@ pub struct ActionEntry {
     pub action_id: String,
     pub alias: Option<String>,
     pub short_name: Option<String>,
+    /// Verbs the model may name this action by — deterministic verb->action
+    /// resolution data (see `RawActionEntry::verbs`).
+    pub verbs: Vec<String>,
+    /// Action group ("" = ungrouped / always visible).
+    pub group: String,
     pub risk_tier: String,
     pub parameters_schema: Value,
     pub preconditions: Vec<String>,
@@ -403,6 +422,8 @@ pub struct ActionBook {
     pub id: String,
     pub name: String,
     pub entries: Vec<ActionEntry>,
+    /// Group name -> blurb (the book's top-level `groups` object).
+    pub groups: Vec<(String, String)>,
     /// Top-level catalogs (with items) referenced by entries' scoped catalogs.
     pub catalogs: Vec<ActionBookCatalog>,
 }
@@ -450,6 +471,8 @@ fn action_from_raw(raw: RawActionBook) -> ActionBook {
             action_id: entry.action_id,
             alias: entry.alias,
             short_name: entry.short_name,
+            verbs: entry.verbs,
+            group: entry.group,
             risk_tier: entry.risk_tier,
             parameters_schema: entry.parameters_schema,
             preconditions: entry.preconditions,
@@ -484,6 +507,7 @@ fn action_from_raw(raw: RawActionBook) -> ActionBook {
         })
         .collect();
     ActionBook {
+        groups: raw.groups.clone().into_iter().collect(),
         id: raw.id,
         name: raw.name,
         entries,

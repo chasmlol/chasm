@@ -370,7 +370,19 @@ async fn run_turn(
         );
     }
     let message = message.trim().to_string();
-    if message.is_empty() {
+    // An errand-completion turn is DELIBERATELY message-less: the mod files it
+    // when the NPC finishes a job, and the pending errand report (injected
+    // depth-1 by chasm) does the prompting. Empty messages are neither
+    // persisted nor appended to the prompt, so nothing fake enters history.
+    let flag = |key: &str| {
+        request
+            .metadata
+            .get(key)
+            .map(|v| v.as_i64() == Some(1) || v.as_bool() == Some(true) || v.as_str() == Some("1"))
+            .unwrap_or(false)
+    };
+    let synthetic = flag("errand_completion") || flag("world_event");
+    if message.is_empty() && !synthetic {
         write_placeholder(sink, request)?;
         trace.stage("final_response_written");
         return Ok(());
@@ -513,7 +525,33 @@ async fn run_turn(
         .ok_or_else(|| anyhow::anyhow!("Live Chat streaming generation ended without a final turn."))?;
     let lines = npc::extract_lines(config, &participants, request, &turn);
     if lines.is_empty() {
-        // The model chose silence — status 1, no audio.
+        // The model chose silence (or an all-silent ACTION turn: empty speech
+        // + steps — "wait here, don't say anything"). extract_lines drops
+        // empty-text lines, so classify the TURN itself and dispatch any
+        // triggered steps before replying with silence; without this a silent
+        // action turn silently no-ops.
+        let silent_gms = actions::get_native_game_master_actions_per_step(config, &turn);
+        if !silent_gms.is_empty() {
+            let actor = actions::ActionActor {
+                native_npc_key: request.npc_key.clone(),
+                native_npc_name: request.npc_name.clone(),
+                character_name: String::new(),
+                character_id: String::new(),
+            };
+            for (step_index, gm) in silent_gms.iter().enumerate() {
+                if !gm.should_trigger {
+                    continue;
+                }
+                let mut step_request = request.clone();
+                if silent_gms.len() > 1 {
+                    step_request.request_id = format!("{}-s{}", request.request_id, step_index + 1);
+                }
+                if sink.action(config, &step_request, &actor, gm, "fallout-new-vegas-native-action") {
+                    info!("{}: silent turn dispatched {} ({})", request.request_id, gm.action, gm.action_id);
+                }
+            }
+        }
+        // Status 1, no audio.
         let resp = OutgoingResponse {
             status: "1".into(),
             player_text: message,
@@ -551,7 +589,7 @@ async fn run_turn(
                 character_id: line.character_id.clone(),
             };
             let mut out_steps: Vec<Value> = Vec::new();
-            for step in spec.get("steps").and_then(Value::as_array).into_iter().flatten() {
+            for (step_index, step) in spec.get("steps").and_then(Value::as_array).into_iter().flatten().enumerate() {
                 let mut step = step.clone();
                 let action_id = step.get("action_id").and_then(Value::as_str).unwrap_or("").to_string();
                 if !action_id.is_empty() {
@@ -566,13 +604,23 @@ async fn run_turn(
                         .filter(|t| !t.is_empty())
                         .unwrap_or("player");
                     let mut synth = line.turn.clone();
-                    let single = serde_json::json!([{ "id": action_id, "target": target }]);
+                    let items = step
+                        .get("items")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or("");
+                    let single = serde_json::json!([{ "id": action_id, "target": target, "items": items }]);
                     match synth.get_mut("structured") {
                         Some(s) => s["actions"] = single,
                         None => synth["structured"] = serde_json::json!({ "actions": single }),
                     }
                     let gm = actions::get_native_game_master_action(config, &synth);
-                    if let Some(body) = actions::build_native_command_body(request, &actor, &gm, "scheduler") {
+                    // A UNIQUE request id per chain step: completion signals
+                    // (LootDone) correlate on it - two loot steps in one chain
+                    // sharing the turn's id would fire each other's gates.
+                    let mut step_request = request.clone();
+                    step_request.request_id = format!("{}-k{}", request.request_id, step_index + 1);
+                    if let Some(body) = actions::build_native_command_body(&step_request, &actor, &gm, "scheduler") {
                         if let Some(obj) = step.as_object_mut() {
                             obj.insert("command_body".to_string(), Value::String(body));
                         }
@@ -599,20 +647,23 @@ async fn run_turn(
     // Native actions: classify each line, write a durable command file per triggered
     // action to every control/actions dir, and report a DISARMED game_master on the
     // response so the action fires exactly once (from the file, not the response).
-    let line_gms: Vec<actions::GameMaster> = lines
+    // Per-STEP classification: a turn may carry a multi-step plan ("follow me
+    // THEN attack Easy Pete") — the old single classification picked one action
+    // by legacy priority and silently dropped the rest (observed live: only the
+    // follow fired on a kill order). Every triggered step gets its own durable
+    // command, in plan order.
+    let line_gms: Vec<Vec<actions::GameMaster>> = lines
         .iter()
-        .map(|line| actions::get_native_game_master_action(config, &line.turn))
+        .map(|line| actions::get_native_game_master_actions_per_step(config, &line.turn))
         .collect();
     let mut response_gm = line_gms
         .iter()
+        .flatten()
         .find(|g| g.should_trigger)
         .cloned()
         .unwrap_or_else(|| actions::get_native_game_master_action(config, &turn));
     let mut queued_native_action = false;
-    for (index, (line, line_gm)) in lines.iter().zip(line_gms.iter()).enumerate() {
-        if !line_gm.should_trigger {
-            continue;
-        }
+    for (index, (line, gms)) in lines.iter().zip(line_gms.iter()).enumerate() {
         let line_request_id = if lines.len() > 1 {
             let suffix = first_non_empty([
                 line.native_npc_key.clone(),
@@ -623,24 +674,50 @@ async fn run_turn(
         } else {
             request.request_id.clone()
         };
-        let mut line_request = request.clone();
-        line_request.request_id = line_request_id;
         let actor = actions::ActionActor {
             native_npc_key: line.native_npc_key.clone(),
             native_npc_name: line.native_npc_name.clone(),
             character_name: line.character_name.clone(),
             character_id: line.character_id.clone(),
         };
-        if sink.action(
-            config,
-            &line_request,
-            &actor,
-            line_gm,
-            "fallout-new-vegas-native-action",
-        ) {
-            queued_native_action = true;
-            if !response_gm.should_trigger {
-                response_gm = line_gm.clone();
+        // LOOT steps aggregate into ONE command carrying the whole errand plan
+        // (a multi-container sweep is one trip, not N competing orders); every
+        // other action still dispatches per step.
+        let loot_aggregate = actions::aggregate_loot_steps(gms);
+        let mut loot_dispatched = false;
+        for (step_index, line_gm) in gms.iter().enumerate() {
+            if !line_gm.should_trigger {
+                continue;
+            }
+            let is_loot = line_gm.action == "LOOT";
+            if is_loot && loot_dispatched {
+                continue;
+            }
+            let dispatch_gm = if is_loot {
+                loot_dispatched = true;
+                loot_aggregate.as_ref().unwrap_or(line_gm)
+            } else {
+                line_gm
+            };
+            let mut line_request = request.clone();
+            // A distinct id per step ALSO makes the command filenames sort in
+            // plan order (same-millisecond files are picked up alphabetically).
+            line_request.request_id = if gms.len() > 1 {
+                format!("{}-s{}", line_request_id, step_index + 1)
+            } else {
+                line_request_id.clone()
+            };
+            if sink.action(
+                config,
+                &line_request,
+                &actor,
+                dispatch_gm,
+                "fallout-new-vegas-native-action",
+            ) {
+                queued_native_action = true;
+                if !response_gm.should_trigger {
+                    response_gm = dispatch_gm.clone();
+                }
             }
         }
     }
@@ -658,10 +735,14 @@ async fn run_turn(
     // and bails if music is disabled, so the live setting is the real authority;
     // in the standalone build `start_song_job` is a no-op anyway.
     {
-        if let Some((line, gm)) = lines.iter().zip(line_gms.iter()).find(|(_, gm)| {
-            gm.should_trigger
-                && (gm.action_id == chasm_core::PLAY_SONG_ACTION_ID
-                    || gm.action_id == chasm_core::PLAY_RAP_ACTION_ID)
+        if let Some((line, gm)) = lines.iter().zip(line_gms.iter()).find_map(|(line, gms)| {
+            gms.iter()
+                .find(|gm| {
+                    gm.should_trigger
+                        && (gm.action_id == chasm_core::PLAY_SONG_ACTION_ID
+                            || gm.action_id == chasm_core::PLAY_RAP_ACTION_ID)
+                })
+                .map(|gm| (line, gm))
         }) {
             let is_rap = gm.action_id == chasm_core::PLAY_RAP_ACTION_ID;
             let job = crate::chasm::SongJob {
@@ -986,6 +1067,14 @@ fn generate_body(
             // variant. The empty-object default keeps old-mod requests
             // unchanged (all flags parse false → default variant).
             "npcState": request.metadata.get("npc_state").cloned().unwrap_or_else(|| json!({})),
+            // Synthetic-turn payloads (world events, errand completions): the
+            // generate body's metadata is built from scratch, so these MUST be
+            // forwarded verbatim or the turn arrives message-less - not
+            // persisted, no memory of the event, and treated as a fresh player
+            // turn (observed live: looting with total amnesia, re-grabbing the
+            // same books forever). Snake_case to match the generate reader.
+            "world_event_text": request.metadata.get("world_event_text").cloned().unwrap_or(Value::Null),
+            "errand_summary": request.metadata.get("errand_summary").cloned().unwrap_or(Value::Null),
         },
     })
 }

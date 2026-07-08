@@ -302,12 +302,67 @@ pub async fn generate_stream_core(
             // audio no longer scales with reply length. Sentences (not raw
             // tokens or char counts) are the smallest unit qwen3-tts can speak
             // with natural prosody.
+            let mut report_guard =
+                ErrandReportGuard::new(&state, &plan.speaker_name, plan.errand_reports.clone());
+            let agent = build_agent_loop_ctx(&state, &ctx);
+            let mut agent_messages = plan.chat_messages.clone();
+            let mut round_speeches: Vec<String> = Vec::new();
+            let mut world_steps: Vec<Value> = Vec::new();
+            let mut executed_queries: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // Sentences already spoken THIS turn (normalized). A model that loops
+            // ("I have secured it, Master. I have secured it, Master.") or re-narrates
+            // the same line across rounds gets the duplicate dropped - not synthesized
+            // and not persisted twice.
+            let mut spoken_sentences: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // Speech lines already PERSISTED inline this turn (as interstitial
+            // fragments), by normalized form. The terminal round's speech is
+            // dropped from the finalize message if it just repeats one of these,
+            // so a model that re-says its line across rounds isn't echoed twice.
+            let mut persisted_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut agent_rounds: usize = 0;
+            let mut final_collected = String::new();
+            // A continuation turn inherits the TOOLS he found (find_action results)
+            // so he doesn't re-discover them every step - but NOT the room scan.
+            // The room is re-searched each turn so the list is always CURRENT: a
+            // just-taken item is gone, nothing stale lingers, no re-picking thin
+            // air. (A player turn starts fully fresh.)
+            let is_continuation = world_event_text(&ctx.player_metadata).is_some();
+            let inherited = inherit_loop_discovery(&plan.live_chat_id, &plan.speaker_name, is_continuation);
+            let mut discovered_actions: Vec<String> = inherited.actions;
+            let mut discovered_containers: Vec<String> = Vec::new();
+            // A container just opened (its contents ride the action-beat text) makes
+            // those contents the items he can take right now - seed the pin from them.
+            let mut discovered_items: Vec<String> = Vec::new();
+            if let Some(event) = world_event_text(&ctx.player_metadata) {
+                for name in parse_opened_container_items(&event) {
+                    if !discovered_items.contains(&name) {
+                        discovered_items.push(name);
+                    }
+                }
+            }
+            // The NPC's OWN carried items an inventory check revealed this turn -
+            // pins give_item's choice. Turn-local like the room scan: re-checked
+            // each turn (his pack changes), never inherited.
+            let mut discovered_inventory: Vec<String> = Vec::new();
+            for round in 0..AGENT_MAX_ROUNDS {
+            // Rebuilt per round: the ACTION SPACE IS the discovery state - the
+            // grammar offers find_action plus whatever actions he has searched up
+            // this loop; a loot search additionally pins targets to real names.
+            let response_format = npc_response_format(
+                &state,
+                plan.structured,
+                &ctx.requested_scopes,
+                &discovered_containers,
+                &discovered_items,
+                &discovered_inventory,
+                &discovered_actions,
+                true,
+            );
             let mut collected = String::new();
             let mut spoken_len: usize = 0;
-            let response_format = plan.structured.then(crate::llm::structured_response_format);
             trace_generate_stage(trace_id.as_deref(), "gen_llm_request_dispatch");
             let mut first_token_seen = false;
-            match crate::llm::chat_completion_stream(&target, &plan.chat_messages, response_format.as_ref(), trace_id.as_deref(), sampling)
+            match crate::llm::chat_completion_stream(&target, &agent_messages, response_format.as_ref(), trace_id.as_deref(), sampling)
                 .await
             {
                 Ok(mut rx) => {
@@ -325,7 +380,7 @@ pub async fn generate_stream_core(
                                 let speech = extracted_speech(plan.structured, &collected);
                                 while let Some(end) = next_sentence_end(&speech, spoken_len) {
                                     let segment = speech[spoken_len..end].trim();
-                                    if !segment.is_empty() {
+                                    if !segment.is_empty() && spoken_sentences.insert(normalize_spoken(segment)) {
                                         yield ndjson(&json!({
                                             "type": "speech.delta",
                                             "text": segment,
@@ -358,7 +413,7 @@ pub async fn generate_stream_core(
             // sentence boundary) as the closing delta.
             let full = extracted_speech(plan.structured, &collected);
             let rest = full.get(spoken_len.min(full.len())..).unwrap_or("").trim_start();
-            if !rest.is_empty() {
+            if !rest.is_empty() && spoken_sentences.insert(normalize_spoken(rest)) {
                 yield ndjson(&json!({
                     "type": "speech.delta",
                     "text": rest,
@@ -366,9 +421,195 @@ pub async fn generate_stream_core(
                 }));
             }
 
+            // --- agent loop round tail ------------------------------------
+            final_collected = collected.clone();
+            agent_rounds = round + 1;
+            if !plan.structured {
+                break;
+            }
+            let Some((round_speech, mut queries, world)) = agent_partition_round(&state, &agent, &collected) else {
+                break;
+            };
+            // take_items is two-step. Emitted with nothing scanned yet it TRIGGERS
+            // the item scan (reuse search_area) so the model sees the real items,
+            // then picks from the pinned grammar; emitted with "[none]" it declines
+            // (takes nothing); an emitted real item is the actual take. Reroute the
+            // first two here so a bare take never dispatches a blind grab.
+            let world: Vec<Value> = {
+                let mut kept = Vec::new();
+                for step in world {
+                    let fields = extract_step_fields(&step);
+                    let id = fields
+                        .as_ref()
+                        .and_then(|f| agent_resolve_step(&state, &agent, &f.verb));
+                    if id.as_deref() == Some("world.take_items") {
+                        let pick = fields
+                            .as_ref()
+                            .and_then(|f| f.items.clone())
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
+                        if pick.eq_ignore_ascii_case("[none]") || pick.eq_ignore_ascii_case("none") {
+                            append_world_line(&state, &plan.live_chat_id, "[You take nothing.]");
+                            discovered_items.clear();
+                            continue;
+                        }
+                        if discovered_items.is_empty() {
+                            queries.push(("world.search_area".to_string(), String::new()));
+                            continue;
+                        }
+                    }
+                    // give_item is the same two-step, over his OWN inventory: a bare
+                    // give triggers the inventory check (reuse check_inventory) so he
+                    // sees his real items, then picks from the pinned grammar; "[none]"
+                    // declines; a real pick runs the give (transfer NPC -> player)
+                    // through the mod's give_item worldq op - no walking, so it rides
+                    // the query channel, not the native loot-errand command.
+                    if id.as_deref() == Some("world.give_item") {
+                        let pick = fields
+                            .as_ref()
+                            .and_then(|f| f.items.clone())
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
+                        if pick.eq_ignore_ascii_case("[none]") || pick.eq_ignore_ascii_case("none") {
+                            append_world_line(&state, &plan.live_chat_id, "[You give nothing.]");
+                            discovered_inventory.clear();
+                            continue;
+                        }
+                        if discovered_inventory.is_empty() {
+                            queries.push(("chasm.check_inventory".to_string(), String::new()));
+                        } else {
+                            queries.push(("chasm.give_item".to_string(), pick));
+                        }
+                        continue;
+                    }
+                    kept.push(step);
+                }
+                kept
+            };
+            if !queries.is_empty() {
+                // A round that queries is PLANNING: its world steps reference
+                // listings the model has not seen yet (it re-emits them,
+                // informed, after the result arrives) - keep only the queries.
+                tracing::debug!("agent: dropped {} premature world step(s) from a query round", world.len());
+            } else {
+                world_steps.extend(world);
+            }
+            // Repeat-query backstop: the model sometimes re-runs the query it
+            // already got an answer for (observed with the loot queries). A
+            // repeat returns nothing new - drop it, and if the whole round was
+            // repeats, the turn is over.
+            let queries: Vec<(String, String)> = queries
+                .into_iter()
+                .filter(|(id, topic)| {
+                    executed_queries.insert(format!("{id}|{}", topic.trim().to_lowercase()))
+                })
+                .collect();
+            // A round that runs no further query is TERMINAL: the loop ends after
+            // it, so its speech + executed chips ride the finalize message. A
+            // round that DOES query keeps going - persist whatever it said HERE,
+            // before its world beats, so his words land where he said them.
+            if queries.is_empty() || round + 1 == AGENT_MAX_ROUNDS {
+                // Drop the terminal line if an inline fragment already showed it
+                // (a model that repeats itself across rounds), else keep it.
+                let echoes_inline = !round_speech.trim().is_empty()
+                    && persisted_lines.contains(&normalize_spoken(round_speech.trim()));
+                round_speeches.push(if echoes_inline { String::new() } else { round_speech });
+                break;
+            }
+            let line = round_speech.trim();
+            if !line.is_empty() && persisted_lines.insert(normalize_spoken(line)) {
+                append_npc_speech_line(&state, &plan, line);
+            }
+            let mut results = String::new();
+            for (query_id, query_topic) in &queries {
+                let outcome =
+                    agent_execute_query(&state, &ctx, &agent, &plan.speaker_name, query_id, query_topic).await;
+                tracing::info!("agent query {query_id}({query_topic}) -> {}", outcome.text.chars().take(120).collect::<String>());
+                if (query_id == "world.search_area" || query_id == "world.search_containers")
+                    && !outcome.containers.is_empty()
+                {
+                    discovered_containers = outcome.containers.clone();
+                }
+                // Items a query revealed pin the matching pick. A check_inventory
+                // lists his OWN carried items (give_item's choice); every other scan
+                // lists loose items in the world (take_items' choice) - kept in
+                // separate buckets so a room search and an inventory check don't
+                // cross-contaminate the two grammars.
+                let bucket = if query_id == "chasm.check_inventory" {
+                    &mut discovered_inventory
+                } else {
+                    &mut discovered_items
+                };
+                for name in &outcome.items {
+                    if !bucket.contains(name) {
+                        bucket.push(name.clone());
+                    }
+                }
+                // find_action results unlock those actions in the grammar for the
+                // rest of the loop; accumulate (a loop can pursue several goals).
+                for id in &outcome.actions {
+                    if !discovered_actions.contains(id) {
+                        discovered_actions.push(id.clone());
+                    }
+                }
+                // Persist what he SAW into the chat so the player can watch the
+                // loop unfold - searches, found actions, nearby people, inventory.
+                if !outcome.text.trim().is_empty() {
+                    append_world_line(&state, &plan.live_chat_id, &format!("[{}]", outcome.text.trim()));
+                }
+                results.push_str(&outcome.text);
+                results.push('\n');
+            }
+            trace_generate_stage(trace_id.as_deref(), "gen_agent_round");
+            agent_messages.push(json!({ "role": "assistant", "content": collected }));
+            agent_messages.push(json!({ "role": "user", "content": format!(
+                "[QUERY RESULT]\n{results}[This result is complete and current. Keep going: if the task needs an action from it, take the next step now using the EXACT names shown; answer a question naturally. Stay SILENT while simply working - leave speech \"\" and do not narrate what you just did or repeat yourself. Do not repeat a query.]"
+            ) }));
+            } // agent rounds
+
+            // Merged raw for finalize: single-round turns pass through
+            // BIT-EXACT (scheduling and all); multi-round turns merge speech
+            // and keep only the WORLD steps (queries were consumed above).
+            let final_raw = if agent_rounds <= 1 {
+                final_collected
+            } else {
+                json!({
+                    // Dedup across rounds: he often re-narrates ("I have secured it,
+                    // Master.") each round; keep it said once (matches the live stream).
+                    "speech": dedupe_sentences(
+                        &round_speeches
+                            .iter()
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ),
+                    "actions": world_steps,
+                }).to_string()
+            };
+
             // Build + persist this speaker's turn.
-            match finalize_turn(&state, &plan, &ctx.macros, &collected) {
-                Ok(turn) => turns.push(turn),
+            match finalize_turn(&state, &plan, &ctx.macros, &final_raw) {
+                Ok(turn) => {
+                    report_guard.defuse();
+                    dispatch_chasm_world_steps(&state, &ctx, &plan, &turn);
+                    let dispatched = turn
+                        .pointer("/structured/actions")
+                        .and_then(Value::as_array)
+                        .map(|a| !a.is_empty())
+                        .unwrap_or(false);
+                    update_loop_discovery(
+                        &plan.live_chat_id,
+                        &plan.speaker_name,
+                        &discovered_containers,
+                        &discovered_items,
+                        &discovered_actions,
+                        dispatched,
+                    );
+                    turns.push(turn)
+                }
                 Err(error) => {
                     yield ndjson(&json!({
                         "type": "live.error",
@@ -426,7 +667,10 @@ pub async fn generate(
     let mut turns: Vec<Value> = Vec::new();
     for speaker in &speakers {
         let plan = prepare_speaker_turn(&state, &ctx, speaker)?;
-        let response_format = plan.structured.then(crate::llm::structured_response_format);
+        // Buffered path: single round, no discovery — no loot branch.
+        let mut report_guard =
+            ErrandReportGuard::new(&state, &plan.speaker_name, plan.errand_reports.clone());
+        let response_format = npc_response_format(&state, plan.structured, &ctx.requested_scopes, &[], &[], &[], &[], false);
         let (text, metrics) = crate::llm::chat_completion_capturing_sampled(
             &target,
             &plan.chat_messages,
@@ -442,6 +686,8 @@ pub async fn generate(
         // finalize_turn persists this speaker's message, so the NEXT speaker's
         // history read sees it (matches ST's between-turn writes).
         let turn = finalize_turn(&state, &plan, &ctx.macros, &text)?;
+        report_guard.defuse();
+        dispatch_chasm_world_steps(&state, &ctx, &plan, &turn);
         turns.push(turn);
     }
 
@@ -552,10 +798,170 @@ struct TurnPlan {
     /// tag the message (and mirrors exactly what the depth-1 alert saw).
     in_combat: bool,
     combat_with: Vec<String>,
+    /// Errand reports CONSUMED into this turn's prompt. If the turn dies
+    /// before finalize (player interrupt aborting the stream, an error), the
+    /// guard puts them back - a swallowed report meant the NPC never told the
+    /// player about the milk (observed live).
+    errand_reports: Vec<String>,
 }
 
 /// Resolves the request-level (speaker-agnostic) context. Fails synchronously
 /// for the conditions the helper surfaces as a non-200 (missing chat / segment).
+/// The DISCOVERY STATE of an in-flight action loop, keyed by conversation+NPC.
+/// A world-event turn ("[You picked up X.]") is a CONTINUATION of the action
+/// that spawned it, so it inherits what the spawning turn had discovered - the
+/// expanded action GROUPS and the CONTAINERS a search found in the room. Both
+/// travel with the cause->effect chain, so he searches a room ONCE and then
+/// loots it across many turns without re-searching every step (he re-searches
+/// only when HE chooses to, which refreshes it). Player turns start FRESH (a
+/// small action space, a clean slate). Lives exactly as long as the loop:
+/// cleared the moment a turn emits no action, or the game reloads. No timer.
+#[derive(Clone, Default)]
+struct LoopDiscovery {
+    /// Container/body names a search revealed (pins loot targets in the grammar).
+    containers: Vec<String>,
+    /// Loose item names a scan / open container revealed (pins take_items' items).
+    items: Vec<String>,
+    /// Action ids `find_action` has turned up this loop - they, plus find_action
+    /// itself, ARE the grammar enum. Everything else is un-emittable until found.
+    actions: Vec<String>,
+}
+
+static ACTIVE_LOOP: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, LoopDiscovery>>,
+> = std::sync::OnceLock::new();
+
+fn toolset_key(live_chat_id: &str, speaker: &str) -> String {
+    format!("{live_chat_id}|{}", speaker.to_lowercase())
+}
+
+/// What a CONTINUATION turn inherits (world events only; player turns start
+/// fresh, so they pass `is_continuation = false` and get an empty slate).
+fn inherit_loop_discovery(live_chat_id: &str, speaker: &str, is_continuation: bool) -> LoopDiscovery {
+    if !is_continuation {
+        return LoopDiscovery::default();
+    }
+    let map = ACTIVE_LOOP.get_or_init(Default::default);
+    let map = map.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&toolset_key(live_chat_id, speaker)).cloned().unwrap_or_default()
+}
+
+/// After a turn: carry its discovery forward if it dispatched an action (its
+/// outcome spawns a continuation that needs the same tools + room knowledge);
+/// clear otherwise (no action = loop over).
+fn update_loop_discovery(
+    live_chat_id: &str,
+    speaker: &str,
+    containers: &[String],
+    items: &[String],
+    actions: &[String],
+    dispatched: bool,
+) {
+    let map = ACTIVE_LOOP.get_or_init(Default::default);
+    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+    let key = toolset_key(live_chat_id, speaker);
+    if dispatched && !(containers.is_empty() && items.is_empty() && actions.is_empty()) {
+        map.insert(
+            key,
+            LoopDiscovery {
+                containers: containers.to_vec(),
+                items: items.to_vec(),
+                actions: actions.to_vec(),
+            },
+        );
+    } else {
+        map.remove(&key);
+    }
+}
+
+/// Drop every in-flight loop - a game reload is a new timeline; any loop that
+/// was mid-flight belongs to the old one (its continuation events were cleared
+/// plugin-side too).
+pub fn clear_active_toolsets() {
+    if let Some(map) = ACTIVE_LOOP.get() {
+        map.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
+/// A world-event turn ("You open the Refrigerator. Inside: ...") carries its
+/// text in metadata: it becomes the turn's message, rendered and persisted in
+/// the PLAYER SLOT under the name "World" - the world talks to the NPC in his
+/// own conversation and he acts on it like anything else. No hidden calls.
+/// Normalized form of a spoken sentence for duplicate detection: lowercased
+/// alphanumerics only (drops punctuation/spacing so "Got it!" == "got it").
+fn normalize_spoken(sentence: &str) -> String {
+    sentence.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
+/// Drop repeated sentences (by normalized form) from a speech string, keeping the
+/// first occurrence and order - so a model that loops or re-narrates the same line
+/// across rounds isn't persisted saying it twice (matches the live-stream dedup).
+fn dedupe_sentences(text: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    for (i, ch) in text.char_indices() {
+        if matches!(ch, '.' | '!' | '?') {
+            let end = i + ch.len_utf8();
+            let sentence = text[start..end].trim();
+            let norm = normalize_spoken(sentence);
+            if !sentence.is_empty() && (norm.is_empty() || seen.insert(norm)) {
+                kept.push(sentence);
+            }
+            start = end;
+        }
+    }
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        let norm = normalize_spoken(tail);
+        if norm.is_empty() || seen.insert(norm) {
+            kept.push(tail);
+        }
+    }
+    kept.join(" ")
+}
+
+fn world_event_text(metadata: &Value) -> Option<String> {
+    metadata
+        .get("world_event_text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
+/// Item names from an "[You open X. Inside: 2x Dirty Water (0 caps, aid), Pistol
+/// (10 caps, weap) and Hammer (5 caps, misc).]" world event, so a just-opened
+/// container's contents pin take_items' choice. Strips the "Nx " count prefix and
+/// the " (n caps, cat)" suffix off each entry. Empty for a non-open / empty event.
+fn parse_opened_container_items(event: &str) -> Vec<String> {
+    let Some((_, rest)) = event.split_once("Inside:") else {
+        return Vec::new();
+    };
+    let rest = rest.trim().trim_end_matches(']').trim().trim_end_matches('.').trim();
+    if rest.is_empty() || rest.eq_ignore_ascii_case("it is empty") {
+        return Vec::new();
+    }
+    // Each item is "Name (n caps, cat)" - the annotation ITSELF holds a ", ", so
+    // items separate on "), " (after folding the final " and " into a comma), not
+    // a bare ", ".
+    rest.replace(" and ", ", ")
+        .split("), ")
+        .filter_map(|part| {
+            // Drop the trailing " (n caps, cat)" annotation.
+            let name = part.trim().rsplit_once(" (").map(|(n, _)| n).unwrap_or(part).trim();
+            // Drop a leading "Nx " count.
+            let name = name
+                .split_once("x ")
+                .filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                .map(|(_, r)| r)
+                .unwrap_or(name);
+            let name = name.trim();
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .collect()
+}
+
 fn resolve_turn_context(state: &Arc<AppState>, id: &str, body: &Value) -> WebResult<TurnContext> {
     let live_chat = state.repository.get_live_chat(id)?;
     let segment =
@@ -566,6 +972,8 @@ fn resolve_turn_context(state: &Arc<AppState>, id: &str, body: &Value) -> WebRes
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    // World-event turns: the event text IS the message ("World:" slot).
+    let message = world_event_text(body.get("metadata").unwrap_or(&Value::Null)).unwrap_or(message);
     let player_participant_id = body
         .get("participantId")
         .and_then(Value::as_str)
@@ -1132,7 +1540,46 @@ fn prepare_speaker_turn_traced(
         });
     }
 
+    // Finished agent errands: injected depth-1 (like the combat directive) so
+    // the NPC naturally reports back ("Went by Doc Mitchell's, all done") on
+    // their next line. Consumed exactly once.
+    let mut errand_reports = crate::scheduler::take_pending_reports(state, &speaker_name);
+    // The mod's INSTANT completion turn carries its summary in the request
+    // metadata (no sweep in the hot path - same latency as a normal turn).
+    // The report guard covers this too: an interrupted turn re-queues it.
+    if let Some(summary) = ctx
+        .player_metadata
+        .get("errand_summary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !errand_reports.iter().any(|r| r == summary) {
+            errand_reports.insert(0, summary.to_string());
+        }
+    }
+    if !errand_reports.is_empty() {
+        let directive = format!(
+            "[You just finished: {}. If you speak, briefly mention it's done - once, then move on. If you were told to stay silent, stay silent.]",
+            errand_reports.join("; ")
+        );
+        let char_count = directive.chars().count();
+        assembled.components.push(chasm_core::PromptComponentView {
+            order: assembled.components.len(),
+            group: "system".to_string(),
+            key: "errand_report".to_string(),
+            label: "Errand report".to_string(),
+            role: "system".to_string(),
+            status: "included".to_string(),
+            note: "Depth-1 completed-errand report, consumed once.".to_string(),
+            content: directive,
+            char_count,
+        });
+    }
+
     let scene_roster = build_scene_roster(state, ctx, &speaker_participant_id, &speaker_name);
+    let query_instruction =
+        chasm_prompt::npc_actions_instruction(&action_book_entries(state), &ctx.requested_scopes);
     let chat_messages = build_chat_messages(
         &assembled,
         &history,
@@ -1153,6 +1600,7 @@ fn prepare_speaker_turn_traced(
             .get("nearby_locations")
             .map(String::as_str)
             .unwrap_or(""),
+        &query_instruction,
     );
 
     let audible_to = default_audible_to(&ctx.live_chat, &speaker_participant_id);
@@ -1182,6 +1630,7 @@ fn prepare_speaker_turn_traced(
         injected,
         in_combat,
         combat_with,
+        errand_reports,
     })
 }
 
@@ -1371,6 +1820,9 @@ fn build_chat_messages(
     global_scenario: &str,
     is_admin: bool,
     nearby_locations: &str,
+    // Dynamic QUERIES section (built from the book's chasm:query entries);
+    // empty for admin/tests and for books without queries.
+    query_instruction: &str,
 ) -> Vec<Value> {
     // Components whose content CHANGES from turn to turn (retrieval picks,
     // book activations, live world state). They must NOT ride in the head
@@ -1466,8 +1918,10 @@ fn build_chat_messages(
         // themselves are still injected as a system component either way.
         system_parts.push(if is_admin {
             chasm_prompt::STRUCTURED_OUTPUT_INSTRUCTION.to_string()
-        } else {
+        } else if query_instruction.is_empty() {
             chasm_prompt::NPC_STRUCTURED_OUTPUT_INSTRUCTION.to_string()
+        } else {
+            format!("{}{}", chasm_prompt::NPC_STRUCTURED_OUTPUT_INSTRUCTION, query_instruction)
         });
         if has_quest_block {
             // Rides with the quest entries in the volatile block: it appears
@@ -1540,6 +1994,13 @@ fn build_chat_messages(
     // `scene_roster` is "" for 1-on-1 live chats and admin, so both stay unchanged.
     let is_group = distinct_npc_speakers > 1 || !scene_roster.is_empty();
     for message_view in window {
+        // A silent action turn is persisted with empty content to carry its
+        // executed-action chip in the chat UI; it isn't dialogue, so it adds
+        // nothing to the model's prompt. Skip it - an empty assistant turn would
+        // only waste a context slot and can break user/assistant alternation.
+        if message_view.content.trim().is_empty() {
+            continue;
+        }
         let base_role = match message_view.role.as_str() {
             "player" => "user",
             "system" => "system",
@@ -1775,8 +2236,13 @@ fn persist_player_message_ctx(state: &Arc<AppState>, ctx: &TurnContext) -> WebRe
     }
     headless.insert("metadata".to_string(), Value::Object(metadata));
 
+    let speaker_name = if world_event_text(&ctx.player_metadata).is_some() {
+        "World"
+    } else {
+        "Player"
+    };
     let message = STJsonlChatMessage {
-        name: "Player".to_string(),
+        name: speaker_name.to_string(),
         is_user: true,
         is_system: false,
         send_date: Some(now_iso()),
@@ -1797,6 +2263,238 @@ fn persist_player_message_ctx(state: &Arc<AppState>, ctx: &TurnContext) -> WebRe
 /// assistant message to the segment JSONL, and bumps the live-chat updatedAt.
 /// `macros` is the request's gamestate macro table (`ctx.macros`), recorded
 /// verbatim onto the persisted message's `extra.chasm.macros`.
+/// Puts consumed errand reports BACK if the turn never finalized: the stream
+/// future is dropped wholesale when the player interrupts (a new request
+/// aborts the HTTP stream), and reports consumed into the dead prompt were
+/// lost with it. Defused after a successful finalize.
+struct ErrandReportGuard {
+    state: Arc<AppState>,
+    npc_name: String,
+    reports: Vec<String>,
+    armed: bool,
+}
+
+impl ErrandReportGuard {
+    fn new(state: &Arc<AppState>, npc_name: &str, reports: Vec<String>) -> Self {
+        Self {
+            state: Arc::clone(state),
+            npc_name: npc_name.to_string(),
+            reports,
+            armed: true,
+        }
+    }
+    fn defuse(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ErrandReportGuard {
+    fn drop(&mut self) {
+        if self.armed && !self.reports.is_empty() {
+            crate::scheduler::readd_pending_reports(&self.state, &self.npc_name, &self.reports);
+            tracing::info!(
+                "agent: turn for {} died before finalize - {} errand report(s) restored",
+                self.npc_name,
+                self.reports.len()
+            );
+        }
+    }
+}
+
+/// Append a permanent "World:" line to a live chat's current segment - the
+/// NPC's own record of what happened. NO generation: it is memory he reads on
+/// his next turn, not a prompt that fires one.
+pub fn append_world_line(state: &AppState, live_chat_id: &str, text: &str) {
+    let Ok(live_chat) = state.repository.get_live_chat(live_chat_id) else {
+        return;
+    };
+    let Some(segment) = current_segment(&live_chat) else {
+        return;
+    };
+    let message = STJsonlChatMessage {
+        name: "World".to_string(),
+        is_user: true,
+        is_system: false,
+        send_date: Some(now_iso()),
+        mes: text.to_string(),
+        extra: json!({}),
+        original_avatar: None,
+    };
+    if let Err(error) = state.repository.append_segment_message(&segment, &message) {
+        tracing::warn!("world line persist failed: {error}");
+    }
+}
+
+/// Persist an NPC speech line the model produced on a NON-terminal agent round
+/// (one that then defers to a tool result). Writing it HERE - before the world
+/// beats that round's queries produce - puts his words where he actually said
+/// them in the chat, instead of `finalize_turn` dumping the whole turn's speech
+/// after every world beat. Marked `interstitial` so the UI renders it as a bare
+/// line (the turn's context strip rides the canonical turn message, not this
+/// fragment). Mirrors the assistant-message shape `finalize_turn` persists so
+/// the st-compat mapper reads it identically.
+fn append_npc_speech_line(state: &AppState, plan: &TurnPlan, speech: &str) {
+    let speech = speech.trim();
+    if speech.is_empty() {
+        return;
+    }
+    let live = json!({
+        "liveChatId": plan.live_chat_id,
+        "segmentId": plan.segment.id,
+        "speakerParticipantId": plan.speaker_participant_id,
+        "present": plan.present,
+        "audibleTo": plan.audible_to,
+        "location": plan.location,
+        "strictVisibility": true,
+    });
+    let headless = json!({
+        "characterId": plan
+            .speaker_character_id
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+        "metadata": {
+            "live": live,
+            "structured": { "speech": speech, "actions": [] },
+        },
+    });
+    let message = STJsonlChatMessage {
+        name: plan.speaker_name.clone(),
+        is_user: false,
+        is_system: false,
+        send_date: Some(now_iso()),
+        mes: speech.to_string(),
+        extra: json!({
+            "headless": headless,
+            // A fragment carries NO injected/executed context (that rides the
+            // canonical turn message). `interstitial` tells the UI to skip the
+            // "no turn context recorded" note for this bare line.
+            "chasm": {
+                "injected": {},
+                "turn_actions": [],
+                "macros": {},
+                "in_combat": false,
+                "combat_with": [],
+                "interstitial": true,
+            },
+        }),
+        original_avatar: None,
+    };
+    if let Err(error) = state.repository.append_segment_message(&plan.segment, &message) {
+        tracing::warn!("npc speech fragment persist failed: {error}");
+    }
+}
+
+fn persist_world_record(state: &Arc<AppState>, ctx: &TurnContext, text: &str) {
+    let message = STJsonlChatMessage {
+        name: "World".to_string(),
+        is_user: true,
+        is_system: false,
+        send_date: Some(now_iso()),
+        mes: text.to_string(),
+        extra: json!({}),
+        original_avatar: None,
+    };
+    if let Err(error) = state.repository.append_segment_message(&ctx.segment, &message) {
+        tracing::warn!("world record persist failed: {error}");
+    }
+}
+
+/// Execute the CHASM-side world steps of a finalized turn (native steps go
+/// through the bridge; these are ours): an immediate `travel_to_location`
+/// starts a movement journey directly - no scheduler task, the walk begins
+/// this instant - and `stop_travel` cancels the speaker's active journey.
+fn dispatch_chasm_world_steps(
+    state: &Arc<AppState>,
+    ctx: &TurnContext,
+    plan: &TurnPlan,
+    turn: &Value,
+) {
+    let Some(steps) = turn.pointer("/structured/actions").and_then(Value::as_array) else {
+        return;
+    };
+    // Permanent record of INSTANT actions (gestures, follow, wait, sit...).
+    // Loot and travel are excluded: their outcomes come back from the game.
+    let titles: std::collections::HashMap<String, String> = action_book_entries(state)
+        .into_iter()
+        .map(|entry| (entry.action_id.clone(), entry.title))
+        .collect();
+    let mut record_parts: Vec<String> = Vec::new();
+    for step in steps {
+        let id = step.get("id").and_then(Value::as_str).unwrap_or("");
+        if id.is_empty()
+            || id == "world.loot_container"
+            || id == "world.take_items"
+            || id == "movement.travel_to_location"
+        {
+            continue;
+        }
+        let Some(title) = titles.get(id) else { continue };
+        let target = step.get("target").and_then(Value::as_str).unwrap_or("").trim();
+        let mut part = title.to_lowercase();
+        if !target.is_empty() {
+            part.push_str(&format!(" ({target})"));
+        }
+        record_parts.push(part);
+    }
+    if !record_parts.is_empty() {
+        persist_world_record(state, ctx, &format!("[You: {}.]", record_parts.join("; ")));
+    }
+    for step in steps {
+        let id = step.get("id").and_then(Value::as_str).unwrap_or("");
+        // "wait here" while travelling MEANS stop travelling - the wait action
+        // alone would leave the journey engine walking them away again.
+        if id == "movement.stop_travel" || id == "ai.wait_here" {
+            let cancelled = crate::movement::cancel_journey(state, &plan.speaker_name);
+            if cancelled || id == "movement.stop_travel" {
+                tracing::info!(
+                    "travel: {id} for {} -> {}",
+                    plan.speaker_name,
+                    if cancelled { "journey cancelled" } else { "no active journey" }
+                );
+            }
+            continue;
+        }
+        if id != "movement.travel_to_location" {
+            continue;
+        }
+        let destination = ["destination", "to", "target"]
+            .iter()
+            .find_map(|key| {
+                step.get(*key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+            })
+            .unwrap_or("player");
+        let npc_key = ctx
+            .player_metadata
+            .get("npc_key")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let traveller = crate::movement::Traveller {
+            npc_key,
+            npc_name: plan.speaker_name.clone(),
+            character_name: plan.speaker_name.clone(),
+            live_chat_id: plan.live_chat_id.clone(),
+        };
+        match crate::movement::start_journey(state, &traveller, destination, None) {
+            Ok(Some(journey)) => {
+                persist_world_record(state, ctx, &format!("[You set off toward {destination}.]"));
+                tracing::info!(
+                    "travel: {} departs for '{}' (direct, journey {})",
+                    plan.speaker_name,
+                    destination,
+                    journey.id
+                );
+            }
+            Ok(None) => tracing::info!("travel: movement engine disabled; '{destination}' ignored"),
+            Err(error) => tracing::warn!("travel: failed to start journey to '{destination}': {error}"),
+        }
+    }
+}
+
 fn finalize_turn(
     state: &Arc<AppState>,
     plan: &TurnPlan,
@@ -1807,9 +2505,13 @@ fn finalize_turn(
     // Structured output: try to parse a JSON object with `speech`/`message`, then
     // resolve emitted action aliases to canonical action ids so the helper can
     // match them (mirrors ST `normalizeStructuredActionAliases`).
-    // Resolve the action alias map once so it can both normalize the emitted
-    // actions and recover each action's alias for the persisted `turn_actions`.
-    let aliases = structured_action_aliases(state);
+    // Resolve the book once: the alias map both normalizes the emitted actions
+    // and recovers each action's alias for the persisted `turn_actions`; the verb
+    // pairs are the deterministic verb->action layer consulted before the
+    // semantic snap ("kill" -> combat.start rides book data, not geometry).
+    let book_entries = action_book_entries(state);
+    let aliases = chasm_prompt::action_alias_pairs(&book_entries);
+    let verb_pairs = chasm_prompt::action_verb_pairs(&book_entries);
 
     // Embedder correction for guessed / off-list action calls ("the model guesses
     // a tool call, the embedder makes it correct"). Build a resolver that snaps an
@@ -1818,12 +2520,7 @@ fn finalize_turn(
     // configured — otherwise the closure returns None and behaviour is unchanged.
     let retrieval_settings = AppSettings::load(&state.config.settings_path).retrieval;
     let action_candidates: Vec<(String, String)> = if plan.structured && retrieval_settings.enabled {
-        match state.repository.list_action_books() {
-            Ok(books) => chasm_prompt::action_embed_candidates(
-                &books.into_iter().flat_map(|b| b.entries).collect::<Vec<_>>(),
-            ),
-            Err(_) => Vec::new(),
-        }
+        chasm_prompt::action_embed_candidates(&book_entries)
     } else {
         Vec::new()
     };
@@ -1869,6 +2566,7 @@ fn finalize_turn(
                     normalize_structured_action_aliases(
                         &mut structured,
                         &aliases,
+                        &verb_pairs,
                         Some(&guess_closure),
                     );
                 }
@@ -1920,8 +2618,17 @@ fn finalize_turn(
     );
     headless.insert("metadata".to_string(), Value::Object(metadata.clone()));
 
-    // Persist the assistant message (only when it has content, like Node).
-    if !content.is_empty() {
+    // Persist the assistant message. Normally this needs content (like Node), but
+    // a SILENT action turn - he acted without a word, common in the freeform loop
+    // (e.g. the final take_items pick) - has empty content yet still carries the
+    // executed-action chip. Persist it (empty body) so the chip shows where the
+    // action fired; the blank line is filtered back out of later prompts.
+    let has_actions = structured
+        .as_ref()
+        .and_then(|structured| structured.get("actions"))
+        .and_then(Value::as_array)
+        .is_some_and(|actions| !actions.is_empty());
+    if !content.is_empty() || has_actions {
         let assistant = STJsonlChatMessage {
             name: plan.speaker_name.clone(),
             is_user: false,
@@ -2138,16 +2845,523 @@ fn strip_speaker_prefix(content: &str, speaker_name: &str) -> String {
 /// object found in the raw text and parses that.
 /// Loads the profile's action books and returns their `(action_id, alias)` map,
 /// used to resolve a model's emitted action alias/id to the canonical action id.
-fn structured_action_aliases(state: &Arc<AppState>) -> Vec<(String, String)> {
-    let actions: Vec<chasm_st_compat::ActionEntry> =
-        match state.repository.list_action_books() {
-            Ok(books) => books
-                .into_iter()
-                .flat_map(|book| book.entries.into_iter())
-                .collect(),
-            Err(_) => Vec::new(),
+// ---------------------------------------------------------------------------
+// NPC agent loop: query actions return results and the reply CONTINUES.
+// Protocol tuned live against gemma-4-12b (crates/chasm-prompt/tests/
+// agent_loop.rs, 21/21): round 1 speaks a natural filler ("Let me check my
+// pack...") whose TTS playback hides the lookup + the cached re-call, round 2
+// answers from the result. A round with no query ends the turn, so plain
+// turns cost NOTHING extra.
+// ---------------------------------------------------------------------------
+
+// 5, not 4: find_action now consumes the FIRST round of any acting turn (the NPC
+// must search up an action before it can emit one), so the acting budget behind
+// it stays what it was (find -> search_area -> loot_container -> take_items still
+// fits). A round with no query still ends the turn, so plain talk costs nothing.
+const AGENT_MAX_ROUNDS: usize = 5;
+
+/// Per-request agent-loop context: resolution maps for detecting query steps
+/// plus the data the built-in executors answer from.
+struct AgentLoopCtx {
+    /// Full enabled book entries (group expansion needs alias+description+group).
+    book_entries: Vec<chasm_st_compat::ActionEntry>,
+    query_ids: std::collections::HashSet<String>,
+    /// Queries the GAME answers (book binding `{engine:"chasm:query", op:"..."}`):
+    /// action id -> mod op, forwarded over the world-query file channel.
+    query_ops: std::collections::HashMap<String, String>,
+    by_alias: std::collections::HashMap<String, String>,
+    candidates: Vec<(String, String)>,
+    action_floor: f32,
+    /// `(name, meters)` from the request's `metadata.targeting.nearby_npcs`.
+    nearby: Vec<(String, f64)>,
+}
+
+fn build_agent_loop_ctx(state: &Arc<AppState>, ctx: &TurnContext) -> AgentLoopCtx {
+    let entries = action_book_entries(state);
+    let mut query_ids = std::collections::HashSet::new();
+    let mut query_ops = std::collections::HashMap::new();
+    for entry in entries.iter().filter(|entry| !entry.disable) {
+        if chasm_prompt::is_query_entry(entry) {
+            query_ids.insert(entry.action_id.clone());
+            if let Some(op) = entry.binding.get("op").and_then(Value::as_str) {
+                if !op.trim().is_empty() {
+                    query_ops.insert(entry.action_id.clone(), op.trim().to_string());
+                }
+            }
+        }
+    }
+    let mut by_alias: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (id, alias) in chasm_prompt::action_alias_pairs(&entries) {
+        by_alias.entry(chasm_prompt::slug_action_alias(&alias)).or_insert(id);
+    }
+    for (id, verb) in chasm_prompt::action_verb_pairs(&entries) {
+        by_alias.entry(chasm_prompt::slug_action_alias(&verb)).or_insert(id);
+    }
+    let retrieval = AppSettings::load(&state.config.settings_path).retrieval;
+    let candidates = if retrieval.enabled {
+        chasm_prompt::action_embed_candidates(&entries)
+    } else {
+        Vec::new()
+    };
+    let nearby = ctx
+        .player_metadata
+        .pointer("/targeting/nearby_npcs")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let name = item.get("npc_name").and_then(Value::as_str)?.trim();
+                    let meters = item.get("distance_m").and_then(Value::as_f64).unwrap_or(0.0);
+                    (!name.is_empty()).then(|| (name.to_string(), meters))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    AgentLoopCtx {
+        book_entries: entries.iter().filter(|e| !e.disable).cloned().collect(),
+        query_ids,
+        query_ops,
+        by_alias,
+        candidates,
+        action_floor: retrieval.action_min_score.max(0.5),
+        nearby,
+    }
+}
+
+/// Resolve one emitted verb to an action id: alias/verb slug (whole then
+/// per-word), else the cosine snap — the same composite finalize uses.
+fn agent_resolve_step(state: &Arc<AppState>, agent: &AgentLoopCtx, verb: &str) -> Option<String> {
+    let whole = chasm_prompt::slug_action_alias(verb);
+    if let Some(id) = agent.by_alias.get(&whole) {
+        return Some(id.clone());
+    }
+    for word in verb.split_whitespace() {
+        if let Some(id) = agent.by_alias.get(&chasm_prompt::slug_action_alias(word)) {
+            return Some(id.clone());
+        }
+    }
+    if agent.candidates.is_empty() {
+        return None;
+    }
+    let (retriever, cache) = match (state.retriever(), state.embed_cache()) {
+        (Some(retriever), Some(cache)) => (retriever, cache),
+        _ => return None,
+    };
+    let rctx = RetrievalCtx {
+        retriever,
+        cache,
+        chat_memory_enabled: false,
+        lore_semantic_enabled: false,
+        action_semantic_enabled: true,
+        quest_semantic_enabled: false,
+        candidates: 48,
+        top_k: 8,
+        min_score: 0.0,
+        action_min_score: agent.action_floor,
+        chat_memory_limit: 0,
+        lore_limit: 0,
+        quest_limit: 0,
+    };
+    chasm_prompt::resolve_guess_to_action(&rctx, verb, &agent.candidates, agent.action_floor)
+}
+
+/// Split one round's raw output into `(speech, query steps, world steps)`.
+/// Query steps are `(action_id, topic)`; world steps keep their raw objects so
+/// the merged finalize re-normalizes them (scheduling fields intact). `None`
+/// when the raw doesn't parse as structured output.
+fn agent_partition_round(
+    state: &Arc<AppState>,
+    agent: &AgentLoopCtx,
+    raw: &str,
+) -> Option<(String, Vec<(String, String)>, Vec<Value>)> {
+    let (speech, structured) = parse_structured(raw)?;
+    let steps = structured
+        .get("actions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut queries = Vec::new();
+    let mut world = Vec::new();
+    for step in steps {
+        let Some(fields) = extract_step_fields(&step) else {
+            continue;
         };
-    chasm_prompt::action_alias_pairs(&actions)
+        match agent_resolve_step(state, agent, &fields.verb) {
+            Some(id) if agent.query_ids.contains(&id) => {
+                queries.push((id, fields.target.clone()));
+            }
+            _ => world.push(step),
+        }
+    }
+    Some((speech, queries, world))
+}
+
+/// Execute one query. Always returns SOMETHING — an empty-handed result is
+/// still an answer the model can speak. Built-ins answer in-process; queries
+/// with a mod op (looting) round-trip through the game's world-query channel.
+/// The outcome of one query: the text the NPC reads back, plus any state it
+/// unlocked for the rest of the loop — container/body names a loot search
+/// revealed, and action ids a `find_action` search turned up.
+#[derive(Default)]
+struct QueryOutcome {
+    text: String,
+    containers: Vec<String>,
+    /// Loose items a scan revealed - pin take_items' `items` field to these.
+    items: Vec<String>,
+    actions: Vec<String>,
+}
+
+/// find_action funnel: how many matches the semantic search returns, and the
+/// relevance floor below which a match is dropped. The floor is deliberately low
+/// — a search wants recall (the model picks from what comes back), unlike the
+/// high-precision snap floor that decides a single guessed verb.
+const FIND_ACTION_TOP_K: usize = 6;
+const FIND_ACTION_FLOOR: f32 = 0.15;
+// Drop any match more than this far (in remapped relevance) below the best hit -
+// keeps a search focused on the genuinely-relevant cluster instead of padding to
+// TOP_K with weak, sometimes DANGEROUS actions (e.g. `attack` leaking into "pick
+// up the pistol" because the weapon noun pulls combat text).
+const FIND_ACTION_GAP: f32 = 0.22;
+
+async fn agent_execute_query(
+    state: &Arc<AppState>,
+    _ctx: &TurnContext,
+    agent: &AgentLoopCtx,
+    speaker_name: &str,
+    action_id: &str,
+    topic: &str,
+) -> QueryOutcome {
+    if let Some(op) = agent.query_ops.get(action_id) {
+        let (text, containers, items) = agent_mod_query(state, op, speaker_name, topic).await;
+        return QueryOutcome { text, containers, items, ..Default::default() };
+    }
+    if action_id == chasm_prompt::FIND_ACTION_ID {
+        return agent_find_action(state, agent, topic);
+    }
+    // give_item's actual transfer: NOT a book query the model emits, but the
+    // second step of give_item, rerouted here with the chosen item as `topic`.
+    // The mod hands that named item from the NPC to the player and reports back.
+    if action_id == "chasm.give_item" {
+        let (text, _, _) = agent_mod_query(state, "give_item", speaker_name, topic).await;
+        return QueryOutcome { text, ..Default::default() };
+    }
+    let text = match action_id {
+        "chasm.who_is_here" => {
+            let others: Vec<String> = agent
+                .nearby
+                .iter()
+                .filter(|(name, _)| !name.eq_ignore_ascii_case(speaker_name))
+                .map(|(name, meters)| format!("{name} ({meters:.0}m)"))
+                .collect();
+            if others.is_empty() {
+                "No one else is nearby right now - just you and the player.".to_string()
+            } else {
+                format!("People nearby right now: {}. The player is right in front of you.", others.join(", "))
+            }
+        }
+        other => format!("(the {other} check returned nothing)"),
+    };
+    QueryOutcome { text, ..Default::default() }
+}
+
+/// The `find_action` tool: semantic-search the whole action book for whatever the
+/// NPC described, and return the matches as a readable listing PLUS their ids. The
+/// loop adds the ids to the round-local discovered set, which unlocks them in the
+/// grammar for the rest of the loop — this is the sole way a regular NPC reaches
+/// any action. find_action never finds itself.
+fn agent_find_action(state: &Arc<AppState>, agent: &AgentLoopCtx, query: &str) -> QueryOutcome {
+    let query = query.trim();
+    if query.is_empty() {
+        return QueryOutcome {
+            text: "(say what you're trying to do, then you can find the action for it)".to_string(),
+            ..Default::default()
+        };
+    }
+    let (retriever, cache) = match (state.retriever(), state.embed_cache()) {
+        (Some(retriever), Some(cache)) => (retriever, cache),
+        _ => {
+            return QueryOutcome {
+                text: "(you can't work out how to do that right now)".to_string(),
+                ..Default::default()
+            }
+        }
+    };
+    let pool: Vec<(String, String)> = agent
+        .candidates
+        .iter()
+        .filter(|(id, _)| id.as_str() != chasm_prompt::FIND_ACTION_ID)
+        .cloned()
+        .collect();
+    if pool.is_empty() {
+        return QueryOutcome {
+            text: "(you can't work out how to do that right now)".to_string(),
+            ..Default::default()
+        };
+    }
+    let rctx = RetrievalCtx {
+        retriever,
+        cache,
+        chat_memory_enabled: false,
+        lore_semantic_enabled: false,
+        action_semantic_enabled: true,
+        quest_semantic_enabled: false,
+        candidates: 64,
+        top_k: FIND_ACTION_TOP_K,
+        min_score: 0.0,
+        action_min_score: FIND_ACTION_FLOOR,
+        chat_memory_limit: 0,
+        lore_limit: 0,
+        quest_limit: 0,
+    };
+    let ids = chasm_prompt::search_actions_semantic(
+        &rctx,
+        query,
+        &pool,
+        FIND_ACTION_TOP_K,
+        FIND_ACTION_FLOOR,
+        FIND_ACTION_GAP,
+    );
+    if ids.is_empty() {
+        return QueryOutcome {
+            text: format!("Nothing you can do matches \"{query}\". Try describing it another way."),
+            ..Default::default()
+        };
+    }
+    let listing = chasm_prompt::describe_found_actions(&agent.book_entries, &ids);
+    QueryOutcome {
+        text: format!(
+            "Things you can do that match \"{query}\":\n{listing}\nEmit one now using the exact verb; if it only looks or checks, leave your speech empty and read the result."
+        ),
+        actions: ids,
+        ..Default::default()
+    }
+}
+
+/// Forward a query to the game: write a `CHASM_WORLDQ_V1` request into the
+/// plugin's `control/queries` channel and poll briefly for the result file.
+/// The plugin answers within a frame or two while the game runs; 4s of quiet
+/// means the world can't answer (game paused, NPC unresolved) and the model is
+/// told to say so instead of stalling the reply.
+async fn agent_mod_query(
+    state: &Arc<AppState>,
+    op: &str,
+    speaker_name: &str,
+    topic: &str,
+) -> (String, Vec<String>, Vec<String>) {
+    use base64::Engine as _;
+    let dir = crate::scheduler::bridge_root(state).join("control").join("queries");
+    let results = dir.join("results");
+    if std::fs::create_dir_all(&results).is_err() {
+        return ("(you can't check that right now)".to_string(), Vec::new(), Vec::new());
+    }
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let request_id = format!("agentq_{op}_{millis}");
+    let b64 = |v: &str| base64::engine::general_purpose::STANDARD.encode(v.as_bytes());
+    let body = format!(
+        "CHASM_WORLDQ_V1
+request_id={request_id}
+op={op}
+npc_name_base64={}
+target_base64={}
+",
+        b64(speaker_name),
+        b64(topic),
+    );
+    let tmp = dir.join(format!("{request_id}.tmp"));
+    let request_path = dir.join(format!("{request_id}.txt"));
+    if std::fs::write(&tmp, body.as_bytes()).is_err()
+        || std::fs::rename(&tmp, &request_path).is_err()
+    {
+        return ("(you can't check that right now)".to_string(), Vec::new(), Vec::new());
+    }
+    let result_path = results.join(format!("{request_id}.json"));
+    for _ in 0..160 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        if let Ok(raw) = std::fs::read_to_string(&result_path) {
+            let _ = std::fs::remove_file(&result_path);
+            let parsed = serde_json::from_str::<Value>(&raw).ok();
+            let text = parsed
+                .as_ref()
+                .and_then(|p| p.get("text").and_then(Value::as_str))
+                .map(|t| t.trim().to_string())
+                .unwrap_or_default();
+            // The listing's `data` entries carry a kind. Containers/bodies feed
+            // loot_container's target grammar; loose items feed take_items' item
+            // grammar (the exact names he can pick from, + "[none]").
+            let names_of = |kinds: &[&str]| -> Vec<String> {
+                parsed
+                    .as_ref()
+                    .and_then(|p| p.get("data").and_then(Value::as_array))
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter(|item| {
+                                item.get("kind")
+                                    .and_then(Value::as_str)
+                                    .map(|k| kinds.contains(&k))
+                                    .unwrap_or(false)
+                            })
+                            .filter_map(|item| item.get("name").and_then(Value::as_str))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let containers = names_of(&["container", "body"]);
+            let items = names_of(&["item"]);
+            if text.is_empty() {
+                return ("(you looked, but couldn't tell)".to_string(), containers, items);
+            }
+            return (text, containers, items);
+        }
+    }
+    let _ = std::fs::remove_file(&request_path);
+    ("(the game world didn't answer - say you couldn't check right now)".to_string(), Vec::new(), Vec::new())
+}
+
+
+/// The `response_format` for an NPC turn: the fully schema-enforced step shape,
+/// with the verb enum attached when the `llm.npc_action_enum` experiment toggle
+/// is on (read fresh per turn, like every other setting).
+fn npc_response_format(
+    state: &Arc<AppState>,
+    structured: bool,
+    requested_scopes: &[String],
+    // Containers/bodies a search DISCOVERED this turn (round-local). With the
+    // verb enum on, the grammar excludes the loot verbs until this is
+    // non-empty, then pins loot_container's target to exactly these names —
+    // "loot the bottle" misroutes become ungenerateable.
+    discovered_containers: &[String],
+    // Loose items a scan / open container revealed. Pin take_items' `items` field
+    // to exactly these + "everything" + "[none]" (so he picks a real item or
+    // declines, never grabs a hallucinated one). Empty pre-scan: take_items keeps
+    // a free items field, and emitting it triggers the scan.
+    discovered_items: &[String],
+    // The NPC's OWN carried items a check_inventory revealed. Pin give_item's
+    // `items` field to exactly these + "[none]". Empty pre-check: give_item keeps a
+    // free items field, and emitting it triggers the inventory check.
+    discovered_inventory: &[String],
+    // Action ids `find_action` has turned up this loop. When `gate_actions` is on
+    // (the streaming agent loop), the enum is EXACTLY find_action + these — a
+    // fresh turn can only search, and choosing re-locks to what was found.
+    discovered_actions: &[String],
+    // Off for the single-shot buffered path (no loop to search-then-act, so it
+    // keeps the full enum) and for admin/Todd (its own full-catalog path).
+    gate_actions: bool,
+) -> Option<Value> {
+    if !structured {
+        return None;
+    }
+    let entries = action_book_entries(state);
+    let gate = gate_actions && !is_admin_scope(requested_scopes);
+    let enum_values = AppSettings::load(&state.config.settings_path)
+        .llm
+        .npc_action_enum
+        .then(|| {
+            if gate {
+                // find_action is the only door: the enum offers find_action plus
+                // whatever the NPC has already discovered this loop; each search
+                // unlocks more. Nothing discovered yet => search is all he can do.
+                let visible: Vec<chasm_st_compat::ActionEntry> = entries
+                    .iter()
+                    .filter(|e| {
+                        e.action_id == chasm_prompt::FIND_ACTION_ID
+                            || discovered_actions.iter().any(|id| id == &e.action_id)
+                    })
+                    .cloned()
+                    .collect();
+                chasm_prompt::action_enum_values(&visible, requested_scopes)
+            } else {
+                chasm_prompt::action_enum_values(&entries, requested_scopes)
+            }
+        })
+        .filter(|values| !values.is_empty());
+    let verbs_of = |action_id: &str| -> Vec<String> {
+        entries
+            .iter()
+            .filter(|e| !e.disable && e.action_id == action_id)
+            .flat_map(|e| e.alias.clone().into_iter().chain(e.verbs.iter().cloned()))
+            .collect()
+    };
+    let loot_grammar = enum_values.is_some().then(|| crate::llm::LootGrammar {
+        verbs: verbs_of("world.loot_container"),
+        container_names: discovered_containers.to_vec(),
+        take_verbs: verbs_of("world.take_items"),
+        item_names: discovered_items.to_vec(),
+        give_verbs: verbs_of("world.give_item"),
+        inventory_names: discovered_inventory.to_vec(),
+    });
+    Some(crate::llm::npc_structured_response_format(
+        enum_values.as_deref(),
+        loot_grammar.as_ref(),
+    ))
+}
+
+/// Loads the profile's action books flattened to their entries (empty on error).
+fn action_book_entries(state: &Arc<AppState>) -> Vec<chasm_st_compat::ActionEntry> {
+    match state.repository.list_action_books() {
+        Ok(books) => books
+            .into_iter()
+            .flat_map(|book| book.entries.into_iter())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn structured_action_aliases(state: &Arc<AppState>) -> Vec<(String, String)> {
+    chasm_prompt::action_alias_pairs(&action_book_entries(state))
+}
+
+/// The activated-actions relay normally carries only the entries activated for
+/// this turn's prompt — but the model can legitimately emit any KNOWN action
+/// (aliases resolve against the whole book, and chat history often shows earlier
+/// calls), and the helper can only execute an action whose trusted execution
+/// rides the relay. Without this, an emitted-but-not-activated action normalizes
+/// fine and then silently does nothing in game (observed pre-Option-B: "kill him
+/// for me" → `attack(target="Easy Pete")` with an empty activation set). Regular
+/// NPCs no longer need it (Option B relays every enabled action), but the ADMIN
+/// path still relays only its per-turn activations. For each normalized emitted
+/// action missing from `views`, append its book entry's execution/binding.
+/// Scoped catalogs are left empty — they are resolved at activation time against
+/// the player message, and actions that need them (spawn) are useless without
+/// candidates anyway.
+fn supplement_activated_actions(
+    views: &mut Vec<chasm_core::ActivatedActionView>,
+    structured: Option<&Value>,
+    entries: &[chasm_st_compat::ActionEntry],
+    aliases: &[(String, String)],
+) {
+    let Some(actions) = structured
+        .and_then(|s| s.get("actions"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    let alias_by_id: std::collections::HashMap<&str, &str> = aliases
+        .iter()
+        .map(|(id, alias)| (id.as_str(), alias.as_str()))
+        .collect();
+    for action in actions {
+        let id = action.get("id").and_then(Value::as_str).unwrap_or("").trim();
+        if id.is_empty() || views.iter().any(|view| view.action_id == id) {
+            continue;
+        }
+        let Some(entry) = entries.iter().find(|entry| entry.action_id == id) else {
+            continue;
+        };
+        views.push(chasm_core::ActivatedActionView {
+            action_id: entry.action_id.clone(),
+            alias: alias_by_id.get(id).map(|a| a.to_string()).unwrap_or_default(),
+            binding: entry.binding.clone(),
+            execution: entry.execution.clone(),
+            requires_target: entry.requires_target,
+            scoped_catalogs: Vec::new(),
+        });
+    }
 }
 
 /// Rewrites `structured["actions"]` so each emitted action carries the canonical
@@ -2158,6 +3372,10 @@ fn structured_action_aliases(state: &Arc<AppState>) -> Vec<(String, String)> {
 fn normalize_structured_action_aliases(
     structured: &mut Value,
     aliases: &[(String, String)],
+    // Deterministic verb lexicon from the book (`entry.verbs`), merged into the
+    // alias map WITHOUT overriding canonical aliases — "kill" resolves to
+    // combat.start by data before the semantic snap ever runs.
+    verbs: &[(String, String)],
     // "The model guesses a tool call, the embedder makes it correct": when exact
     // alias resolution fails, this snaps the guessed verb to the nearest real
     // action id (or returns None when nothing is close enough). `None` disables
@@ -2175,6 +3393,11 @@ fn normalize_structured_action_aliases(
             action_id.clone(),
         );
         ids.insert(action_id.clone());
+    }
+    for (action_id, verb) in verbs {
+        by_alias
+            .entry(chasm_prompt::slug_action_alias(verb))
+            .or_insert_with(|| action_id.clone());
     }
 
     // Resolve the emitted `actions` into an ORDERED plan. Each entry is a step
@@ -2207,14 +3430,28 @@ fn normalize_structured_action_aliases(
         } else {
             (fields.target.clone(), String::new())
         };
+        // Immediacy words are NOT deferrals. The model routinely decorates a
+        // direct order with when/after = "immediately"/"now" (observed live:
+        // "kill easy pete" -> {do:"attack", when:"immediately"}), and any
+        // non-empty when/after routes the plan to the scheduler — where an
+        // unknown event condition parks the task on a flag that never fires.
+        // The order LOOKED accepted ("I shall eliminate him immediately") and
+        // silently did nothing. Strip them so the step stays on the fast path.
+        let non_deferral = |v: Option<&String>| -> String {
+            v.map(|s| s.trim())
+                .filter(|s| !s.is_empty() && !is_immediacy_phrase(s))
+                .map(str::to_string)
+                .unwrap_or_default()
+        };
         steps.push(PlanStep {
             verb: fields.verb,
             action_id,
             target,
-            at: fields.at.clone().unwrap_or_default(),
-            when: fields.when.clone().unwrap_or_default(),
-            after: fields.after.clone().unwrap_or_default(),
+            at: non_deferral(fields.at.as_ref()),
+            when: non_deferral(fields.when.as_ref()),
+            after: non_deferral(fields.after.as_ref()),
             destination,
+            items: fields.items.clone().unwrap_or_default(),
             obj: fields.obj,
         });
     }
@@ -2226,15 +3463,27 @@ fn normalize_structured_action_aliases(
     // chain, each step gated on its time/event, else on the previous step finishing
     // (= "then"). A plan of only immediate non-travel gestures stays on the fast
     // path and fires this turn.
+    // FREEFORM LOOP: immediate steps DISPATCH NOW, always - the NPC acts, the
+    // world answers in his context, and he decides the next call. The
+    // scheduler exists solely for steps the player explicitly deferred
+    // (a clock time, an event, a delay).
     let needs_schedule = steps
         .iter()
-        .any(|s| !s.at.is_empty() || !s.when.is_empty() || !s.after.is_empty() || !s.destination.is_empty());
+        .any(|s| !s.at.is_empty() || !s.when.is_empty() || !s.after.is_empty());
     if !needs_schedule {
         for s in &steps {
             // Preserve any extra fields on an admin object (spawn `entity`/`count`).
             let mut obj = s.obj.clone().unwrap_or_default();
             obj.insert("id".to_string(), json!(s.action_id));
             obj.insert("target".to_string(), json!(s.target));
+            if !s.items.is_empty() {
+                obj.insert("items".to_string(), json!(s.items));
+            }
+            if !s.destination.is_empty() {
+                // Travel's place (target is deliberately empty for travel
+                // steps) - the direct-journey dispatch reads it from here.
+                obj.insert("destination".to_string(), json!(s.destination));
+            }
             if !obj.get("parameters").map(Value::is_object).unwrap_or(false) {
                 obj.insert("parameters".to_string(), json!({}));
             }
@@ -2273,6 +3522,7 @@ fn normalize_structured_action_aliases(
                     "after": opt(&s.after),
                     "destination": opt(&s.destination),
                     "target": s.target,
+                    "items": opt(&s.items),
                 })
             })
             .collect();
@@ -2309,6 +3559,8 @@ struct PlanStep {
     after: String,
     /// Travel place ("" for a non-travel step).
     destination: String,
+    /// Item filter for a taking step ("" = not a taking step / take everything).
+    items: String,
     /// The original emitted object, so admin `entity`/`count` survive the fast path.
     obj: Option<serde_json::Map<String, Value>>,
 }
@@ -2321,11 +3573,15 @@ struct StepFields {
     when: Option<String>,
     after: Option<String>,
     to: Option<String>,
+    /// Item names for a taking step ("hat", "bottle, caps", "everything").
+    items: Option<String>,
     obj: Option<serde_json::Map<String, Value>>,
 }
 
 /// Lift `(verb, target, at, to)` from one emitted action entry. Handles the
-/// current object form `{"do":..,"target":..,"at":..}`, admin/legacy objects
+/// current object form `{"action":..,"target":..,"time":..,"condition":..,
+/// "delay":..}` and its older `do`/`at`/`when`/`after` spelling (chat history
+/// still shows old-format turns), admin/legacy objects
 /// keyed by `id`/`name`/`alias`, a `verb(args)` function-call string, and a bare
 /// `"wave"` / `"attack Easy Pete"` phrase. `None` when no verb is present.
 fn extract_step_fields(raw: &Value) -> Option<StepFields> {
@@ -2345,9 +3601,10 @@ fn extract_step_fields(raw: &Value) -> Option<StepFields> {
                 verb,
                 target: pick(map, &["target", "who", "on"]).unwrap_or_default(),
                 at: pick(map, &["at", "time"]),
-                when: pick(map, &["when", "if", "once", "event", "trigger"]),
+                when: pick(map, &["when", "condition", "if", "once", "event", "trigger"]),
                 after: pick(map, &["after", "delay", "wait"]),
                 to: pick(map, &["to", "dest", "destination", "place", "location"]),
+                items: pick(map, &["items", "item", "take", "loot"]),
                 obj: Some(map.clone()),
             })
         }
@@ -2360,6 +3617,7 @@ fn extract_step_fields(raw: &Value) -> Option<StepFields> {
                     when: None,
                     after: None,
                     to: call.to,
+                    items: None,
                     obj: None,
                 });
             }
@@ -2376,6 +3634,7 @@ fn extract_step_fields(raw: &Value) -> Option<StepFields> {
                 when: None,
                 after: None,
                 to: None,
+                items: None,
                 obj: None,
             })
         }
@@ -2402,6 +3661,17 @@ fn humanize_verb(verb: &str) -> String {
         out.push(ch);
     }
     out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// True when a step's `at`/`when`/`after` value just says "do it now" — an
+/// intensifier, not a schedule. Slug-compared so punctuation/case don't matter.
+fn is_immediacy_phrase(value: &str) -> bool {
+    matches!(
+        chasm_prompt::slug_action_alias(value).as_str(),
+        "now" | "immediately" | "instantly" | "right_now" | "right_away" | "at_once"
+            | "this_instant" | "right_this_second" | "straight_away" | "straightaway"
+            | "asap" | "as_soon_as_possible" | "immediate"
+    )
 }
 
 fn resolve_verb_to_action_id(
@@ -2838,6 +4108,9 @@ struct AdminRun {
     /// (which are aliases like `spawn_entity`) back to canonical ids
     /// (`world.spawn_entity`) so the helper can match them to `activatedActions`.
     aliases: Vec<(String, String)>,
+    /// All book entries, used to supplement the relay with emitted-but-unactivated
+    /// actions at finalize time (the admin path still activates per turn).
+    book_entries: Vec<chasm_st_compat::ActionEntry>,
 }
 
 /// Structured-output minimum token budget, matching
@@ -3032,6 +4305,7 @@ fn resolve_admin_run(state: &Arc<AppState>, body: &Value) -> WebResult<AdminRun>
         // This is the admin/Todd generation path → the full instruction.
         true,
         "",
+        "",
     );
 
     Ok(AdminRun {
@@ -3048,6 +4322,7 @@ fn resolve_admin_run(state: &Arc<AppState>, body: &Value) -> WebResult<AdminRun>
         request_metadata,
         activated_actions: injected.activated_actions,
         aliases: structured_action_aliases(state),
+        book_entries: action_book_entries(state),
     })
 }
 
@@ -3136,6 +4411,7 @@ fn admin_message_view(index: usize, message: &STJsonlChatMessage) -> MessageView
         turn_actions: Vec::new(),
         in_combat: false,
         combat_with: Vec::new(),
+        interstitial: false,
     }
 }
 
@@ -3222,7 +4498,8 @@ fn finalize_admin_result(run: &AdminRun, raw: &str, streamed: bool) -> WebResult
                 // ids (`world.spawn_entity`) so the helper can match them to the
                 // relayed activatedActions — the live path does this too. Without it
                 // Todd's ACTION_BOOK actions (gestures, spawn) never resolve.
-                normalize_structured_action_aliases(&mut value, &run.aliases, None);
+                let verb_pairs = chasm_prompt::action_verb_pairs(&run.book_entries);
+                normalize_structured_action_aliases(&mut value, &run.aliases, &verb_pairs, None);
                 (speech, Some(value))
             }
             None => {
@@ -3264,12 +4541,23 @@ fn finalize_admin_result(run: &AdminRun, raw: &str, streamed: bool) -> WebResult
     let mut metadata = admin_metadata(run, streamed, structured_ok);
     // Relay the activated actions' trusted execution/binding + scoped-catalog
     // candidates onto the turn metadata (mirrors the live `finalize_turn`), so the
-    // helper can build native commands for Todd's ACTION_BOOK actions.
-    if !run.activated_actions.is_empty() {
+    // helper can build native commands for Todd's ACTION_BOOK actions. Supplement
+    // the relay with book entries for actions the model emitted that never
+    // activated this turn — dispatch must not depend on retrieval luck (regular
+    // NPCs get this via Option B's all-enabled relay; admin still activates per
+    // turn).
+    let mut activated_actions = run.activated_actions.clone();
+    supplement_activated_actions(
+        &mut activated_actions,
+        structured.as_ref(),
+        &run.book_entries,
+        &run.aliases,
+    );
+    if !activated_actions.is_empty() {
         if let Value::Object(map) = &mut metadata {
             map.insert(
                 "activatedActions".to_string(),
-                serde_json::to_value(&run.activated_actions).unwrap_or_else(|_| json!([])),
+                serde_json::to_value(&activated_actions).unwrap_or_else(|_| json!([])),
             );
         }
     }
@@ -3448,6 +4736,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dedupe_sentences_drops_repeats_keeps_order() {
+        assert_eq!(
+            dedupe_sentences("I have secured it, Master. I have secured it, Master."),
+            "I have secured it, Master."
+        );
+        // First occurrence + order preserved; punctuation/case ignored for matching.
+        assert_eq!(
+            dedupe_sentences("Got it! On to the next. got it. Anything else?"),
+            "Got it! On to the next. Anything else?"
+        );
+        // No repeats -> unchanged (modulo whitespace normalization).
+        assert_eq!(dedupe_sentences("Hello there. How are you?"), "Hello there. How are you?");
+    }
+
+    #[test]
+    fn parses_opened_container_contents_into_item_names() {
+        let event = "[You open Refrigerator. Inside: 2x Dirty Water (0 caps, aid), 9mm Pistol (10 caps, weap) and Box of Detergent (5 caps, misc).]";
+        assert_eq!(
+            parse_opened_container_items(event),
+            vec!["Dirty Water", "9mm Pistol", "Box of Detergent"]
+        );
+        // Empty container and non-open events yield nothing.
+        assert!(parse_opened_container_items("[You open Footlocker. It is empty.]").is_empty());
+        assert!(parse_opened_container_items("[You picked up Hammer.]").is_empty());
+    }
+
+    #[test]
     fn extracts_first_balanced_json_object() {
         let raw =
             "<|channel>thought\n<channel|>{\n  \"speech\": \"Hi {there}\",\n  \"actions\": []\n}";
@@ -3526,7 +4841,7 @@ mod tests {
             "speech": "ok",
             "actions": [{ "alias": "follow", "parameters": { "confidence": 0.8, "target": "player" } }],
         });
-        normalize_structured_action_aliases(&mut s, &aliases, None);
+        normalize_structured_action_aliases(&mut s, &aliases, &[], None);
         let actions = s["actions"].as_array().unwrap();
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0]["id"], "movement.follow_target");
@@ -3542,7 +4857,7 @@ mod tests {
         let mut s = json!({
             "actions": ["follow", { "id": "combat.start" }, "teleport", { "alias": "nonsense" }],
         });
-        normalize_structured_action_aliases(&mut s, &aliases, None);
+        normalize_structured_action_aliases(&mut s, &aliases, &[], None);
         let ids: Vec<&str> = s["actions"]
             .as_array()
             .unwrap()
@@ -3556,7 +4871,7 @@ mod tests {
     fn object_plan_single_immediate_stays_on_fast_path() {
         let aliases = vec![("npc.gesture_wave".to_string(), "wave".to_string())];
         let mut s = json!({ "actions": [{ "do": "wave", "target": "player" }] });
-        normalize_structured_action_aliases(&mut s, &aliases, None);
+        normalize_structured_action_aliases(&mut s, &aliases, &[], None);
         let actions = s["actions"].as_array().unwrap();
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0]["id"], "npc.gesture_wave");
@@ -3565,10 +4880,114 @@ mod tests {
     }
 
     #[test]
+    fn new_step_field_names_resolve_and_schedule() {
+        // The renamed step fields (action/time/condition/delay) must flow the
+        // same as the old spelling (do/at/when/after), which history still
+        // contains and the parser still accepts.
+        let aliases = vec![("combat.start".to_string(), "attack".to_string())];
+        let mut s = json!({ "actions": [
+            { "action": "attack", "target": "Easy Pete", "condition": "the player says go" }
+        ] });
+        normalize_structured_action_aliases(&mut s, &aliases, &[], None);
+        assert!(s["actions"].as_array().unwrap().is_empty());
+        assert_eq!(s["scheduled"][0]["steps"][0]["event"], "the player says go");
+
+        let mut s2 = json!({ "actions": [ { "action": "attack", "target": "Easy Pete" } ] });
+        normalize_structured_action_aliases(&mut s2, &aliases, &[], None);
+        assert_eq!(s2["actions"][0]["id"], "combat.start");
+        assert_eq!(s2["actions"][0]["target"], "Easy Pete");
+    }
+
+    #[test]
+    fn enum_values_cover_npc_visible_aliases_and_verbs_only() {
+        // Real-book shape: EVERY entry carries scopes; regular-NPC visibility is
+        // "global" (always passes) vs admin-only. `scopes.is_empty()` would
+        // exclude the whole book (the harness bug this test now pins).
+        let mut combat = trusted_book_entry("combat.start");
+        combat.scopes = vec!["global".into(), "admin".into(), "game:fallout-new-vegas".into()];
+        let mut admin_only = trusted_book_entry("world.spawn_entity");
+        admin_only.scopes = vec!["admin".into(), "godmode".into()];
+        let mut disabled = trusted_book_entry("npc.gesture_wave");
+        disabled.disable = true;
+        let values =
+            chasm_prompt::action_enum_values(&[combat, admin_only, disabled], &[]);
+        assert!(values.contains(&"attack".to_string()), "canonical alias");
+        assert!(values.contains(&"kill".to_string()), "book verb");
+        assert!(values.contains(&"take him out".to_string()), "multiword verb");
+        assert!(
+            !values.iter().any(|v| v == "spawn_entity"),
+            "admin-scoped entries stay out of the NPC enum"
+        );
+        assert!(
+            !values.iter().any(|v| v == "wave"),
+            "disabled entries stay out of the NPC enum"
+        );
+    }
+
+    #[test]
+    fn verb_lexicon_resolves_kill_phrasings_without_the_embedder() {
+        // The book's `verbs` lexicon is the deterministic layer: "kill" and the
+        // multiword idioms resolve to combat.start by DATA, never reaching the
+        // semantic snap (whose geometry cross-matches "take him out" to the
+        // take-item gesture).
+        let aliases = vec![("combat.start".to_string(), "attack".to_string())];
+        let verbs = vec![
+            ("combat.start".to_string(), "kill".to_string()),
+            ("combat.start".to_string(), "take him out".to_string()),
+        ];
+        let mut s = json!({ "actions": [
+            { "do": "kill", "target": "Easy Pete" },
+            { "do": "take him out", "target": "Easy Pete" },
+        ] });
+        normalize_structured_action_aliases(&mut s, &aliases, &verbs, None);
+        let ids: Vec<&str> = s["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["combat.start", "combat.start"]);
+
+        // A verb spelled like a canonical alias must NOT redirect it — aliases
+        // win collisions.
+        let clash = vec![("combat.stop".to_string(), "attack".to_string())];
+        let mut s2 = json!({ "actions": [{ "do": "attack", "target": "player" }] });
+        normalize_structured_action_aliases(&mut s2, &aliases, &clash, None);
+        assert_eq!(s2["actions"][0]["id"], "combat.start");
+    }
+
+    #[test]
+    fn immediacy_words_do_not_defer_the_plan() {
+        // Live no-op 2026-07-06: "kill easy pete" -> the model emitted
+        // {do:"attack", target:"Easy Pete", when:"immediately"}; the non-empty
+        // `when` routed the kill to the scheduler where "immediately" parked it
+        // on a flag nothing raises. Immediacy words must stay on the fast path.
+        let aliases = vec![("combat.start".to_string(), "attack".to_string())];
+        for (key, value) in [("when", "immediately"), ("after", "now"), ("at", "right away")] {
+            let mut s = json!({ "actions": [
+                { "do": "attack", "target": "Easy Pete", key: value }
+            ] });
+            normalize_structured_action_aliases(&mut s, &aliases, &[], None);
+            let actions = s["actions"].as_array().unwrap();
+            assert_eq!(actions.len(), 1, "{key}={value} must not defer");
+            assert_eq!(actions[0]["id"], "combat.start");
+            assert_eq!(actions[0]["target"], "Easy Pete");
+            assert!(s.get("scheduled").is_none(), "{key}={value} wrongly scheduled");
+        }
+        // A REAL event condition still defers to the scheduler.
+        let mut s = json!({ "actions": [
+            { "do": "attack", "target": "Easy Pete", "when": "the player says go" }
+        ] });
+        normalize_structured_action_aliases(&mut s, &aliases, &[], None);
+        assert!(s["actions"].as_array().unwrap().is_empty());
+        assert_eq!(s["scheduled"][0]["steps"][0]["event"], "the player says go");
+    }
+
+    #[test]
     fn object_plan_timed_action_schedules() {
         let aliases = vec![("npc.gesture_wave".to_string(), "wave".to_string())];
         let mut s = json!({ "actions": [{ "do": "wave", "target": "player", "at": "6:37PM" }] });
-        normalize_structured_action_aliases(&mut s, &aliases, None);
+        normalize_structured_action_aliases(&mut s, &aliases, &[], None);
         assert!(s["actions"].as_array().unwrap().is_empty(), "timed action leaves actions empty");
         let steps = s["scheduled"][0]["steps"].as_array().unwrap();
         assert_eq!(steps.len(), 1);
@@ -3586,7 +5005,7 @@ mod tests {
             { "do": "travel", "target": "player", "at": "7:00PM" },
             { "do": "wave", "target": "player" },
         ] });
-        normalize_structured_action_aliases(&mut s, &aliases, None);
+        normalize_structured_action_aliases(&mut s, &aliases, &[], None);
         assert!(s["actions"].as_array().unwrap().is_empty());
         let steps = s["scheduled"][0]["steps"].as_array().unwrap();
         assert_eq!(steps.len(), 2, "order preserved as one chain");
@@ -3605,7 +5024,7 @@ mod tests {
         let mut s = json!({ "actions": [
             { "do": "attack", "target": "Easy Pete", "when": "the player says hi", "after": "30 seconds" },
         ] });
-        normalize_structured_action_aliases(&mut s, &aliases, None);
+        normalize_structured_action_aliases(&mut s, &aliases, &[], None);
         assert!(s["actions"].as_array().unwrap().is_empty(), "an event step schedules");
         let step = &s["scheduled"][0]["steps"][0];
         assert_eq!(step["action_id"], "combat.start");
@@ -3727,6 +5146,7 @@ mod tests {
         let messages = build_chat_messages(
             &assembled, &history, "", false, "", "", &Value::Null, "", "", false,
             "It is 1:22PM. You are in the saloon.", false, "",
+            "",
         );
         // Scenario rides as a SYSTEM message at depth 1: after the history bulk,
         // directly before the newest line - so the cached prompt prefix survives
@@ -3739,6 +5159,7 @@ mod tests {
         // Empty scenario -> no injection at all.
         let plain = build_chat_messages(
             &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "", false, "",
+            "",
         );
         assert_eq!(plain.len(), 2);
     }
@@ -3782,6 +5203,7 @@ mod tests {
         ];
         let messages = build_chat_messages(
             &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "", false, "",
+            "",
         );
         // Head system message: stable card only — retrieval picks must NOT be
         // there or every turn's differing picks would invalidate the LLM's
@@ -3838,6 +5260,7 @@ mod tests {
         ];
         let messages = build_chat_messages(
             &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "", false, "",
+            "",
         );
         // Head holds the card but NOT the persona — the persona moved to depth 1.
         let head = messages[0]["content"].as_str().unwrap();
@@ -3876,6 +5299,7 @@ mod tests {
         }];
         let messages = build_chat_messages(
             &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "", false, "",
+            "",
         );
         // Just the head system message + the one history line: no persona block.
         assert_eq!(messages.len(), 2);
@@ -3960,6 +5384,7 @@ mod tests {
         ];
         let messages = build_chat_messages(
             &assembled, &history, "", false, "", "", &Value::Null, "", "", false, "", false, "",
+            "",
         );
         // Not in the cached head.
         assert!(!messages[0]["content"].as_str().unwrap().contains("YOU ARE IN COMBAT"));
@@ -4168,7 +5593,85 @@ mod tests {
             request_metadata: json!({ "adminMode": true }),
             activated_actions: Vec::new(),
             aliases: Vec::new(),
+            book_entries: Vec::new(),
         }
+    }
+
+    /// A minimal book entry carrying trusted execution, like `combat.start`.
+    fn trusted_book_entry(action_id: &str) -> chasm_st_compat::ActionEntry {
+        chasm_st_compat::ActionEntry {
+            keys: vec!["attack".into()],
+            title: "Start combat with a target".into(),
+            description: String::new(),
+            constant: false,
+            disable: false,
+            vectorized: true,
+            order: 300.0,
+            case_sensitive: None,
+            action_id: action_id.into(),
+            alias: None,
+            short_name: None,
+            verbs: vec!["kill".into(), "take him out".into()],
+            group: String::new(),
+            risk_tier: String::new(),
+            parameters_schema: json!({}),
+            preconditions: Vec::new(),
+            effects: Vec::new(),
+            examples_when_to_use: Vec::new(),
+            examples_when_not_to_use: Vec::new(),
+            vectorizable_text: String::new(),
+            execution: json!({
+                "script": "rActor.StartCombat rTarget",
+                "templateId": "combat.start.player_target",
+                "language": "geck/xnvse",
+                "arguments": ["actor", "target"],
+            }),
+            binding: json!({ "engine": "fallout-new-vegas:xnvse" }),
+            requires_target: true,
+            scoped_catalogs: Vec::new(),
+            scopes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn supplements_relay_with_emitted_but_unactivated_actions() {
+        // The in-game failure this guards: the model emits a valid action on a
+        // turn where the entry never ACTIVATED (empty relay), so the helper had
+        // no execution metadata and silently dropped the action.
+        let entries = vec![trusted_book_entry("combat.start")];
+        let aliases = chasm_prompt::action_alias_pairs(&entries);
+        let structured = json!({ "actions": [{ "id": "combat.start", "target": "Easy Pete" }] });
+        let mut views: Vec<chasm_core::ActivatedActionView> = Vec::new();
+        supplement_activated_actions(&mut views, Some(&structured), &entries, &aliases);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].action_id, "combat.start");
+        assert_eq!(views[0].alias, "attack");
+        assert_eq!(views[0].execution["script"], json!("rActor.StartCombat rTarget"));
+        assert_eq!(views[0].binding["engine"], json!("fallout-new-vegas:xnvse"));
+        // Idempotent: an id already in the relay is not duplicated.
+        supplement_activated_actions(&mut views, Some(&structured), &entries, &aliases);
+        assert_eq!(views.len(), 1);
+        // Unknown emitted ids are ignored.
+        let unknown = json!({ "actions": [{ "id": "combat.teleport" }] });
+        supplement_activated_actions(&mut views, Some(&unknown), &entries, &aliases);
+        assert_eq!(views.len(), 1);
+    }
+
+    #[test]
+    fn admin_finalize_supplements_relay_for_emitted_unactivated_action() {
+        // Admin turns still activate per-turn: an emitted action whose entry
+        // never activated must ride the relay via the finalize-time supplement.
+        let mut run = admin_run_fixture(true);
+        run.book_entries = vec![trusted_book_entry("combat.start")];
+        run.aliases = chasm_prompt::action_alias_pairs(&run.book_entries);
+        let raw = "{\"speech\":\"Fine.\",\"actions\":[{\"id\":\"attack\",\"target\":\"Easy Pete\"}]}";
+        let result = finalize_admin_result(&run, raw, false).expect("structured finalize");
+        let relayed = result["turns"][0]["metadata"]["activatedActions"]
+            .as_array()
+            .expect("supplemented relay");
+        assert_eq!(relayed.len(), 1);
+        assert_eq!(relayed[0]["actionId"], "combat.start");
+        assert_eq!(relayed[0]["binding"]["engine"], "fallout-new-vegas:xnvse");
     }
 
     #[test]

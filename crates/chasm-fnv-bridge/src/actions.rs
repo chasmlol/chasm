@@ -27,12 +27,20 @@ const NATIVE_ACTION_COMMAND_VERSION: &str = "NVBRIDGE_ACTION_V2";
 /// The resolved native action attached to a generated line / turn.
 #[derive(Debug, Clone)]
 pub struct GameMaster {
-    pub action: String,        // ATTACK | FOLLOW | STOP_FOLLOW | ACTION_BOOK | NONE
+    pub action: String,        // ATTACK | FOLLOW | STOP_FOLLOW | LOOT | ACTION_BOOK | NONE
     pub confidence: String,    // "0.90" or ""
     pub should_trigger: bool,
     pub action_id: String,
     pub reason: String,
     pub actions: Vec<Value>,   // normalized action metadata
+    /// LOOT only: what to loot from ("that body") and what to take ("hat").
+    pub target: String,
+    pub items: String,
+    /// LOOT only: the FULL errand as `(mode, value)` entries - mode "container"
+    /// with an exact container/body name, or mode "items" with exact item
+    /// names. A turn's loot steps aggregate into ONE command carrying this
+    /// plan, so the plugin never has to re-assemble an errand from step files.
+    pub loot_plan: Vec<(String, String)>,
 }
 
 impl GameMaster {
@@ -45,6 +53,9 @@ impl GameMaster {
             action_id: String::new(),
             reason: String::new(),
             actions: Vec::new(),
+            target: String::new(),
+            items: String::new(),
+            loot_plan: Vec::new(),
         }
     }
 }
@@ -421,8 +432,25 @@ pub fn get_native_game_master_action(config: &BridgeConfig, turn: &Value) -> Gam
             action_id,
             reason: sanitize_bridge_line(&first_str(action, &["reason"])),
             actions: actions.clone(),
+            target: first_str(action, &["target"]),
+            items: first_str(action, &["items"]),
+            loot_plan: Vec::new(),
         })
     };
+
+    // LOOT before the trusted ACTION_BOOK fallthrough: the loot-group world
+    // actions are fully native errands (walk + take + report) with their own
+    // command shape. `world.loot_container` opens ONE exact-named container/
+    // body (contents choice follows asynchronously); `world.take_items` picks
+    // up exact-named loose items. Names come from the search listings.
+    for action in &structured {
+        let id = normalize_structured_action_id(action);
+        if id == "world.loot_container" || id == "world.take_items" {
+            if let Some(gm) = base(action, "LOOT") {
+                return gm;
+            }
+        }
+    }
 
     for action in &structured {
         if normalize_structured_action_id(action) == "combat.start" && is_player_action_target(action) {
@@ -460,6 +488,40 @@ pub fn get_native_game_master_action(config: &BridgeConfig, turn: &Value) -> Gam
         }
     }
     GameMaster::none()
+}
+
+/// Per-STEP classification: one [`GameMaster`] per emitted structured action, in
+/// plan order, keeping only the triggered ones. `get_native_game_master_action`
+/// picks a SINGLE action per turn by legacy priority (ATTACK → STOP_FOLLOW →
+/// FOLLOW → ACTION_BOOK), which silently DROPS the rest of a multi-step plan —
+/// observed live: "kill easy pete" came back as the plan
+/// `[follow(player), attack(Easy Pete)]` and only the follow ever fired. Each
+/// step is classified against a single-action clone of the turn (the relay
+/// metadata rides along), so every step gets its own durable command.
+pub fn get_native_game_master_actions_per_step(
+    config: &BridgeConfig,
+    turn: &Value,
+) -> Vec<GameMaster> {
+    let steps: Vec<Value> = turn
+        .pointer("/structured/actions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if steps.len() <= 1 {
+        let gm = get_native_game_master_action(config, turn);
+        return if gm.should_trigger { vec![gm] } else { Vec::new() };
+    }
+    steps
+        .iter()
+        .filter_map(|step| {
+            let mut synth = turn.clone();
+            if let Some(structured) = synth.get_mut("structured") {
+                structured["actions"] = json!([step.clone()]);
+            }
+            let gm = get_native_game_master_action(config, &synth);
+            gm.should_trigger.then_some(gm)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +608,7 @@ fn get_admin_text_command_action(config: &BridgeConfig, message: &str) -> GameMa
             "confidence": "1.00",
             "reason": "admin text command fallback",
         })],
+        ..GameMaster::none()
     }
 }
 
@@ -661,7 +724,25 @@ fn resolve_trusted_execution_argument(
     request: &NativeRequest,
 ) -> Option<String> {
     if let Some(s) = argument.as_str() {
-        return Some(s.trim().to_string());
+        let name = s.trim();
+        // A plain "target" argument names WHO the action is aimed at, but the book
+        // template can't know the runtime target — the plugin maps the literal word
+        // "target" to the player. Thread the action's emitted `target` through
+        // instead: a named nearby NPC becomes `refid:<id>` (resolved against
+        // `metadata.targeting.nearby_npcs`), so `attack(target="Easy Pete")`
+        // actually attacks Easy Pete. Player-ish / empty / unresolvable targets
+        // keep the literal word (the plugin's player fallback).
+        if matches!(slug_lookup_key(name).as_str(), "target" | "target_actor") {
+            let target = get_action_target(action);
+            if !target.is_empty() {
+                if let Some(encoded) = normalize_trusted_native_ref_arg_value(&target, request) {
+                    if encoded.starts_with("refid:") {
+                        return Some(encoded);
+                    }
+                }
+            }
+        }
+        return Some(name.to_string());
     }
     let config = if argument.is_object() {
         argument.clone()
@@ -1166,6 +1247,30 @@ fn clone_game_master_with_primary_action(
     }
 }
 
+/// The `(mode, value)` plan entry for one LOOT step.
+fn loot_plan_entry(gm: &GameMaster) -> (String, String) {
+    if gm.action_id == "world.take_items" {
+        ("items".to_string(), gm.items.clone())
+    } else {
+        ("container".to_string(), gm.target.clone())
+    }
+}
+
+/// Fold ALL of a turn's triggered LOOT steps into ONE GameMaster whose
+/// `loot_plan` carries the whole errand ("loot everything in the room" is a
+/// multi-container plan = one trip, one command). Returns None when the turn
+/// has no loot steps.
+pub fn aggregate_loot_steps(gms: &[GameMaster]) -> Option<GameMaster> {
+    let loot: Vec<&GameMaster> = gms
+        .iter()
+        .filter(|g| g.should_trigger && g.action == "LOOT")
+        .collect();
+    let first = loot.first()?;
+    let mut aggregate = (*first).clone();
+    aggregate.loot_plan = loot.iter().map(|g| loot_plan_entry(g)).collect();
+    Some(aggregate)
+}
+
 // ---------------------------------------------------------------------------
 // Command-file builders
 // ---------------------------------------------------------------------------
@@ -1213,7 +1318,50 @@ fn build_native_action_command_lines(
     };
     let player_text = request.player_text.clone();
 
-    if trusted_engine == TRUSTED_FNV_ACTION_ENGINE && !trusted_script.is_empty() {
+    // ATTACK stays on the legacy line format even when the entry carries trusted
+    // execution metadata: the plugin's legacy ATTACK handler has the
+    // already-in-combat no-op guard (the combat feedback-loop fix), which the
+    // generic trusted-script path has no equivalent for. ATTACK is only ever
+    // classified for a player-targeted `combat.start`, so nothing is lost —
+    // named-target combat rides ACTION_BOOK through the trusted path.
+    // LOOT: its own V2 command shape — ONE command carries the WHOLE errand as
+    // a `mode|value` plan (one line per stop), so the plugin builds the trip
+    // directly instead of re-assembling it from per-step files.
+    if action == "LOOT" {
+        let plan: Vec<(String, String)> = if gm.loot_plan.is_empty() {
+            vec![loot_plan_entry(gm)]
+        } else {
+            gm.loot_plan.clone()
+        };
+        let plan_text = plan
+            .iter()
+            .map(|(mode, value)| format!("{mode}|{value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = vec![
+            NATIVE_ACTION_COMMAND_VERSION.to_string(),
+            format!("request_id={}", encode_command_value(&request_id)),
+            format!("npc_key={}", encode_command_value(&native_npc_key)),
+            format!("npc_name={}", encode_command_value(&native_npc_name)),
+            "action=LOOT".to_string(),
+            format!("action_id={}", encode_command_value(&gm.action_id)),
+            format!("confidence={}", encode_command_value(&gm.confidence)),
+            format!(
+                "reason={}",
+                encode_command_value(if gm.reason.is_empty() { source } else { &gm.reason })
+            ),
+            format!("player_text={}", encode_base64_utf8(&player_text)),
+            format!("loot_plan_base64={}", encode_base64_utf8(&plan_text)),
+        ];
+        return Some(BuiltCommand {
+            request_id,
+            format: NATIVE_ACTION_COMMAND_VERSION,
+            lines,
+        });
+    }
+
+    let force_legacy = action == "ATTACK";
+    if !force_legacy && trusted_engine == TRUSTED_FNV_ACTION_ENGINE && !trusted_script.is_empty() {
         let args = match resolve_trusted_execution_arguments(&execution, &primary, request) {
             Some(a) => a,
             None => {
@@ -1333,7 +1481,7 @@ pub fn build_native_command_body(
         return None;
     }
     let action = gm.action.trim().to_uppercase();
-    if !["ATTACK", "FOLLOW", "STOP_FOLLOW", "ACTION_BOOK"].contains(&action.as_str()) {
+    if !["ATTACK", "FOLLOW", "STOP_FOLLOW", "LOOT", "ACTION_BOOK"].contains(&action.as_str()) {
         return None;
     }
     if actor.native_npc_key.trim().is_empty() && actor.native_npc_name.trim().is_empty() {
@@ -1356,7 +1504,7 @@ pub fn write_native_game_master_command(
         return false;
     }
     let action = gm.action.trim().to_uppercase();
-    if !["ATTACK", "FOLLOW", "STOP_FOLLOW", "ACTION_BOOK"].contains(&action.as_str()) {
+    if !["ATTACK", "FOLLOW", "STOP_FOLLOW", "LOOT", "ACTION_BOOK"].contains(&action.as_str()) {
         return false;
     }
     if actor.native_npc_key.trim().is_empty() && actor.native_npc_name.trim().is_empty() {
@@ -1487,6 +1635,82 @@ mod tests {
         crate::config::load_test_config()
     }
 
+
+    /// EXACT repro of the 2026-07-06 live follow-instead-of-kill: the model
+    /// emitted the PLAN [follow(player), attack(Easy Pete)] and single-turn
+    /// classification picked FOLLOW by priority, silently dropping the kill.
+    /// Per-step classification must yield BOTH commands, in plan order.
+    #[test]
+    fn multi_step_plan_dispatches_every_step() {
+        let turn = json!({
+            "speaker": { "name": "chamzy" },
+            "message": { "content": "As you command, Master." },
+            "structured": { "actions": [
+                { "action": "follow", "target": "player", "id": "movement.follow_target",
+                  "parameters": {}, "reason": "Action \"follow\"." },
+                { "action": "attack", "target": "Easy Pete", "id": "combat.start",
+                  "parameters": {}, "reason": "Action \"attack\"." }
+            ]},
+            "metadata": { "activatedActions": [
+                { "actionId": "combat.start", "bookId": "FNV",
+                  "binding": { "engine": "fallout-new-vegas:xnvse" },
+                  "execution": { "script": "rActor.StartCombat rTarget", "templateId": "combat.start.player_target",
+                    "language": "geck/xnvse", "arguments": [ "actor", "target" ] } }
+            ]}
+        });
+        // The old single classification: FOLLOW wins, attack silently dropped.
+        let single = get_native_game_master_action(&cfg(), &turn);
+        assert_eq!(single.action, "FOLLOW", "precondition: legacy priority picks follow");
+        // Per-step: both fire, plan order preserved.
+        let gms = get_native_game_master_actions_per_step(&cfg(), &turn);
+        assert_eq!(gms.len(), 2);
+        assert_eq!(gms[0].action, "FOLLOW");
+        assert_eq!(gms[1].action, "ACTION_BOOK");
+        assert_eq!(gms[1].action_id, "combat.start");
+        // Single-step turns keep the exact old behavior.
+        let mut one = turn.clone();
+        one["structured"]["actions"] = json!([
+            { "action": "attack", "target": "Easy Pete", "id": "combat.start" }
+        ]);
+        let gms = get_native_game_master_actions_per_step(&cfg(), &one);
+        assert_eq!(gms.len(), 1);
+        assert_eq!(gms[0].action, "ACTION_BOOK");
+    }
+
+    /// EXACT repro of the 2026-07-06 live no-op: companion told "kill easy pete",
+    /// model emitted the verb with the NAME INSIDE IT and no target field, so the
+    /// normalized step is combat.start with an EMPTY target. Empty target is
+    /// player-ish -> must classify ATTACK and build the legacy command.
+    #[test]
+    fn live_repro_empty_target_combat_start_classifies_attack() {
+        let turn = json!({
+            "speaker": { "name": "chamzy" },
+            "message": { "content": "As you command, my Master." },
+            "structured": { "actions": [
+                { "do": "attack Easy Pete", "id": "combat.start", "target": "",
+                  "parameters": {}, "reason": "attack Easy Pete" }
+            ]},
+            "metadata": { "activatedActions": [
+                { "actionId": "combat.start", "bookId": "FNV",
+                  "binding": { "engine": "fallout-new-vegas:xnvse" },
+                  "execution": { "script": "rActor.StartCombat rTarget", "templateId": "combat.start.player_target",
+                    "language": "geck/xnvse", "arguments": [ "actor", "target" ] } }
+            ]}
+        });
+        let gm = get_native_game_master_action(&cfg(), &turn);
+        assert_eq!(gm.action, "ATTACK");
+        assert!(gm.should_trigger);
+        let actor = ActionActor {
+            native_npc_key: "chamzy".into(),
+            native_npc_name: "chamzy".into(),
+            ..Default::default()
+        };
+        let cmd = build_native_action_command_lines(&request(), &actor, &gm, "src")
+            .expect("command built");
+        assert_eq!(cmd.format, "legacy");
+        assert_eq!(cmd.lines[3], "ATTACK");
+    }
+
     fn request() -> NativeRequest {
         NativeRequest {
             request_id: "req_x".into(),
@@ -1495,6 +1719,70 @@ mod tests {
             player_text: "follow me".into(),
             ..Default::default()
         }
+    }
+
+    /// The loot-group world actions classify as native LOOT with the right
+    /// mode: `world.loot_container` (exact-named container, contents choice
+    /// follows async) and `world.take_items` (exact-named loose items).
+    #[test]
+    fn loot_step_classifies_and_builds_loot_command() {
+        let turn = json!({
+            "speaker": { "name": "chamzy" },
+            "message": { "content": "On it." },
+            "structured": { "actions": [
+                { "action": "loot", "target": "Oven", "items": "",
+                  "id": "world.loot_container", "parameters": {}, "reason": "Action loot." }
+            ]}
+        });
+        let gm = get_native_game_master_action(&cfg(), &turn);
+        assert_eq!(gm.action, "LOOT");
+        assert!(gm.should_trigger);
+        assert_eq!(gm.action_id, "world.loot_container");
+        assert_eq!(gm.target, "Oven");
+        let actor = ActionActor {
+            native_npc_key: "chamzy".into(),
+            native_npc_name: "chamzy".into(),
+            ..Default::default()
+        };
+        let cmd = build_native_action_command_lines(&request(), &actor, &gm, "src")
+            .expect("command built");
+        assert_eq!(cmd.format, NATIVE_ACTION_COMMAND_VERSION);
+        assert!(cmd.lines.contains(&"action=LOOT".to_string()));
+        let b64 = |v: &str| base64::engine::general_purpose::STANDARD.encode(v.as_bytes());
+        // Single step = a one-stop plan.
+        assert!(cmd.lines.contains(&format!("loot_plan_base64={}", b64("container|Oven"))));
+        // A whole room sweep: every LOOT step of the turn aggregates into ONE
+        // command carrying the full plan; non-loot steps stay per-step.
+        let plan = json!({
+            "speaker": { "name": "chamzy" },
+            "message": { "content": "On it." },
+            "structured": { "actions": [
+                { "action": "follow", "target": "player", "id": "movement.follow_target" },
+                { "action": "take", "target": "", "items": "Empty Soda Bottle", "id": "world.take_items" },
+                { "action": "loot", "target": "Oven", "items": "", "id": "world.loot_container" },
+                { "action": "loot", "target": "Desk", "items": "", "id": "world.loot_container" }
+            ]}
+        });
+        let gms = get_native_game_master_actions_per_step(&cfg(), &plan);
+        assert_eq!(gms.len(), 4);
+        let aggregate = aggregate_loot_steps(&gms).expect("loot steps present");
+        assert_eq!(aggregate.action, "LOOT");
+        assert_eq!(
+            aggregate.loot_plan,
+            vec![
+                ("items".to_string(), "Empty Soda Bottle".to_string()),
+                ("container".to_string(), "Oven".to_string()),
+                ("container".to_string(), "Desk".to_string()),
+            ]
+        );
+        let cmd = build_native_action_command_lines(&request(), &actor, &aggregate, "src")
+            .expect("command built");
+        assert!(cmd.lines.contains(&format!(
+            "loot_plan_base64={}",
+            b64("items|Empty Soda Bottle
+container|Oven
+container|Desk")
+        )));
     }
 
     fn follow_turn() -> Value {
@@ -1637,6 +1925,88 @@ mod tests {
             normalize_trusted_native_ref_arg_value("follow me again", &req),
             None
         );
+    }
+
+    /// A regular-NPC kill turn: `attack(target="Easy Pete")` normalized to
+    /// `combat.start` with a NAMED (non-player) target, the entry's trusted
+    /// execution riding the relay (post book fix: `binding.engine` present).
+    fn named_target_attack_turn() -> Value {
+        json!({
+            "structured": { "actions": [
+                { "id": "combat.start", "target": "Easy Pete", "confidence": 0.9, "reason": "ordered to kill" }
+            ]},
+            "metadata": { "activatedActions": [
+                { "actionId": "combat.start", "bookId": "FNV",
+                  "binding": { "engine": "fallout-new-vegas:xnvse" },
+                  "execution": { "script": "rActor.StartCombat rTarget", "templateId": "combat.start.player_target",
+                    "language": "geck/xnvse", "arguments": [ "actor", "target" ] } }
+            ]}
+        })
+    }
+
+    #[test]
+    fn named_target_attack_builds_trusted_command_with_target_refid() {
+        // "kill Easy Pete for me" end-to-end at this layer: classification must
+        // fall through the player-only ATTACK arm into ACTION_BOOK, and the
+        // template's plain "target" argument must be resolved to the named
+        // nearby NPC's refid — NOT passed verbatim (verbatim = the plugin
+        // attacks the player).
+        let turn = named_target_attack_turn();
+        let gm = get_native_game_master_action(&cfg(), &turn);
+        assert_eq!(gm.action, "ACTION_BOOK");
+        assert!(gm.should_trigger);
+        let actor = ActionActor {
+            native_npc_key: "chamzy".into(),
+            native_npc_name: "chamzy".into(),
+            ..Default::default()
+        };
+        let cmd =
+            build_native_action_command_lines(&admin_request_with_nearby(), &actor, &gm, "src")
+                .unwrap();
+        assert_eq!(cmd.lines[0], "NVBRIDGE_ACTION_V2");
+        assert_eq!(cmd.lines[5], "action_id=combat.start");
+        assert_eq!(cmd.lines[10], "arguments=actor,refid:0010A6B1");
+    }
+
+    #[test]
+    fn player_target_attack_stays_on_the_guarded_legacy_path() {
+        // A player-targeted combat.start classifies as ATTACK and must use the
+        // LEGACY command format even when trusted execution metadata is present:
+        // the plugin's legacy ATTACK handler carries the already-in-combat no-op
+        // guard the trusted script path lacks.
+        let mut turn = named_target_attack_turn();
+        turn["structured"]["actions"][0]["target"] = json!("player");
+        let gm = get_native_game_master_action(&cfg(), &turn);
+        assert_eq!(gm.action, "ATTACK");
+        let actor = ActionActor {
+            native_npc_key: "chamzy".into(),
+            native_npc_name: "chamzy".into(),
+            ..Default::default()
+        };
+        let cmd =
+            build_native_action_command_lines(&admin_request_with_nearby(), &actor, &gm, "src")
+                .unwrap();
+        assert_eq!(cmd.format, "legacy");
+        assert_eq!(cmd.lines[3], "ATTACK");
+    }
+
+    #[test]
+    fn unresolvable_named_target_falls_back_to_the_literal_word() {
+        // Target names nobody nearby → keep the literal "target" argument (the
+        // plugin's player fallback) rather than dropping the whole action.
+        let mut turn = named_target_attack_turn();
+        turn["structured"]["actions"][0]["target"] = json!("Ghost of Christmas Past");
+        let gm = get_native_game_master_action(&cfg(), &turn);
+        assert_eq!(gm.action, "ACTION_BOOK");
+        let actor = ActionActor {
+            native_npc_key: "chamzy".into(),
+            native_npc_name: "chamzy".into(),
+            ..Default::default()
+        };
+        let cmd =
+            build_native_action_command_lines(&admin_request_with_nearby(), &actor, &gm, "src")
+                .unwrap();
+        assert_eq!(cmd.lines[10], "arguments=actor,target");
     }
 
     #[test]

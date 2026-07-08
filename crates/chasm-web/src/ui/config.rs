@@ -41,6 +41,9 @@ use crate::{AppState, WebResult};
 /// `crate::apply_llm_sampling_form` via the `sampling_*` form keys.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct LlmConfig {
+    /// EXPERIMENT: enum-grammar constraint on NPC action verbs (see
+    /// `LlmSettings::npc_action_enum`).
+    pub npc_action_enum: bool,
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: u32,
@@ -52,9 +55,10 @@ pub(crate) struct LlmConfig {
 }
 
 impl LlmConfig {
-    fn from_settings(s: &LlmSamplingSettings) -> Self {
-        let n = s.normalized();
+    fn from_settings(llm: &chasm_core::LlmSettings) -> Self {
+        let n = llm.sampling.normalized();
         Self {
+            npc_action_enum: llm.npc_action_enum,
             temperature: n.temperature,
             top_p: n.top_p,
             top_k: n.top_k,
@@ -69,6 +73,7 @@ impl LlmConfig {
     /// Builds the `sampling_*` form body the legacy `apply_llm_form` reads.
     fn to_form(&self) -> HashMap<String, String> {
         let mut form = HashMap::new();
+        form.insert("npc_action_enum".into(), self.npc_action_enum.to_string());
         form.insert("sampling_temperature".into(), self.temperature.to_string());
         form.insert("sampling_top_p".into(), self.top_p.to_string());
         form.insert("sampling_top_k".into(), self.top_k.to_string());
@@ -357,7 +362,7 @@ impl UiConfig {
     fn build(settings: &AppSettings, domain: &str) -> Self {
         let mut out = Self::empty();
         match domain {
-            "llm" => out.llm = Some(LlmConfig::from_settings(&settings.llm.sampling)),
+            "llm" => out.llm = Some(LlmConfig::from_settings(&settings.llm)),
             "tts" => out.tts = Some(TtsConfig::from_settings(&settings.tts)),
             "stt" => out.stt = Some(SttConfig::from_settings(&settings.stt)),
             "retrieval" => {

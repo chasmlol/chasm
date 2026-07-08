@@ -427,6 +427,23 @@ pub fn router(config: AppConfig) -> Router {
             }
         });
 
+        // Loot sweeps run on their OWN fast cadence: completion reports feed
+        // the voiced "here's your milk" turn and container choices hold the
+        // NPC at an open container - the 3s scheduler tick added most of the
+        // dead time the player felt before the NPC spoke (sub-second turn,
+        // multi-second plumbing). Cheap directory reads; 500ms is fine.
+        let sweep_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                ticker.tick().await;
+                let s = Arc::clone(&sweep_state);
+                let _ = tokio::task::spawn_blocking(move || scheduler::sweep_loot_reports(&s)).await;
+                let s2 = Arc::clone(&sweep_state);
+                let _ = tokio::task::spawn_blocking(move || scheduler::sweep_world_records(&s2)).await;
+            }
+        });
+
         // NPC movement engine tick: advance every active journey along its route
         // against the in-game clock (leave on time, walk, arrive on time), emitting
         // the position commands the plugin applies. Same cadence + fire-and-forget
@@ -2866,6 +2883,12 @@ pub(crate) fn apply_llm_form(llm: &mut LlmSettings, form: &HashMap<String, Strin
 
     apply_llm_sampling_form(&mut llm.sampling, form);
 
+    // Enum-grammar experiment toggle. VALUE-based (not checkbox-presence), so a
+    // form that doesn't know about the field leaves the setting untouched.
+    if let Some(value) = form.get("npc_action_enum") {
+        llm.npc_action_enum = matches!(value.trim(), "true" | "on" | "1");
+    }
+
     // Live chat orchestrator. The whole section posts together, so the checkbox
     // is authoritative: present = enabled, absent = disabled.
     llm.orchestrator_enabled = form.contains_key("orchestrator_enabled");
@@ -3912,6 +3935,7 @@ mod tests {
             turn_actions: Vec::new(),
             in_combat: false,
             combat_with: Vec::new(),
+            interstitial: false,
         }
     }
 

@@ -247,7 +247,11 @@ fn project_message(message: &MessageView) -> UiChatMessage {
         && injected_quests.is_empty()
         && offered_actions.is_empty()
         && executed_actions.is_empty()
-        && !message.in_combat;
+        && !message.in_combat
+        // Interstitial speech fragments (a line said mid-loop) intentionally
+        // carry no context - it rides the canonical turn message - so they must
+        // not render as "no turn context recorded".
+        && !message.interstitial;
 
     UiChatMessage {
         id: message.id.clone(),

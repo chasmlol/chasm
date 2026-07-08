@@ -67,33 +67,27 @@ pub const STRUCTURED_OUTPUT_INSTRUCTION: &str = concat!(
 );
 
 /// The action instruction for a REGULAR NPC (everyone except the admin/Todd
-/// path). Actions are FUNCTION CALLS — the syntax models are most reliably trained
-/// on, which removes the ambiguity of free-form strings (where the place ends, is
-/// that a time or a target). Each is `word(args)` with optional `to=`/`at=`/
-/// `target=`; the normalizer parses the call. Chosen in `build_chat_messages` for
-/// non-admin turns.
+/// path). Each action is a step object `{do, target, at, when, after}`; the
+/// normalizer resolves the verb (alias → book verbs → semantic snap) and routes
+/// deferred steps to the scheduler. DELIBERATELY EXAMPLE-FREE: models parrot
+/// examples — observed live, the two conditional-attack examples (both naming
+/// Easy Pete) made every plain "kill X" come out with a bolted-on `when`
+/// condition, so the order scheduled instead of firing. Every behavior the
+/// examples taught is spelled out as an explicit rule instead. Chosen in
+/// `build_chat_messages` for non-admin turns.
 pub const NPC_STRUCTURED_OUTPUT_INSTRUCTION: &str = r#"Reply with ONE JSON object and nothing else:
 {"speech": "<what you say out loud>", "actions": [<steps>]}
-- "speech": only your spoken words - no name, no narration, no action words.
-- "actions": an ORDERED list of the things you physically do. You perform them in order, each step starting only after the step before it finishes. Use [] when you are only talking.
 
-Each step is an object: {"do": "<verb>", "target": "<who or where>", "at": "<clock time>", "when": "<event>", "after": "<delay>"}.
-- "do": the single verb for what you physically do (wave, travel, attack, follow, wait, give, ...). Use the most natural verb for what you're doing - the system maps it to the closest real action, so it need not be an exact match.
-- "target": who or where the step is aimed at - the player as "player", a nearby person by name, or a place name for a travel step. Omit when it needs none.
-- "at": wait until this in-game clock time to START the step, e.g. "7:00PM". Optional.
-- "when": wait for this EVENT before the step, in plain words - e.g. "the player says hello", "Easy Pete comes near", "it gets dark". Optional.
-- "after": once the step is otherwise ready, wait this long before doing it, e.g. "30 seconds", "5 minutes". Optional.
+"speech": your spoken words only - leave it "" whenever you have nothing worth saying. You do NOT talk every turn: while carrying out a task you mostly work in silence ("") and speak only when it actually matters - answering the player, reacting to something notable, or when a job is finished. Do NOT narrate each step ("I have taken the X, Master" after every grab is wrong). You are free to act without a word, to speak without acting, or to do both - whatever fits the moment.
+"actions": what you physically DO. [] when you are only talking, or doing nothing.
 
-Use "at" for a clock time, "when" for an event, "after" for a delay; a step may have none (do it now) or combine them. The list order IS the word "then": to do A then B, put A before B; to do something after you arrive somewhere, list the travel step first and that step second.
-Times are ALWAYS a clock time like "2:52PM" or "11:00AM". You are told the current in-game time; convert a relative time such as "in five minutes" to the actual clock time yourself - never write "in an hour". If the player asks you to do something later or on an event, emit the step with "at"/"when" set - do NOT just say you will.
-Only put a step in "actions" for a PHYSICAL action (moving, gesturing, fighting, giving) - not for talking, smiling, or nodding.
+Each step: {"action": "...", "target": "...", "items": "...", "time": "", "condition": "", "delay": ""}
+- "action": one of your available actions.
+- "target": who or where it is aimed at - "player", a person's name, a place, a container. "" when none.
+- "items": what to take, when taking things. "" otherwise.
+- "time"/"condition"/"delay": ONLY when the player asked for a later clock time, an event to wait for, or a delay - that puts the step on your schedule instead of doing it now. Otherwise leave them "".
 
-Examples (when the current time is 6:32PM):
-- "wave at me" -> {"speech":"Sure thing.","actions":[{"do":"wave","target":"player"}]}
-- "give me a wave in five minutes" -> {"speech":"You got it.","actions":[{"do":"wave","target":"player","at":"6:37PM"}]}
-- "come to me at 7pm then wave" -> {"speech":"I'll be there.","actions":[{"do":"travel","target":"player","at":"7:00PM"},{"do":"wave","target":"player"}]}
-- "if Easy Pete comes near, shoot him" -> {"speech":"...","actions":[{"do":"attack","target":"Easy Pete","when":"Easy Pete comes near"}]}
-- "when I say hi, wait 30 seconds then kill Easy Pete" -> {"speech":"...","actions":[{"do":"attack","target":"Easy Pete","when":"the player says hi","after":"30 seconds"}]}"#;
+You act in a loop: do something, the world tells you what happened, then you decide your next step from what it said. Act only on what you have seen."#;
 
 /// Verbatim from `src/headless/quest-books.js` `QUEST_BOOK_STRUCTURED_OUTPUT_INSTRUCTION`.
 pub const QUEST_BOOK_STRUCTURED_OUTPUT_INSTRUCTION: &str = concat!(
@@ -224,6 +218,17 @@ fn retrieve_ids(
 /// (see [`action_embed_candidates`]). Returns the single best action id at or
 /// above `floor`, or `None` when nothing is close enough — a wild guess no-ops
 /// rather than firing the wrong action.
+///
+/// Ranks by RAW EMBEDDING COSINE, deliberately skipping the reranker: the
+/// cross-encoder judges "does this passage answer this query" and scores terse
+/// verb queries near zero even on perfect matches (measured on the real FNV
+/// book: "attack" -> sigmoid 0.25 against the combat entry whose text contains
+/// "attack" — every kill/attack phrasing landed below the 0.5 floor and the
+/// action silently dropped). Verb-to-intent-text matching is a similarity
+/// problem, not a relevance one; cosines separate cleanly ("kill" -> 0.63 vs
+/// junk band ~0.45-0.52). The cosine is remapped through the same 0.45..0.80
+/// calibration as the no-reranker retrieval path so `floor` keeps its 0..1
+/// meaning.
 pub fn resolve_guess_to_action(
     ctx: &RetrievalCtx,
     guess: &str,
@@ -235,7 +240,183 @@ pub fn resolve_guess_to_action(
         return None;
     }
     let built = build_candidates(ctx, candidates.iter().cloned());
-    retrieve_ids(ctx, guess, &built, 1, floor).into_iter().next()
+    let query_text = ctx.retriever.query_text(guess);
+    let query_vec = ctx.cache.get_or_embed(ctx.retriever, &query_text).ok()?;
+    let (best_id, best_cos) = built
+        .iter()
+        .map(|(id, vec, _)| (id, chasm_embed::cosine_similarity(&query_vec, vec)))
+        .max_by(|a, b| a.1.total_cmp(&b.1))?;
+    // Same remap as chasm-embed's no-reranker scoring: BGE cosines have a high
+    // baseline (junk ~0.45-0.52, real hits ~0.55-0.80).
+    let relevance = ((best_cos - 0.45) / 0.35).clamp(0.0, 1.0);
+    (relevance >= floor).then(|| best_id.clone())
+}
+
+/// `(action_id, verb)` pairs from each entry's explicit `verbs` lexicon — the
+/// DETERMINISTIC verb->action layer of guess correction, consulted after the
+/// alias map and before the semantic snap. Curated in the action book (e.g.
+/// combat.start lists "kill", "take him out"), so idiomatic phrasings that
+/// embedding geometry cross-matches to the wrong entry ("take him out" sits
+/// closer to the take-item gesture than to combat) resolve exactly.
+/// Every verb the enum-grammar experiment may sample for a request carrying
+/// `requested_scopes`: the canonical alias + `verbs` lexicon of every enabled,
+/// scope-passing entry, deduped in book order. All values resolve
+/// deterministically through the alias/verb maps — the list rides the sampler
+/// grammar, never the prompt. NOTE: the real FNV book scopes every entry (e.g.
+/// `["global","admin","godmode","game:fallout-new-vegas"]`) — eligibility is
+/// [`action_passes_scopes`] (global always passes), NOT `scopes.is_empty()`.
+pub fn action_enum_values(actions: &[ActionEntry], requested_scopes: &[String]) -> Vec<String> {
+    let eligible: Vec<ActionEntry> = actions
+        .iter()
+        .filter(|entry| !entry.disable && action_passes_scopes(entry, requested_scopes))
+        .cloned()
+        .collect();
+    let mut values = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (_, alias) in action_alias_pairs(&eligible) {
+        if !alias.is_empty() && seen.insert(alias.clone()) {
+            values.push(alias);
+        }
+    }
+    for (_, verb) in action_verb_pairs(&eligible) {
+        let verb = verb.trim().to_string();
+        if !verb.is_empty() && seen.insert(verb.to_string()) {
+            values.push(verb);
+        }
+    }
+    values
+}
+
+/// Engine marker for QUERY-kind action entries: executed by chasm itself
+/// (information lookups), never dispatched to the game. The agent loop
+/// continues the reply after answering them.
+pub const QUERY_ACTION_ENGINE: &str = "chasm:query";
+
+/// Whether a book entry is a query (see [`QUERY_ACTION_ENGINE`]).
+pub fn is_query_entry(entry: &ActionEntry) -> bool {
+    entry
+        .binding
+        .get("engine")
+        .and_then(Value::as_str)
+        .map(|engine| engine.trim().eq_ignore_ascii_case(QUERY_ACTION_ENGINE))
+        .unwrap_or(false)
+}
+
+/// The action id of the `find_action` tool - the ONLY action a regular NPC can
+/// reach out of the gate; every other action is discovered THROUGH it.
+pub const FIND_ACTION_ID: &str = "chasm.find_action";
+
+/// First-sentence gloss of an action's description (drops a leading `QUERY:` tag
+/// and the trailing period) - the one-line summary shown for a discovered action.
+fn first_action_sentence(entry: &ActionEntry) -> String {
+    let desc = entry.description.trim().trim_start_matches("QUERY:").trim();
+    desc.split(". ").next().unwrap_or(desc).trim_end_matches('.').to_string()
+}
+
+/// The ACTIONS section injected into every regular-NPC turn. No action is listed
+/// or offered directly: the ONLY thing the NPC can do out of the gate is
+/// `find_action`, a semantic search over everything he is capable of. He
+/// describes what he wants ("loot a container", "play a song"), gets back the
+/// real actions that match, then emits one of THOSE - which is when the grammar
+/// re-locks to the found set. Discovery persists across the loop, so he searches
+/// once per new intent, not once per step. The catalog never rides the prompt;
+/// the embedder is the index. Returns empty when `find_action` is out of scope
+/// (byte-identical prompt for NPCs who cannot search).
+pub fn npc_actions_instruction(entries: &[ActionEntry], requested_scopes: &[String]) -> String {
+    let find = entries.iter().find(|e| {
+        e.action_id == FIND_ACTION_ID && !e.disable && action_passes_scopes(e, requested_scopes)
+    });
+    let Some(find) = find else {
+        return String::new();
+    };
+    let alias = {
+        let a = structured_action_alias(find);
+        if a.is_empty() { "find_action".to_string() } else { a }
+    };
+    format!(
+        "
+ACTIONS - you cannot act directly. To DO anything at all - move, loot, fight, sit, gesture, search the room, check what you carry - first FIND the action: emit \"{alias}\" with an empty speech string and set its target to a plain description of what you are trying to do (e.g. \"loot a container\", \"play a song\", \"sit down\", \"look around the room for loot\"). You get back the real actions that match; read them, then emit ONE of them using the exact verb shown. Some of those actions only LOOK or CHECK and answer instantly (searching the room, checking your inventory): emit those with an empty speech string too, read the result, then act on it. What you find stays available for the rest of what you are doing, so search once for a new goal, not for every step. Never invent an action you have not found, and never answer a question in the same round you check something.
+"
+    )
+}
+
+/// Top-`top_k` actions whose embedding text is closest to `query`, by RAW COSINE
+/// (the same verb-vs-intent similarity path [`resolve_guess_to_action`] uses, not
+/// the relevance reranker - terse action text scores near zero under the
+/// cross-encoder), best first. Backs the `find_action` tool: the NPC describes an
+/// intent and gets the real actions that match. `candidates` is
+/// `(action_id, embeddable_text)` (see [`action_embed_candidates`]); ids scoring
+/// below `floor` after the 0.45..0.80 cosine remap are dropped, so a nonsense
+/// query returns nothing rather than a wall of noise.
+pub fn search_actions_semantic(
+    ctx: &RetrievalCtx,
+    query: &str,
+    candidates: &[(String, String)],
+    top_k: usize,
+    floor: f32,
+    gap: f32,
+) -> Vec<String> {
+    let query = query.trim();
+    if query.is_empty() || candidates.is_empty() || top_k == 0 {
+        return Vec::new();
+    }
+    let built = build_candidates(ctx, candidates.iter().cloned());
+    let query_text = ctx.retriever.query_text(query);
+    let Ok(query_vec) = ctx.cache.get_or_embed(ctx.retriever, &query_text) else {
+        return Vec::new();
+    };
+    let mut scored: Vec<(String, f32)> = built
+        .iter()
+        .map(|(id, vec, _)| {
+            let cos = chasm_embed::cosine_similarity(&query_vec, vec);
+            (id.clone(), ((cos - 0.45) / 0.35).clamp(0.0, 1.0))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    // Absolute floor cuts clear junk; the RELATIVE gap cuts the tail a strong
+    // match would otherwise drag in - "pick up the pistol" scores take_items high,
+    // so a weak `attack`/gesture far below the best is dropped instead of padding
+    // top_k. Both must hold. Without the gap, top_k always returned k results even
+    // when only 2 were relevant, and the charged noun ("pistol") leaked combat in.
+    let best = scored.first().map(|(_, relevance)| *relevance).unwrap_or(0.0);
+    scored
+        .into_iter()
+        .filter(|(_, relevance)| *relevance >= floor && *relevance + gap >= best)
+        .take(top_k)
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// A human-facing listing of the actions a [`search_actions_semantic`] turned up:
+/// one `- alias: first sentence` line per id, in rank order, skipping ids with no
+/// matching entry or no alias. This is the QUERY RESULT the NPC reads before
+/// choosing one.
+pub fn describe_found_actions(entries: &[ActionEntry], ids: &[String]) -> String {
+    let mut lines = Vec::new();
+    for id in ids {
+        if let Some(entry) = entries.iter().find(|e| &e.action_id == id) {
+            let alias = structured_action_alias(entry);
+            if alias.is_empty() {
+                continue;
+            }
+            lines.push(format!("- {alias}: {}.", first_action_sentence(entry)));
+        }
+    }
+    lines.join("\n")
+}
+
+pub fn action_verb_pairs(actions: &[ActionEntry]) -> Vec<(String, String)> {
+    actions
+        .iter()
+        .filter(|entry| !entry.disable)
+        .flat_map(|entry| {
+            entry
+                .verbs
+                .iter()
+                .filter(|verb| !verb.trim().is_empty())
+                .map(|verb| (entry.action_id.clone(), verb.clone()))
+        })
+        .collect()
 }
 
 /// Env-gated (CHASM_RETRIEVAL_DUMP=1) content dump of what semantic retrieval
@@ -460,9 +641,18 @@ fn actions_from_array(
                         .map(|a| a.to_string())
                         .unwrap_or_default()
                 });
+            // take_items carries the item in `items` (target is forced empty by the
+            // grammar), so surface that as the chip's target for a readable
+            // "take_items -> Boxing Gloves".
             let target = object
                 .get("target")
                 .and_then(Value::as_str)
+                .filter(|t| !t.trim().is_empty())
+                .or_else(|| {
+                    (id == "world.take_items")
+                        .then(|| object.get("items").and_then(Value::as_str))
+                        .flatten()
+                })
                 .unwrap_or("")
                 .trim()
                 .to_string();
@@ -1011,7 +1201,7 @@ fn quest_passes_scopes(quest: &QuestEntry, requested_scopes: &[String]) -> bool 
 /// "empty requested → pass" loophole, so an admin-only action (`scopes:["admin"]`)
 /// is never offered to a request that lacks the `admin` scope (regular NPCs). An
 /// action with no scopes is always available.
-fn action_passes_scopes(action: &ActionEntry, requested_scopes: &[String]) -> bool {
+pub fn action_passes_scopes(action: &ActionEntry, requested_scopes: &[String]) -> bool {
     if action.scopes.is_empty() {
         return true;
     }
@@ -2255,6 +2445,8 @@ mod tests {
             action_id: action_id.to_string(),
             alias: None,
             short_name: None,
+            verbs: Vec::new(),
+            group: String::new(),
             risk_tier: String::new(),
             parameters_schema: Value::Null,
             preconditions: Vec::new(),
@@ -2285,6 +2477,45 @@ mod tests {
             structured_action_alias(&action("world.open_gate", "Open gate")),
             "open_gate"
         );
+    }
+
+    #[test]
+    fn describe_found_actions_lists_alias_and_first_sentence() {
+        let mut loot = action("world.loot_container", "Loot");
+        loot.alias = Some("loot_container".to_string());
+        loot.description = "Walk to ONE container and open it. Then take from it.".to_string();
+        let mut search = action("world.search_area", "Search");
+        search.alias = Some("search_area".to_string());
+        search.description =
+            "QUERY: one picture of everything lootable around you. No target needed.".to_string();
+        let entries = vec![loot, search];
+        // Rank order preserved; a leading `QUERY:` is stripped; only the first
+        // sentence is kept; an id with no matching entry is skipped silently.
+        let ids = vec![
+            "world.search_area".to_string(),
+            "world.loot_container".to_string(),
+            "missing.id".to_string(),
+        ];
+        assert_eq!(
+            describe_found_actions(&entries, &ids),
+            "- search_area: one picture of everything lootable around you.\n\
+             - loot_container: Walk to ONE container and open it."
+        );
+    }
+
+    #[test]
+    fn npc_actions_instruction_is_find_action_only() {
+        let follow = action("movement.follow_target", "Follow");
+        // No find_action in scope => empty (the NPC has no way to search).
+        assert!(npc_actions_instruction(&[follow.clone()], &["global".to_string()]).is_empty());
+
+        let mut find = action(FIND_ACTION_ID, "Find action");
+        find.alias = Some("find_action".to_string());
+        let out = npc_actions_instruction(&[find, follow], &["global".to_string()]);
+        assert!(out.contains("find_action"), "names the search tool");
+        assert!(out.contains("cannot act directly"));
+        // The catalog must NOT ride the prompt - other actions stay unnamed.
+        assert!(!out.contains("follow"), "must not enumerate other actions");
     }
 
     #[test]
@@ -2468,6 +2699,7 @@ mod tests {
             turn_actions: Vec::new(),
             in_combat: false,
             combat_with: Vec::new(),
+            interstitial: false,
         };
         // Empty name + player role => "user: ...".
         assert_eq!(format_chat_vector_line(&msg), "user: Where's the doctor?");

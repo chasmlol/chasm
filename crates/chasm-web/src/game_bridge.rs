@@ -597,6 +597,7 @@ mod tests {
             action_id: "attack-1".into(),
             reason: "player asked".into(),
             actions: Vec::new(),
+            ..GameMaster::none()
         };
         let queued = sink.action(&config, &request, &actor, &gm, "test-source");
         assert!(!queued, "HTTP sink never owns the durable queue");

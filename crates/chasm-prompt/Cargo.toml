@@ -17,3 +17,5 @@ chasm-st-compat = { path = "../chasm-st-compat" }
 [dev-dependencies]
 # Tests build minimal PNG character cards (base64-encoded tEXt payloads).
 base64.workspace = true
+# The ignored enum_ab harness drives a live llama-server (blocking: tests are sync).
+reqwest = { workspace = true, features = ["blocking"] }

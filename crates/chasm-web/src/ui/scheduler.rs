@@ -95,6 +95,18 @@ fn trigger_view(trigger: &Trigger) -> (String, String) {
             "In-game time".to_string(),
             format!("Day {day}, {}", format_hour_label(*hour)),
         ),
+        Trigger::OwnerJourneyDone => (
+            "Sequence".to_string(),
+            "When the previous journey arrives".to_string(),
+        ),
+        Trigger::LootDone { .. } => (
+            "Sequence".to_string(),
+            "When the previous looting finishes".to_string(),
+        ),
+        Trigger::PrevSettled { .. } => (
+            "Sequence".to_string(),
+            "Shortly after the previous step".to_string(),
+        ),
         Trigger::Condition { condition } => {
             let name = match serde_json::to_value(condition) {
                 Ok(Value::Object(map)) => map
@@ -121,6 +133,9 @@ fn trigger_view(trigger: &Trigger) -> (String, String) {
 fn trigger_is_deferred(trigger: &Trigger) -> bool {
     match trigger {
         Trigger::Time { .. } => true,
+        Trigger::OwnerJourneyDone => true,
+        Trigger::LootDone { .. } => true,
+        Trigger::PrevSettled { .. } => true,
         Trigger::Condition { condition } => !matches!(condition, scheduler::Condition::Immediate),
     }
 }

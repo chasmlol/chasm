@@ -194,6 +194,173 @@ pub fn structured_response_format() -> Value {
     })
 }
 
+/// The structured-output response format for a REGULAR NPC turn. Unlike the
+/// admin shape above, the step objects are FULLY schema-enforced (llama.cpp
+/// compiles this to a GBNF grammar): exactly the five known fields, `action`
+/// required, nothing else samplable — so a malformed step can no longer be
+/// generated. `speech` is listed first ON PURPOSE: the grammar fixes field
+/// order (serde_json runs with preserve_order here), and speech-first is what
+/// lets the TTS pipeline start speaking while the actions are still generating.
+///
+/// `action_enum`: when set (the enum-grammar experiment), the step verb is
+/// constrained to the book's aliases + verb lexicon at SAMPLING time — the
+/// model never sees the list, the sampler steers it onto the nearest legal
+/// verb. When `None`, the verb is a free string and the resolver (alias →
+/// verbs → embedder snap) corrects it after generation.
+/// Loot grammar constraints for the enum experiment. `verbs` = the book's
+/// loot_container alias+verbs; `container_names` = the containers/bodies a
+/// search DISCOVERED this turn. Pre-search (names empty) the loot verbs are
+/// EXCLUDED from the verb enum entirely — the model structurally cannot loot
+/// before searching. Post-search a dedicated step branch pins `target` to the
+/// real names, so "loot the bottle"-style misroutes cannot be generated.
+#[derive(Debug, Clone, Default)]
+pub struct LootGrammar {
+    /// loot_container alias+verbs. Excluded from the generic verb enum until a
+    /// container is discovered (search-first is structural); then pinned.
+    pub verbs: Vec<String>,
+    /// Containers/bodies a search discovered — loot_container's target is pinned
+    /// to exactly these.
+    pub container_names: Vec<String>,
+    /// take_items alias+verbs. Always emittable (a bare take triggers the scan);
+    /// once items are known, moved to the pinned take branch below.
+    pub take_verbs: Vec<String>,
+    /// Loose items a scan / open container revealed — take_items' `items` field is
+    /// pinned to exactly these plus "everything" and "[none]", so he must pick a
+    /// real item or explicitly decline (never forced to grab something).
+    pub item_names: Vec<String>,
+    /// give_item alias+verbs. Always emittable (a bare give triggers the inventory
+    /// scan); once his inventory is known, moved to the pinned give branch below.
+    pub give_verbs: Vec<String>,
+    /// The NPC's OWN carried items an inventory check revealed — give_item's `items`
+    /// field is pinned to exactly these plus "[none]", so he hands over a real item
+    /// or explicitly gives nothing (never a hallucinated one, never "everything").
+    pub inventory_names: Vec<String>,
+}
+
+pub fn npc_structured_response_format(
+    action_enum: Option<&[String]>,
+    loot: Option<&LootGrammar>,
+) -> Value {
+    let step_schema =
+        |action_values: Option<&[String]>, target_values: Option<&[String]>, items_values: Option<&[String]>| -> Value {
+            let field = |desc: &str, values: Option<&[String]>| -> Value {
+                let mut m = serde_json::Map::new();
+                m.insert("type".to_string(), json!("string"));
+                m.insert("description".to_string(), json!(desc));
+                if let Some(values) = values {
+                    if !values.is_empty() {
+                        m.insert("enum".to_string(), json!(values));
+                    }
+                }
+                Value::Object(m)
+            };
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "action": field("ONE short verb for what the NPC physically does.", action_values),
+                    "target": field("Who or where the step is aimed at.", target_values),
+                    "items": field("For taking or giving things: an exact item name (plus \"everything\"/\"[none]\" where those are offered).", items_values),
+                    "time": { "type": "string", "description": "In-game clock time to start, e.g. \"7:00PM\"." },
+                    "condition": { "type": "string", "description": "Event to wait for, in plain words." },
+                    "delay": { "type": "string", "description": "Delay once otherwise ready, e.g. \"30 seconds\"." }
+                },
+                "required": ["action", "target", "items"]
+            })
+        };
+
+    // The step grammar. Without the verb enum everything stays a free string (the
+    // resolver corrects after generation) and no pinning can bind. With the enum
+    // on, up to three branches:
+    //   * generic  - every verb EXCEPT loot verbs (need a container first) and,
+    //                once items are known, take verbs (they move to the take branch).
+    //   * loot     - once a container is discovered: loot verbs, target pinned to it.
+    //   * take     - once items are known (scan / open container): take verbs, the
+    //                `items` field pinned to the real names + "everything" + "[none]".
+    // Pre-scan, take verbs stay in the generic branch with a FREE items field, so a
+    // bare take_items is emittable and triggers the scan.
+    let steps = match (action_enum, loot) {
+        (Some(values), Some(grammar))
+            if !grammar.verbs.is_empty()
+                || !grammar.take_verbs.is_empty()
+                || !grammar.give_verbs.is_empty() =>
+        {
+            let is = |set: &[String], v: &String| set.iter().any(|s| s.eq_ignore_ascii_case(v));
+            let pin_take = !grammar.item_names.is_empty() && !grammar.take_verbs.is_empty();
+            // give mirrors take: pre-scan the give verb stays in the generic branch
+            // (a bare give triggers the inventory scan); once the inventory is known
+            // it moves to a pinned branch (items = his carried items + "[none]").
+            let pin_give = !grammar.inventory_names.is_empty() && !grammar.give_verbs.is_empty();
+            let other: Vec<String> = values
+                .iter()
+                .filter(|v| !is(&grammar.verbs, v))
+                .filter(|v| !(pin_take && is(&grammar.take_verbs, v)))
+                .filter(|v| !(pin_give && is(&grammar.give_verbs, v)))
+                .cloned()
+                .collect();
+            let mut branches = vec![step_schema(Some(&other), None, None)];
+            if !grammar.container_names.is_empty() {
+                branches.push(step_schema(Some(&grammar.verbs), Some(&grammar.container_names), None));
+            }
+            // Force target EMPTY on a take/give. The item lives in the pinned `items`
+            // field; leaving target free let the model dump a HALLUCINATED item there
+            // ("take_items target=Pip-Boy Glove items=Boxing Gloves") which then
+            // surfaced / leaked to the mod. Empty target => the only item name that
+            // can escape is a real, pinned one.
+            let empty_target = [String::new()];
+            if pin_take {
+                let mut opts = grammar.item_names.clone();
+                opts.push("everything".to_string());
+                opts.push("[none]".to_string());
+                branches.push(step_schema(
+                    Some(&grammar.take_verbs),
+                    Some(&empty_target),
+                    Some(&opts),
+                ));
+            }
+            if pin_give {
+                // Giving has no "everything" - he hands over ONE named item (or
+                // "[none]"); giving away his whole pack would be a footgun.
+                let mut opts = grammar.inventory_names.clone();
+                opts.push("[none]".to_string());
+                branches.push(step_schema(
+                    Some(&grammar.give_verbs),
+                    Some(&empty_target),
+                    Some(&opts),
+                ));
+            }
+            if branches.len() == 1 {
+                branches.into_iter().next().unwrap()
+            } else {
+                json!({ "anyOf": branches })
+            }
+        }
+        _ => step_schema(action_enum, None, None),
+    };
+
+    json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "chasm_npc_reply",
+            "description": "An NPC reply: spoken text plus the physical steps taken this turn.",
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "speech": { "type": "string", "description": "The NPC's spoken words only; \"\" when acting silently or when there's nothing worth saying." },
+                    "actions": {
+                        "type": "array",
+                        "description": "Ordered physical steps this turn. Empty when only talking.",
+                        "items": steps
+                    }
+                },
+                "required": ["speech", "actions"]
+            }
+        }
+    })
+}
+
 /// Optional per-request generation knobs (used by the speaker-selection LLM
 /// call, which honors the custom-model temperature/max_tokens settings).
 #[derive(Debug, Clone, Copy, Default)]
@@ -760,6 +927,163 @@ fn parse_delta(payload: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn npc_schema_orders_speech_first_and_constrains_steps() {
+        // llama.cpp's json_schema->grammar conversion fixes FIELD ORDER from the
+        // serialized property order — speech MUST come first or TTS waits for
+        // the actions to generate. This also pins that serde_json preserves
+        // insertion order in this build (a dependency enables preserve_order;
+        // if that ever drops, properties serialize alphabetically = actions
+        // first, and this test catches it).
+        let format = super::npc_structured_response_format(None, None);
+        let serialized = serde_json::to_string(&format).unwrap();
+        let speech_pos = serialized.find("\"speech\"").unwrap();
+        let actions_pos = serialized.find("\"actions\"").unwrap();
+        assert!(speech_pos < actions_pos, "speech must serialize before actions");
+        // Step objects: fully closed shape, action required.
+        let step = &format["json_schema"]["schema"]["properties"]["actions"]["items"];
+        assert_eq!(step["additionalProperties"], serde_json::json!(false));
+        assert_eq!(step["required"], serde_json::json!(["action", "target", "items"]));
+        assert!(step["properties"]["action"].get("enum").is_none());
+        // Enum variant: the verb list rides the grammar.
+        let vals = vec!["attack".to_string(), "kill".to_string()];
+        let format = super::npc_structured_response_format(Some(&vals), None);
+        let step = &format["json_schema"]["schema"]["properties"]["actions"]["items"];
+        assert_eq!(
+            step["properties"]["action"]["enum"],
+            serde_json::json!(["attack", "kill"])
+        );
+        // Empty enum degrades to a free string, not an unsatisfiable grammar.
+        let format = super::npc_structured_response_format(Some(&[]), None);
+        let step = &format["json_schema"]["schema"]["properties"]["actions"]["items"];
+        assert!(step["properties"]["action"].get("enum").is_none());
+    }
+
+    /// Loot grammar pin: pre-search the loot verbs are EXCLUDED from the verb
+    /// enum (search-first is structural); post-search an anyOf branch pins
+    /// loot_container's target to the discovered names.
+    #[test]
+    fn loot_grammar_excludes_then_pins() {
+        let vals: Vec<String> = ["loot", "wave", "search containers"].iter().map(|s| s.to_string()).collect();
+        let loot = super::LootGrammar {
+            verbs: vec!["loot".into()],
+            ..Default::default()
+        };
+        let format = super::npc_structured_response_format(Some(&vals), Some(&loot));
+        let step = format.pointer("/json_schema/schema/properties/actions/items").unwrap();
+        let action_enum = step.pointer("/properties/action/enum").unwrap();
+        assert!(!action_enum.to_string().contains("loot"), "pre-search enum still contains loot: {action_enum}");
+        assert!(action_enum.to_string().contains("wave"));
+
+        let loot = super::LootGrammar {
+            verbs: vec!["loot".into()],
+            container_names: vec!["Oven".into(), "Footlocker".into()],
+            ..Default::default()
+        };
+        let format = super::npc_structured_response_format(Some(&vals), Some(&loot));
+        let step = format.pointer("/json_schema/schema/properties/actions/items").unwrap();
+        let branches = step.get("anyOf").and_then(serde_json::Value::as_array).expect("anyOf branches");
+        // A loot branch (target pinned) + the generic branch (no loot verb).
+        let loot_branch = branches.iter().find(|b| b.pointer("/properties/target/enum").is_some()).expect("loot branch");
+        let target_enum = loot_branch.pointer("/properties/target/enum").unwrap().to_string();
+        assert!(target_enum.contains("Oven") && target_enum.contains("Footlocker"));
+        assert!(branches.iter().all(|b| !b.pointer("/properties/action/enum").unwrap().to_string().contains("loot")
+            || b.pointer("/properties/target/enum").is_some()));
+    }
+
+    /// take_items: bare (no items yet) stays in the generic enum so it can trigger
+    /// the scan; once items are known, a take branch pins `items` to the real names
+    /// plus "everything" and "[none]", and the take verb leaves the generic branch.
+    #[test]
+    fn take_grammar_pins_items_with_none_option() {
+        let vals: Vec<String> =
+            ["take", "wave", "loot"].iter().map(|s| s.to_string()).collect();
+        // Pre-scan: take verb still emittable (generic), no take branch.
+        let g = super::LootGrammar {
+            verbs: vec!["loot".into()],
+            take_verbs: vec!["take".into()],
+            ..Default::default()
+        };
+        let f = super::npc_structured_response_format(Some(&vals), Some(&g));
+        let step = f.pointer("/json_schema/schema/properties/actions/items").unwrap();
+        // No items known and no containers -> single generic branch containing "take".
+        assert!(step.pointer("/properties/action/enum").unwrap().to_string().contains("take"));
+
+        // Post-scan: items known -> a take branch pins items, take leaves generic.
+        let g = super::LootGrammar {
+            verbs: vec!["loot".into()],
+            take_verbs: vec!["take".into()],
+            item_names: vec!["Hammer".into(), "9mm Pistol".into()],
+            ..Default::default()
+        };
+        let f = super::npc_structured_response_format(Some(&vals), Some(&g));
+        let branches = f
+            .pointer("/json_schema/schema/properties/actions/items/anyOf")
+            .and_then(serde_json::Value::as_array)
+            .expect("anyOf branches");
+        let take_branch = branches
+            .iter()
+            .find(|b| b.pointer("/properties/items/enum").is_some())
+            .expect("take branch with pinned items");
+        let items_enum = take_branch.pointer("/properties/items/enum").unwrap().to_string();
+        assert!(items_enum.contains("Hammer") && items_enum.contains("9mm Pistol"));
+        assert!(items_enum.contains("everything") && items_enum.contains("[none]"));
+        // Target is forced empty on a take so no hallucinated item can ride it.
+        assert_eq!(take_branch.pointer("/properties/target/enum").unwrap(), &json!([""]));
+        // The take verb must NOT be in the generic branch anymore.
+        let generic = branches
+            .iter()
+            .find(|b| b.pointer("/properties/items/enum").is_none() && b.pointer("/properties/target/enum").is_none())
+            .expect("generic branch");
+        assert!(!generic.pointer("/properties/action/enum").unwrap().to_string().contains("take"));
+    }
+
+    /// give mirrors take, over the NPC's own inventory: pre-check the give verb is
+    /// generic (a bare give triggers the inventory scan); once the inventory is
+    /// known, a branch pins `items` to his carried items + "[none]" (NO
+    /// "everything"), with target forced empty, and the give verb leaves generic.
+    #[test]
+    fn give_grammar_pins_inventory_with_none_only() {
+        let vals: Vec<String> = ["give", "wave", "take"].iter().map(|s| s.to_string()).collect();
+        // Pre-check: give verb still emittable in the generic branch, no give branch.
+        let g = super::LootGrammar {
+            give_verbs: vec!["give".into()],
+            ..Default::default()
+        };
+        let f = super::npc_structured_response_format(Some(&vals), Some(&g));
+        let step = f.pointer("/json_schema/schema/properties/actions/items").unwrap();
+        assert!(step.pointer("/properties/action/enum").unwrap().to_string().contains("give"));
+
+        // Post-check: inventory known -> a give branch pins items, give leaves generic.
+        let g = super::LootGrammar {
+            give_verbs: vec!["give".into()],
+            inventory_names: vec!["Stimpak".into(), "Purified Water".into()],
+            ..Default::default()
+        };
+        let f = super::npc_structured_response_format(Some(&vals), Some(&g));
+        let branches = f
+            .pointer("/json_schema/schema/properties/actions/items/anyOf")
+            .and_then(serde_json::Value::as_array)
+            .expect("anyOf branches");
+        let give_branch = branches
+            .iter()
+            .find(|b| b.pointer("/properties/items/enum").is_some())
+            .expect("give branch with pinned items");
+        let items_enum = give_branch.pointer("/properties/items/enum").unwrap().to_string();
+        assert!(items_enum.contains("Stimpak") && items_enum.contains("Purified Water"));
+        assert!(items_enum.contains("[none]"));
+        // Giving has NO "everything" - one named item or nothing.
+        assert!(!items_enum.contains("everything"));
+        // Target forced empty so no hallucinated recipient/item can ride it.
+        assert_eq!(give_branch.pointer("/properties/target/enum").unwrap(), &json!([""]));
+        // The give verb must NOT be in the generic branch anymore.
+        let generic = branches
+            .iter()
+            .find(|b| b.pointer("/properties/items/enum").is_none() && b.pointer("/properties/target/enum").is_none())
+            .expect("generic branch");
+        assert!(!generic.pointer("/properties/action/enum").unwrap().to_string().contains("give"));
+    }
+
     use super::*;
     use chasm_core::LlmSamplingSettings;
 

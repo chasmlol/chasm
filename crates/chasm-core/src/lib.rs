@@ -345,6 +345,14 @@ pub struct MessageView {
     /// `extra.chasm.combat_with`). Empty unless `in_combat`.
     #[serde(default)]
     pub combat_with: Vec<String>,
+    /// True for an interstitial speech FRAGMENT the NPC said mid-loop (before a
+    /// tool result), persisted so the chat shows it where he said it rather than
+    /// dumped after the world beats by `finalize_turn`. The turn's context strip
+    /// (lore / quests / executed actions) rides the canonical turn message, so a
+    /// fragment records no context and must NOT show the "no turn context
+    /// recorded" note. `false` for full turns and pre-feature messages.
+    #[serde(default)]
+    pub interstitial: bool,
 }
 
 /// One lore/quest/action entry that was injected into a single turn's prompt,

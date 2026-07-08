@@ -875,6 +875,20 @@ fn extract_chasm_metadata(
     (injected, turn_actions, in_combat, combat_with)
 }
 
+/// True when a persisted message is an interstitial speech fragment (a line the
+/// NPC said mid-loop, before a tool result). The generation path stamps
+/// `extra.chasm.interstitial = true` on these so the UI renders them as a bare
+/// line - their turn context rides the canonical turn message, so they must not
+/// show the "no turn context recorded" note.
+fn message_is_interstitial(message: &STJsonlChatMessage) -> bool {
+    message
+        .extra
+        .get("chasm")
+        .and_then(|blob| blob.get("interstitial"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Parses an array of injected-entry objects, skipping anything that isn't an
 /// object. Each field defaults to empty so a partial record still renders.
 fn parse_injected_entries(value: Option<&Value>) -> Vec<InjectedEntryView> {
@@ -1060,6 +1074,7 @@ fn to_message_view(
         turn_actions,
         in_combat,
         combat_with,
+        interstitial: message_is_interstitial(message),
     }
 }
 
@@ -1094,6 +1109,7 @@ fn to_fallback_message_view(index: usize, message: &STJsonlChatMessage) -> Messa
         turn_actions,
         in_combat,
         combat_with,
+        interstitial: message_is_interstitial(message),
     }
 }
 
@@ -1101,7 +1117,14 @@ fn role_for_message(message: &STJsonlChatMessage) -> &'static str {
     if message.is_system {
         "system"
     } else if message.is_user {
-        "player"
+        // World-event / observation lines (searches, opens, pickups) are
+        // authored by the game under the "World" name - a distinct role so the
+        // UI can style them apart from the player's own messages.
+        if message.name.eq_ignore_ascii_case("world") {
+            "world"
+        } else {
+            "player"
+        }
     } else {
         "npc"
     }

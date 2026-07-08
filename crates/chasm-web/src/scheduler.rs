@@ -115,6 +115,21 @@ fn parse_num_field(value: Option<&Value>) -> Option<f64> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Trigger {
+    /// Met when the task OWNER has no journey in flight (their previous leg
+    /// arrived / lingered out / was cancelled). Drives agent travel chains:
+    /// "go to Doc Mitchell's THEN come back" — leg 2 launches when leg 1's
+    /// journey finishes. Evaluated against the movement store in
+    /// `advance_chain` (needs state, unlike the world-snapshot conditions).
+    OwnerJourneyDone,
+    /// Met when the loot errand with this request id has REPORTED (its
+    /// loot_report was swept into the completion registry). Gates the step
+    /// AFTER a loot step: "loot the room, THEN do pushups" waits for the
+    /// actual sweep to finish, not for the command to be issued.
+    LootDone { request_id: String },
+    /// Met `ms` real milliseconds after the PREVIOUS chain step issued its
+    /// command — the settle window for instant-ish actions (gestures,
+    /// combat orders) that expose no engine completion signal.
+    PrevSettled { ms: u64 },
     /// Fires when the in-game clock reaches (or passes) `day`+`hour`.
     Time { day: u32, hour: f64 },
     /// Fires when `condition` evaluates true against the current world snapshot.
@@ -164,6 +179,10 @@ pub struct ChainStep {
     /// `delay_ms` to hold the step for the delay before issuing its command.
     #[serde(default)]
     pub armed_at_ms: i64,
+    /// Epoch ms when this step's command was issued (0 = not yet) — the
+    /// anchor for the NEXT step's `PrevSettled` window.
+    #[serde(default)]
+    pub issued_at_ms: i64,
     pub done: bool,
 }
 
@@ -210,8 +229,30 @@ pub struct SchedulerTask {
 pub struct SchedulerStore {
     #[serde(default)]
     pub version: u32,
+    /// Loot-errand completions (request id, recorded epoch ms) — the signal
+    /// `Trigger::LootDone` gates on. RECENCY MATTERS: a gate is satisfied only
+    /// by a completion recorded AFTER its previous step issued, so completions
+    /// carried across save reloads can never pre-satisfy a rolled-back chain
+    /// (observed live: a reloaded chain machine-gunned all its steps at once,
+    /// each stomping the previous errand). Bounded (newest kept).
+    #[serde(default)]
+    pub completed_loot_ids: Vec<(String, i64)>,
     #[serde(default)]
     pub tasks: Vec<SchedulerTask>,
+    /// Completed agent errands the owner hasn't mentioned yet: consumed (and
+    /// spoken) on that NPC's next generation. Save-aware with the store.
+    #[serde(default)]
+    pub pending_reports: Vec<PendingReport>,
+}
+
+/// One completed-errand report, waiting for its owner's next line.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingReport {
+    pub npc_key: String,
+    pub npc_name: String,
+    pub live_chat_id: String,
+    pub summary: String,
+    pub created_at_ms: i64,
 }
 
 impl SchedulerStore {
@@ -407,16 +448,35 @@ pub fn restore_scheduler_store(content_root: &Path, checkpoint_id: &str) {
     if let Some(dir) = dst.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    match std::fs::read(scheduler_checkpoint_path(content_root, checkpoint_id)) {
-        Ok(bytes) => {
-            let _ = std::fs::write(&dst, bytes);
-            tracing::info!("scheduler: restored store from checkpoint {checkpoint_id}");
-        }
-        Err(_) => {
-            let _ = std::fs::write(&dst, EMPTY_STORE_JSON);
+    // Pending errand reports and loot-completion ids are REAL-TIME state, not
+    // game-time state: restoring them from the checkpoint resurrected already-
+    // consumed reports on EVERY reload of the same save ("he keeps telling me
+    // about that soda bottle" - observed live, quicksave cycling). Tasks and
+    // chains roll back with the world; the report ledger carries forward.
+    // Merged at the JSON level so checkpoint shapes pass through verbatim.
+    let live_ledger: Option<(Value, Value)> = std::fs::read_to_string(&dst)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .map(|live| {
+            (
+                live.get("pending_reports").cloned().unwrap_or_else(|| json!([])),
+                live.get("completed_loot_ids").cloned().unwrap_or_else(|| json!([])),
+            )
+        });
+    let restored: Value = std::fs::read(scheduler_checkpoint_path(content_root, checkpoint_id))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or_else(|| {
             tracing::info!("scheduler: cleared store (no sidecar for {checkpoint_id})");
-        }
+            serde_json::from_slice(EMPTY_STORE_JSON).unwrap_or_else(|_| json!({}))
+        });
+    let mut merged = restored;
+    if let (Some(obj), Some((reports, loot_ids))) = (merged.as_object_mut(), live_ledger) {
+        obj.insert("pending_reports".to_string(), reports);
+        obj.insert("completed_loot_ids".to_string(), loot_ids);
     }
+    let _ = std::fs::write(&dst, merged.to_string());
+    tracing::info!("scheduler: restored store from checkpoint {checkpoint_id} (report ledger carried forward)");
 }
 
 // ===========================================================================
@@ -578,6 +638,48 @@ fn is_travel_verb(verb: &str) -> bool {
 ///    steps: [ { verb, action_id, when, command_body? } ] }`
 /// where `command_body` is the pre-built native command file the bridge captured
 /// at schedule time for steps whose verb resolved to a native Action-Book action.
+/// A task counts as an ERRAND (vs a clock appointment) when none of its chain
+/// steps waits on an in-game time: it runs NOW, driven by completion gates.
+fn task_is_errand(task: &SchedulerTask) -> bool {
+    !task.chain.is_empty()
+        && !task
+            .chain
+            .iter()
+            .any(|step| matches!(step.trigger, Trigger::Time { .. }))
+}
+
+/// A new errand SUPERSEDES the owner's running ones: two live chains firing
+/// loot commands at the same NPC stomp each other's sessions, and every stomp
+/// report legitimately opens the OTHER chain's next gate - a mutual cascade
+/// (observed live: the previous book-run's chain interleaved with the new
+/// one). Clock appointments are left alone.
+fn cancel_other_errands(state: &AppState, owner_npc_key: &str, keep_summary: &str) {
+    let mut store = read_store(state);
+    let mut cancelled = 0;
+    for task in store.tasks.iter_mut() {
+        if !task.state.is_terminal()
+            && task.owner_npc_key == owner_npc_key
+            && task.summary != keep_summary
+            && task_is_errand(task)
+        {
+            task.state = TaskState::Cancelled;
+            task.last_error = "superseded by a new errand".to_string();
+            cancelled += 1;
+        }
+    }
+    if cancelled > 0 {
+        let _ = write_store(state, &store);
+        tracing::info!("scheduler: {cancelled} running errand(s) superseded for {owner_npc_key}");
+    }
+}
+
+/// Run one tick right away - a freshly scheduled errand's first step is
+/// Immediate, and "immediately" should not mean "at the next 3s tick"
+/// (the player watches the NPC stand still for the gap otherwise).
+fn kick_chains_now(state: &AppState) {
+    tick(state);
+}
+
 pub fn schedule_from_spec(state: &AppState, spec: &Value) -> anyhow::Result<Option<SchedulerTask>> {
     let Some(steps_json) = spec.get("steps").and_then(Value::as_array) else {
         return Ok(None);
@@ -594,6 +696,57 @@ pub fn schedule_from_spec(state: &AppState, spec: &Value) -> anyhow::Result<Opti
         (Some(day), Some(hour)) => GameClock::from_game(day, hour),
         _ => current_clock(state).unwrap_or(GameClock { day: 0.0, hour: 0.0 }),
     };
+
+    // AGENT SEQUENCE: a pure immediate multi-step plan containing travel
+    // ("go to Doc Mitchell's then come back to me"). The legacy path below
+    // hands EVERY untimed destination to the movement engine AT BUILD TIME —
+    // all legs launch at once and the last one wins. Agent chains launch each
+    // leg when the previous journey finishes (OwnerJourneyDone against the
+    // movement store), with non-travel steps riding between/after, and store a
+    // pending report on completion for the NPC to mention.
+    if let Some(chain) = build_agent_errand_chain(
+        &steps_json,
+        &owner_npc_key,
+        &owner_name,
+        &str_field(spec, "character_name"),
+        &str_field(spec, "live_chat_id"),
+    ) {
+        let summary = if raw.is_empty() {
+            chain.iter().map(|s| s.description.clone()).collect::<Vec<_>>().join(", then ")
+        } else {
+            capitalize(raw.trim_end_matches('.'))
+        };
+        let now = epoch_millis();
+        let mut args = Map::new();
+        args.insert("raw".to_string(), json!(raw));
+        args.insert("agent".to_string(), json!(true));
+        let task = SchedulerTask {
+            id: format!("task_{}_{}", now, rand_suffix()),
+            owner_npc_key: owner_npc_key.clone(),
+            owner_name: first_nonempty(&[str_field(spec, "owner_name"), str_field(spec, "character_name")]),
+            character_name: str_field(spec, "character_name"),
+            live_chat_id: str_field(spec, "live_chat_id"),
+            action: "errand".to_string(),
+            args,
+            summary,
+            trigger: chain[0].trigger.clone(),
+            chain,
+            state: TaskState::Pending,
+            last_error: String::new(),
+            created_at_ms: now,
+            fired_at_ms: 0,
+            created_day: clock.day as u32,
+            created_hour: clock.hour,
+        };
+        let persisted = persist_task(state, task);
+        if let Ok(Some(persisted_task)) = &persisted {
+            if task_is_errand(persisted_task) {
+                cancel_other_errands(state, &persisted_task.owner_npc_key, &persisted_task.summary);
+            }
+            kick_chains_now(state);
+        }
+        return persisted;
+    }
 
     let mut chain: Vec<ChainStep> = Vec::new();
     for (i, st) in steps_json.iter().enumerate() {
@@ -642,6 +795,7 @@ pub fn schedule_from_spec(state: &AppState, spec: &Value) -> anyhow::Result<Opti
                             command: Value::Null, // movement already walking; this only gates
                             delay_ms: 0,
                             armed_at_ms: 0,
+                            issued_at_ms: 0,
                             done: false,
                         });
                     }
@@ -661,9 +815,37 @@ pub fn schedule_from_spec(state: &AppState, spec: &Value) -> anyhow::Result<Opti
             classify_event(&event, Some(clock))
         } else {
             match parse_when(&when_text, clock) {
-                Some((day, hour)) => Trigger::Time { day, hour },
+                // Models express "start now" as the CURRENT clock time (told
+                // "the time is 12:30PM", they write time:"12:30PM" — observed
+                // 13/60 A/B turns). parse_when rolls a non-future time to
+                // TOMORROW, turning "right now" into a 24h wait — so a parsed
+                // time within a few game-minutes of now fires immediately.
+                Some((day, hour)) => {
+                    let target = (day as f64) * 24.0 + hour;
+                    let now = clock.day * 24.0 + clock.hour;
+                    let now_ish = 5.0 / 60.0; // 5 game-minutes
+                    if target <= now + now_ish || (target - (now + 24.0)).abs() <= now_ish {
+                        Trigger::Condition { condition: Condition::Immediate }
+                    } else {
+                        Trigger::Time { day, hour }
+                    }
+                }
                 None => Trigger::Condition { condition: Condition::Immediate },
             }
+        };
+        // "Then" means AFTER the previous step actually finishes, even on the
+        // legacy (timed/event) chain: a follow-on step whose own trigger is
+        // Immediate gates on the previous step's REAL completion - loot via
+        // its report, travel via the journey, instant actions via the settle
+        // window. Observed live: the model stamped the current clock time on
+        // step 1 ("at 8:40PM" = now), routing the plan here, and step 2 fired
+        // one tick later, stomping the running loot errand.
+        let trigger = if i > 0
+            && matches!(&trigger, Trigger::Condition { condition: Condition::Immediate })
+        {
+            completion_trigger(&steps_json[i - 1])
+        } else {
+            trigger
         };
 
         // Command, in priority order:
@@ -706,6 +888,7 @@ pub fn schedule_from_spec(state: &AppState, spec: &Value) -> anyhow::Result<Opti
             command,
             delay_ms,
             armed_at_ms: 0,
+            issued_at_ms: 0,
             done: false,
         });
     }
@@ -740,7 +923,135 @@ pub fn schedule_from_spec(state: &AppState, spec: &Value) -> anyhow::Result<Opti
         created_hour: clock.hour,
     };
 
-    persist_task(state, task)
+    let persisted = persist_task(state, task);
+    if let Ok(Some(persisted_task)) = &persisted {
+        if task_is_errand(persisted_task) {
+            cancel_other_errands(state, &persisted_task.owner_npc_key, &persisted_task.summary);
+        }
+        kick_chains_now(state);
+    }
+    persisted
+}
+
+/// The request id inside a pre-built native command body (the bridge writes
+/// `request_id=<id>` as a key=value line) — the correlation key for LootDone.
+fn command_body_request_id(body: &str) -> String {
+    body.lines()
+        .find_map(|line| line.strip_prefix("request_id="))
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// How long an instant-ish step (gesture, combat order) is assumed to take
+/// before the next chain step may fire — no engine completion signal exists
+/// for these, so the chain settles on wall-clock.
+const SETTLE_MS: u64 = 8000;
+
+/// What the step AFTER this one must gate on: travel legs finish via the
+/// movement store, loot errands via their completion report, everything else
+/// settles on a timer.
+fn completion_trigger(step: &Value) -> Trigger {
+    let field = |key: &str| step.get(key).and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if !field("destination").is_empty() {
+        return Trigger::OwnerJourneyDone;
+    }
+    let body = field("command_body");
+    if body.contains("action=LOOT") {
+        // Freeform loot no longer writes completion reports; a scheduled loot
+        // step settles on a generous window instead.
+        return Trigger::PrevSettled { ms: 20000 };
+    }
+    Trigger::PrevSettled { ms: SETTLE_MS }
+}
+
+/// Builds an AGENT errand chain from a scheduled spec's steps, or `None` when
+/// the plan isn't one (any clock/event/delay field, fewer than 2 steps, or no
+/// DURABLE step at all — pure-instant sequences dispatch immediately
+/// elsewhere, keeping e.g. the kill flow fast). Steps run strictly in order:
+/// each gates on the PREVIOUS step's completion — journeys via the movement
+/// store, loot errands via their completion report, instant actions via a
+/// settle window. A final marker keeps the task alive until the LAST step
+/// truly finishes, and completion is reported via the pending-reports store.
+fn build_agent_errand_chain(
+    steps_json: &[Value],
+    owner_npc_key: &str,
+    owner_name: &str,
+    character_name: &str,
+    live_chat_id: &str,
+) -> Option<Vec<ChainStep>> {
+    if steps_json.len() < 2 {
+        return None;
+    }
+    let field = |st: &Value, key: &str| -> String {
+        st.get(key).and_then(Value::as_str).unwrap_or("").trim().to_string()
+    };
+    let mut has_durable = false;
+    for st in steps_json {
+        if !field(st, "when").is_empty() || !field(st, "event").is_empty() || !field(st, "after").is_empty() {
+            return None; // clock/event/delay plans stay on the legacy chain
+        }
+        if !field(st, "destination").is_empty()
+            || st.get("command_body").and_then(Value::as_str).unwrap_or("").contains("action=LOOT")
+        {
+            has_durable = true;
+        }
+    }
+    if !has_durable {
+        return None; // pure instant sequences dispatch immediately elsewhere
+    }
+    let mut chain: Vec<ChainStep> = Vec::new();
+    for (i, st) in steps_json.iter().enumerate() {
+        let verb = field(st, "verb");
+        let destination = field(st, "destination");
+        let command_body = st.get("command_body").and_then(Value::as_str).unwrap_or("").to_string();
+        let trigger = if chain.is_empty() {
+            Trigger::Condition { condition: Condition::Immediate }
+        } else {
+            completion_trigger(&steps_json[i - 1])
+        };
+        let (description, command) = if !destination.is_empty() {
+            (
+                format!("Travel to {destination}"),
+                json!({
+                    "op": "agent_journey",
+                    "destination": destination,
+                    "npc_key": owner_npc_key,
+                    "npc_name": owner_name,
+                    "character_name": character_name,
+                    "live_chat_id": live_chat_id,
+                }),
+            )
+        } else if !command_body.is_empty() {
+            (capitalize(&verb), json!({ "op": "native_action", "body": command_body }))
+        } else {
+            (capitalize(&verb), Value::Null)
+        };
+        chain.push(ChainStep {
+            id: format!("{}_{}", i + 1, slugify(&verb)),
+            description,
+            trigger,
+            command,
+            delay_ms: 0,
+            armed_at_ms: 0,
+            issued_at_ms: 0,
+            done: false,
+        });
+    }
+    // Final marker: hold the task open until the LAST step completes, so Done
+    // (and the pending report) means "actually finished", not "last command
+    // issued".
+    chain.push(ChainStep {
+        id: "complete".to_string(),
+        description: "Errand complete".to_string(),
+        trigger: completion_trigger(steps_json.last()?),
+        command: Value::Null,
+        delay_ms: 0,
+        armed_at_ms: 0,
+        issued_at_ms: 0,
+        done: false,
+    });
+    Some(chain)
 }
 
 /// Persist a freshly built task, de-duplicating: the same owner re-emitting the
@@ -768,6 +1079,58 @@ fn persist_task(state: &AppState, task: SchedulerTask) -> anyhow::Result<Option<
     Ok(Some(task))
 }
 
+/// Consume (and return) the pending errand reports for `speaker_name`, matched
+/// case-insensitively against the report's owner name or key. Called by the
+/// generation path so the NPC mentions finished errands exactly once.
+pub fn take_pending_reports(state: &AppState, speaker_name: &str) -> Vec<String> {
+    let mut store = read_store(state);
+    if store.pending_reports.is_empty() {
+        return Vec::new();
+    }
+    let mut taken = Vec::new();
+    store.pending_reports.retain(|report| {
+        let matches = report.npc_name.eq_ignore_ascii_case(speaker_name)
+            || report.npc_key.eq_ignore_ascii_case(speaker_name);
+        if matches {
+            taken.push(report.summary.clone());
+            false
+        } else {
+            true
+        }
+    });
+    if !taken.is_empty() {
+        if let Err(error) = write_store(state, &store) {
+            tracing::warn!("scheduler: failed to persist consumed reports: {error}");
+        }
+    }
+    taken
+}
+
+/// Put errand reports BACK for `npc_name` (a turn consumed them into its
+/// prompt and then died before speaking - player interrupts abort the whole
+/// stream). Front of the queue so they surface on the very next turn.
+pub fn readd_pending_reports(state: &AppState, npc_name: &str, summaries: &[String]) {
+    if summaries.is_empty() {
+        return;
+    }
+    let mut store = read_store(state);
+    for summary in summaries.iter().rev() {
+        store.pending_reports.insert(
+            0,
+            PendingReport {
+                npc_key: String::new(),
+                npc_name: npc_name.to_string(),
+                live_chat_id: String::new(),
+                summary: summary.clone(),
+                created_at_ms: epoch_millis(),
+            },
+        );
+    }
+    if let Err(error) = write_store(state, &store) {
+        tracing::warn!("scheduler: failed to restore errand reports: {error}");
+    }
+}
+
 /// Lowercase kebab of the first couple of words, for a stable step id.
 fn slugify(text: &str) -> String {
     text.to_ascii_lowercase()
@@ -793,6 +1156,173 @@ fn first_word(text: &str) -> String {
 /// One scheduler tick: read the clock, evaluate every non-terminal task, and fire
 /// any due triggers. Persists only if something changed. Never propagates a fire
 /// failure — a failed task is marked `failed` and logged, the rest proceed.
+/// Sweep opened-container choice requests (`loot_choice_*.json`): the NPC has
+/// walked to a container, opened it, and stands there with the contents laid
+/// out — the model now reads the real list (name/count/value/weight) and picks
+/// what to take, grammar-constrained to those exact names. The answer goes back
+/// over the world-query channel as `take_choice`; a failed call defaults to
+/// taking everything (the common intent of "loot the X"), and the plugin's own
+/// 90s deadline means a totally dead backend leaves the container untouched.
+/// Sweep finished loot sessions the plugin reported (`control/queries/results/
+/// loot_report_*.json`) into pending reports, so the NPC naturally mentions the
+/// haul on their next line. Mod-initiated files — nothing chasm-side to
+/// correlate against, the file itself carries the NPC identity.
+/// Sweep INSERT-ONLY world records (mod-side failures etc.) into the FNV live
+/// chat as "World:" lines. No generation.
+pub fn sweep_world_records(state: &AppState) {
+    let dir = bridge_root(state)
+        .join("control")
+        .join("queries")
+        .join("results");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    let live_chat_id = {
+        let settings = chasm_core::AppSettings::load(&state.config.settings_path);
+        let config_path = settings.launcher.helper_config.trim().to_string();
+        chasm_fnv_bridge::load_config(Path::new(&config_path))
+            .map(|c| c.live_chat_id)
+            .unwrap_or_default()
+    };
+    if live_chat_id.is_empty() {
+        return;
+    }
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("world_record_") || !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let _ = std::fs::remove_file(entry.path());
+        let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if let Some(text) = parsed.get("text").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+            crate::generate::append_world_line(state, &live_chat_id, text);
+        }
+    }
+}
+
+pub fn sweep_loot_reports(state: &AppState) {
+    let dir = bridge_root(state)
+        .join("control")
+        .join("queries")
+        .join("results");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    let mut reports: Vec<(PendingReport, String)> = Vec::new();
+    let mut spoken_ids: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("loot_report_") || !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let _ = std::fs::remove_file(entry.path());
+        let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let npc_name = parsed
+            .get("npc_name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let summary = parsed
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if npc_name.is_empty() && parsed.get("npc_key").and_then(Value::as_str).unwrap_or("").is_empty() {
+            continue;
+        }
+        if summary.is_empty() {
+            continue;
+        }
+        let request_id = parsed
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        // Already delivered by the mod's instant completion turn: record the
+        // completion id (chain gating) but no pending report, no speak_up.
+        if parsed.get("spoken").and_then(Value::as_bool).unwrap_or(false) {
+            spoken_ids.push(request_id);
+            continue;
+        }
+        reports.push((
+            PendingReport {
+                npc_key: parsed
+                    .get("npc_key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                npc_name,
+                live_chat_id: String::new(),
+                summary,
+                created_at_ms: epoch_millis(),
+            },
+            request_id,
+        ));
+    }
+    if reports.is_empty() && spoken_ids.is_empty() {
+        return;
+    }
+    let mut store = read_store(state);
+    for id in spoken_ids {
+        if !id.is_empty() {
+            store.completed_loot_ids.push((id, epoch_millis()));
+        }
+    }
+    let mut speak_up: Vec<(String, String)> = Vec::new();
+    for (report, request_id) in reports {
+        tracing::info!(
+            "scheduler: loot report for '{}' -> '{}'",
+            report.npc_name,
+            report.summary
+        );
+        if !request_id.is_empty() {
+            store.completed_loot_ids.push((request_id, epoch_millis()));
+        }
+        if !speak_up
+            .iter()
+            .any(|(_, name)| name.eq_ignore_ascii_case(&report.npc_name))
+        {
+            speak_up.push((report.npc_key.clone(), report.npc_name.clone()));
+        }
+        store.pending_reports.push(report);
+    }
+    let excess = store.completed_loot_ids.len().saturating_sub(100);
+    if excess > 0 {
+        store.completed_loot_ids.drain(..excess);
+    }
+    let _ = write_store(state, &store);
+    // Gates changed: advance chains NOW rather than at the next 3s tick, so
+    // "loot the room THEN do pushups" flows step-to-step without dead air.
+    tick(state);
+    // Give each reporting NPC a voiced turn to deliver the news ("here's your
+    // milk") - the mod guards earshot/busy/cooldown and simply skips when it
+    // can't; the report then surfaces on the next normal chat instead.
+    for (npc_key, npc_name) in speak_up {
+        use base64::Engine as _;
+        let cmd = serde_json::json!({
+            "op": "speak_up",
+            "npc_key": npc_key,
+            "npc_name_base64": base64::engine::general_purpose::STANDARD.encode(npc_name.as_bytes()),
+        });
+        let _ = issue_companion_command(state, &cmd);
+    }
+}
+
 pub fn tick(state: &AppState) {
     let clock = current_clock(state);
     let world_base = read_world_snapshot(state);
@@ -809,6 +1339,33 @@ pub fn tick(state: &AppState) {
         let task = store.tasks[idx].clone();
         match advance_task(state, &task, clock, &world_base) {
             Some(updated) => {
+                // An AGENT errand that just finished leaves a report for the
+                // owner to mention on their next line.
+                if updated.state == TaskState::Done
+                    && task.state != TaskState::Done
+                    && updated.args.get("agent").and_then(Value::as_bool).unwrap_or(false)
+                {
+                    store.pending_reports.push(PendingReport {
+                        npc_key: updated.owner_npc_key.clone(),
+                        npc_name: updated.owner_name.clone(),
+                        live_chat_id: updated.live_chat_id.clone(),
+                        summary: updated.summary.clone(),
+                        created_at_ms: epoch_millis(),
+                    });
+                    // The errand is done - no reason to keep lingering at its
+                    // destination; release the traveller so they come back.
+                    let owner = if updated.owner_name.is_empty() {
+                        updated.owner_npc_key.clone()
+                    } else {
+                        updated.owner_name.clone()
+                    };
+                    crate::movement::finish_journey_linger(state, &owner);
+                    tracing::info!(
+                        "scheduler: agent errand complete for {} -> pending report '{}'",
+                        updated.owner_name,
+                        updated.summary
+                    );
+                }
                 store.tasks[idx] = updated;
                 changed = true;
             }
@@ -900,7 +1457,28 @@ fn advance_chain(
         return None;
     };
     let step = &task.chain[step_idx];
-    if !trigger_met(&step.trigger, clock, &world) {
+    let step_trigger_met = match &step.trigger {
+        Trigger::OwnerJourneyDone => owner_journey_done(state, &task.owner_npc_key),
+        Trigger::LootDone { request_id } => {
+            // Only completions recorded AFTER the previous step issued count:
+            // ledger entries survive save reloads (deliberately), but a
+            // rolled-back chain must wait for THIS lifetime's completion.
+            let issued_after = if step_idx > 0 { task.chain[step_idx - 1].issued_at_ms } else { 0 };
+            read_store(state)
+                .completed_loot_ids
+                .iter()
+                .any(|(id, at_ms)| id == request_id && *at_ms >= issued_after)
+        }
+        Trigger::PrevSettled { ms } => {
+            // Anchored on the previous step's issue time; a chain never starts
+            // with PrevSettled, but treat that (and an unissued prev) safely.
+            step_idx == 0
+                || (task.chain[step_idx - 1].issued_at_ms > 0
+                    && epoch_millis() >= task.chain[step_idx - 1].issued_at_ms + *ms as i64)
+        }
+        other => trigger_met(other, clock, &world),
+    };
+    if !step_trigger_met {
         // Not yet — mark active on first evaluation so the UI shows progress.
         if task.state == TaskState::Pending {
             let mut updated = task.clone();
@@ -936,6 +1514,7 @@ fn advance_chain(
         }
     }
     updated.chain[step_idx].done = true;
+    updated.chain[step_idx].issued_at_ms = epoch_millis();
     tracing::info!(
         "scheduler: chain {} advanced step '{}' for {}",
         task.id,
@@ -956,7 +1535,26 @@ fn trigger_met(trigger: &Trigger, clock: Option<GameClock>, world: &WorldSnapsho
             None => false,
         },
         Trigger::Condition { condition } => condition.is_met(world),
+        // Need state / chain context; advance_chain evaluates these directly.
+        Trigger::OwnerJourneyDone => false,
+        Trigger::LootDone { .. } => false,
+        Trigger::PrevSettled { .. } => false,
     }
+}
+
+/// Is the owner's journey pipeline idle? Waiting/EnRoute = a leg in flight;
+/// Lingering counts as ARRIVED for chaining (they reached the place — the next
+/// leg may start), and no journey at all means the leg failed to launch or is
+/// long gone — the chain must proceed rather than hang.
+fn owner_journey_done(state: &AppState, owner_npc_key: &str) -> bool {
+    let store = crate::movement::read_store(state);
+    !store.journeys.iter().any(|journey| {
+        journey.npc_key.eq_ignore_ascii_case(owner_npc_key)
+            && matches!(
+                journey.state,
+                crate::movement::JourneyState::Waiting | crate::movement::JourneyState::EnRoute
+            )
+    })
 }
 
 /// The world snapshot a task is evaluated against, folding the task's own event
@@ -1045,6 +1643,30 @@ fn issue_command(state: &AppState, command: &Value) -> anyhow::Result<()> {
     }
     let root = bridge_root(state);
 
+    // Agent travel leg: launch a movement-engine journey for the owner. The
+    // NEXT chain step gates on OwnerJourneyDone, so legs run sequentially.
+    if op == "agent_journey" {
+        let who = crate::movement::Traveller {
+            npc_key: command.get("npc_key").and_then(Value::as_str).unwrap_or("").to_string(),
+            npc_name: command.get("npc_name").and_then(Value::as_str).unwrap_or("").to_string(),
+            character_name: command.get("character_name").and_then(Value::as_str).unwrap_or("").to_string(),
+            live_chat_id: command.get("live_chat_id").and_then(Value::as_str).unwrap_or("").to_string(),
+        };
+        let destination = command.get("destination").and_then(Value::as_str).unwrap_or("");
+        match crate::movement::start_journey(state, &who, destination, None) {
+            Ok(Some(journey)) => {
+                tracing::info!("scheduler: agent leg -> journey {} to '{}'", journey.id, destination);
+            }
+            Ok(None) => {
+                tracing::warn!("scheduler: agent leg to '{}' not started (movement disabled) - chain proceeds", destination);
+            }
+            Err(error) => {
+                tracing::warn!("scheduler: agent leg to '{}' failed: {error} - chain proceeds", destination);
+            }
+        }
+        return Ok(());
+    }
+
     // Native Action-Book command: write the captured body verbatim to control/actions.
     if op == "native_action" {
         let body = command.get("body").and_then(Value::as_str).unwrap_or("");
@@ -1129,6 +1751,16 @@ pub(crate) fn bridge_root(state: &AppState) -> PathBuf {
 /// rather than firing at the wrong moment.
 fn classify_event(event: &str, clock: Option<GameClock>) -> Trigger {
     let e = event.trim().to_ascii_lowercase();
+    // "immediately"/"now" is an intensifier, not an event — fire on the next
+    // tick. (The normalizer strips these before scheduling, but plans built by
+    // older turns / other entry points must not park forever on a flag named
+    // "event:immediately" that nothing ever raises.)
+    if matches!(
+        e.trim_matches(|c: char| !c.is_ascii_alphanumeric()),
+        "now" | "immediately" | "instantly" | "asap" | "at once" | "right away" | "right now"
+    ) {
+        return Trigger::Condition { condition: Condition::Immediate };
+    }
     if let Some(phrase) = extract_said_phrase(&e) {
         return Trigger::Condition { condition: Condition::PlayerSaid { phrase } };
     }
@@ -1441,6 +2073,122 @@ fn rand_suffix() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn current_clock_time_counts_as_now() {
+        // "waste him right now" -> the model writes time:"12:30PM" when told
+        // the time IS 12:30PM; parse_when alone would schedule TOMORROW.
+        let clock = super::GameClock { day: 10.0, hour: 12.5 };
+        let (day, hour) = super::parse_when("12:30pm", clock).unwrap();
+        let target = (day as f64) * 24.0 + hour;
+        // parse_when itself rolls to tomorrow — the trigger builder must catch it.
+        assert!(target >= 10.0 * 24.0 + 12.5 + 23.0, "precondition: rolled to tomorrow");
+    }
+
+    /// THE target sentence: "loot everything above 5 value in this room, then
+    /// do 5 pushups, then loot everything below 5 value and travel to the
+    /// saloon" — every step gates on the PREVIOUS step's real completion:
+    /// loot via its report (LootDone), pushups via the settle window, travel
+    /// via the movement store.
+    #[test]
+    fn errand_chain_gates_on_real_completion_per_kind() {
+        let loot1 = "NVBRIDGE_ACTION_V2
+request_id=req_1-s1
+action=LOOT
+loot_plan_base64=xxx";
+        let loot2 = "NVBRIDGE_ACTION_V2
+request_id=req_1-s3
+action=LOOT
+loot_plan_base64=yyy";
+        let steps = vec![
+            serde_json::json!({ "verb": "loot", "destination": "", "target": "", "command_body": loot1 }),
+            serde_json::json!({ "verb": "pushups", "destination": "", "target": "", "command_body": "NVBRIDGE_ACTION_V2
+request_id=req_1-s2
+action=ACTION_BOOK" }),
+            serde_json::json!({ "verb": "loot", "destination": "", "target": "", "command_body": loot2 }),
+            serde_json::json!({ "verb": "travel", "destination": "Prospector Saloon", "target": "" }),
+        ];
+        let chain = super::build_agent_errand_chain(&steps, "chamzy", "chamzy", "chamzy", "fnv").unwrap();
+        assert_eq!(chain.len(), 5, "four steps + completion marker");
+        // Step 1 fires immediately; step 2 (pushups) waits out loot #1's settle
+        // window (freeform loot writes no completion reports).
+        assert_eq!(chain[0].trigger, super::Trigger::Condition { condition: super::Condition::Immediate });
+        assert_eq!(chain[1].trigger, super::Trigger::PrevSettled { ms: 20000 });
+        // Step 3 (loot #2) waits for the pushups to settle.
+        assert_eq!(chain[2].trigger, super::Trigger::PrevSettled { ms: super::SETTLE_MS });
+        // Step 4 (travel) waits out loot #2's settle window; the completion
+        // marker waits for the journey to actually land.
+        assert_eq!(chain[3].trigger, super::Trigger::PrevSettled { ms: 20000 });
+        assert_eq!(chain[3].command["op"], "agent_journey");
+        assert_eq!(chain[4].trigger, super::Trigger::OwnerJourneyDone);
+
+        // A plan with no durable step at all stays off the chain (instant combos
+        // like "wave then attack" dispatch immediately - the kill flow stays fast).
+        let steps = vec![
+            serde_json::json!({ "verb": "wave", "destination": "", "target": "player", "command_body": "NVBRIDGE_ACTION_V2..." }),
+            serde_json::json!({ "verb": "attack", "destination": "", "target": "Easy Pete", "command_body": "NVBRIDGE_ACTION_V2..." }),
+        ];
+        assert!(super::build_agent_errand_chain(&steps, "chamzy", "chamzy", "chamzy", "fnv").is_none());
+    }
+
+    #[test]
+    fn agent_travel_chain_builds_sequential_legs() {
+        // "go to doc mitchell's house then come back to me": two travel legs,
+        // leg 2 gated on leg 1's journey finishing, final completion marker.
+        let steps = vec![
+            serde_json::json!({ "verb": "travel", "destination": "Doc Mitchell's House", "target": "" }),
+            serde_json::json!({ "verb": "travel", "destination": "player", "target": "" }),
+        ];
+        let chain = super::build_agent_errand_chain(&steps, "chamzy", "chamzy", "chamzy", "fnv").unwrap();
+        assert_eq!(chain.len(), 3, "two legs + completion marker");
+        assert_eq!(chain[0].trigger, super::Trigger::Condition { condition: super::Condition::Immediate });
+        assert_eq!(chain[0].command["op"], "agent_journey");
+        assert_eq!(chain[0].command["destination"], "Doc Mitchell's House");
+        assert_eq!(chain[1].trigger, super::Trigger::OwnerJourneyDone);
+        assert_eq!(chain[1].command["destination"], "player");
+        assert_eq!(chain[2].trigger, super::Trigger::OwnerJourneyDone);
+        assert!(chain[2].command.is_null());
+
+        // Mixed plan: travel then a captured native action rides the gate.
+        let steps = vec![
+            serde_json::json!({ "verb": "travel", "destination": "the saloon", "target": "" }),
+            serde_json::json!({ "verb": "wave", "destination": "", "target": "player", "command_body": "NVBRIDGE_ACTION_V2..." }),
+        ];
+        let chain = super::build_agent_errand_chain(&steps, "k", "n", "c", "l").unwrap();
+        assert_eq!(chain[1].command["op"], "native_action");
+
+        // NOT agent chains: timed plans, single steps, no-travel plans.
+        let timed = vec![
+            serde_json::json!({ "verb": "travel", "destination": "the saloon", "when": "9:00PM" }),
+            serde_json::json!({ "verb": "wave", "destination": "" }),
+        ];
+        assert!(super::build_agent_errand_chain(&timed, "k", "n", "c", "l").is_none());
+        let single = vec![serde_json::json!({ "verb": "travel", "destination": "the saloon" })];
+        assert!(super::build_agent_errand_chain(&single, "k", "n", "c", "l").is_none());
+        let no_travel = vec![
+            serde_json::json!({ "verb": "wave", "destination": "" }),
+            serde_json::json!({ "verb": "salute", "destination": "" }),
+        ];
+        assert!(super::build_agent_errand_chain(&no_travel, "k", "n", "c", "l").is_none());
+    }
+
+    #[test]
+    fn immediacy_events_fire_now_not_on_a_phantom_flag() {
+        // Live no-op 2026-07-06: {when:"immediately"} classified to
+        // FlagSet("event:immediately") and the kill order parked forever.
+        for text in ["immediately", "now", "Right away!", "at once"] {
+            assert_eq!(
+                super::classify_event(text, None),
+                super::Trigger::Condition { condition: super::Condition::Immediate },
+                "{text:?} must fire immediately"
+            );
+        }
+        // Real conditions still classify as events, not Immediate.
+        assert_ne!(
+            super::classify_event("the player says go", None),
+            super::Trigger::Condition { condition: super::Condition::Immediate }
+        );
+    }
+
     use super::*;
 
     fn clock(day: f64, hour: f64) -> GameClock {
@@ -1667,6 +2415,7 @@ mod tests {
                 command: json!({ "op": "native_action", "body": "CMD" }),
                 delay_ms: 0,
                 armed_at_ms: 0,
+                issued_at_ms: 0,
                 done: false,
             }],
             state: TaskState::Pending,
@@ -1681,7 +2430,7 @@ mod tests {
     #[test]
     fn store_serde_round_trip() {
         let task = sample_task();
-        let store = SchedulerStore { version: STORE_VERSION, tasks: vec![task.clone()] };
+        let store = SchedulerStore { version: STORE_VERSION, tasks: vec![task.clone()], pending_reports: Vec::new(), completed_loot_ids: Vec::new() };
         let text = serde_json::to_string_pretty(&store).unwrap();
         let back: SchedulerStore = serde_json::from_str(&text).unwrap();
         assert_eq!(back.tasks.len(), 1);
@@ -1742,6 +2491,7 @@ mod tests {
             command: Value::Null,
             delay_ms: 0,
             armed_at_ms: 0,
+            issued_at_ms: 0,
             done: false,
         };
         let step2 = ChainStep {
@@ -1751,6 +2501,7 @@ mod tests {
             command: json!({ "op": "travel_to", "npc_key": "boone" }),
             delay_ms: 0,
             armed_at_ms: 0,
+            issued_at_ms: 0,
             done: false,
         };
 

@@ -170,6 +170,18 @@ export function Llm() {
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
+            <FormRow
+              label="Constrain action verbs (experiment)"
+              help="Locks each NPC action verb to the action book's aliases + verb lexicon at sampling time (grammar enum). Off = free verb, corrected by the resolver."
+              control={
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 accent-primary"
+                  checked={form.npc_action_enum}
+                  onChange={(e) => set("npc_action_enum", e.target.checked)}
+                />
+              }
+            />
             <NumberRow
               label="Temperature"
               help="Higher = more varied, lower = more deterministic (0–2)."

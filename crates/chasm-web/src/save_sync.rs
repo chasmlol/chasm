@@ -1806,6 +1806,9 @@ fn handle_save_sync_event(
         }
         crate::scheduler::restore_scheduler_store(data_root, &checkpoint_id);
         crate::movement::restore_movement_store(data_root, &checkpoint_id);
+        // In-flight action loops belong to the old timeline (the plugin cleared
+        // its loot/event state too) - drop the carried toolsets.
+        crate::generate::clear_active_toolsets();
         return Ok(result);
     }
 

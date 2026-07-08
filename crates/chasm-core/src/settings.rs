@@ -333,6 +333,11 @@ pub struct LlmSettings {
     pub orchestrator_temperature: f32,
     /// Editable director system prompt (blank → the built-in default).
     pub orchestrator_system_prompt: String,
+    /// EXPERIMENT: constrain each NPC action step's verb to the action book's
+    /// aliases + verb lexicon via the sampling grammar (enum in the JSON schema
+    /// sent as `response_format`). The model never sees the list — the sampler
+    /// steers it onto the nearest legal verb. Off = free verb + embedder snap.
+    pub npc_action_enum: bool,
 }
 
 /// Per-request LLM sampling knobs forwarded to the local llama.cpp
@@ -472,6 +477,7 @@ impl Default for LlmSettings {
             orchestrator_max_speakers: ORCHESTRATOR_DEFAULT_MAX_SPEAKERS,
             orchestrator_temperature: ORCHESTRATOR_DEFAULT_TEMPERATURE,
             orchestrator_system_prompt: ORCHESTRATOR_DEFAULT_SYSTEM_PROMPT.to_string(),
+            npc_action_enum: false,
         }
     }
 }

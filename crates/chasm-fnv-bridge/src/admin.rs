@@ -437,6 +437,7 @@ mod tests {
             action_id: "world.spawn_entity".into(),
             reason: "spawn".into(),
             actions: vec![json!({ "action_id": "world.spawn_entity" })],
+            ..GameMaster::none()
         };
         let actor =
             resolve_native_actor_for_admin(&config, &admin_request(true, "spawn a deathclaw"), &gm)
@@ -458,6 +459,7 @@ mod tests {
                 "actor": "sunny_smiles",
                 "parameters": { "actor": "sunny_smiles" },
             })],
+            ..GameMaster::none()
         };
         let actor =
             resolve_native_actor_for_admin(&config, &admin_request(false, "sunny_smiles follow me"), &gm)
