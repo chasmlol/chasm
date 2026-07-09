@@ -349,20 +349,45 @@ pub async fn generate_stream_core(
             // pins give_item's choice. Turn-local like the room scan: re-checked
             // each turn (his pack changes), never inherited.
             let mut discovered_inventory: Vec<String> = Vec::new();
+            // After a bare give/take triggers the inventory/area scan, the NEXT
+            // round is a LOCKED pick (see `npc_locked_pick_format`): the model is
+            // constrained to one give/take step - pick a real item or "[none]" -
+            // with no speech, so it cannot narrate a fake hand-off or escape to
+            // speech-only. One-shot: consumed at the top of each round.
+            let mut pending_pick: Option<&'static str> = None;
+            // Set when a find_action surfaces the TRAVEL action as its top hit: the
+            // NEXT round is a LOCKED travel commit (see `npc_locked_travel_format`),
+            // so the NPC must emit the travel (place + arrival time) instead of just
+            // agreeing in words - which is how a scheduled "meet me at 9" quietly
+            // became nothing. One-shot: consumed at the top of each round.
+            let mut pending_travel = false;
             for round in 0..AGENT_MAX_ROUNDS {
             // Rebuilt per round: the ACTION SPACE IS the discovery state - the
             // grammar offers find_action plus whatever actions he has searched up
-            // this loop; a loot search additionally pins targets to real names.
-            let response_format = npc_response_format(
-                &state,
-                plan.structured,
-                &ctx.requested_scopes,
-                &discovered_containers,
-                &discovered_items,
-                &discovered_inventory,
-                &discovered_actions,
-                true,
-            );
+            // this loop; a loot search additionally pins targets to real names. A
+            // pending pick (a scan ran last round) or a pending travel (find_action
+            // surfaced travel) overrides it with a locked grammar instead.
+            let lock = pending_pick.take().filter(|kind| match *kind {
+                "give" => !discovered_inventory.is_empty(),
+                _ => !discovered_items.is_empty(),
+            });
+            let lock_travel = std::mem::take(&mut pending_travel);
+            let response_format = if lock_travel {
+                Some(npc_locked_travel_format(&state))
+            } else if let Some(kind) = lock {
+                Some(npc_locked_pick_format(&state, kind, &discovered_items, &discovered_inventory))
+            } else {
+                npc_response_format(
+                    &state,
+                    plan.structured,
+                    &ctx.requested_scopes,
+                    &discovered_containers,
+                    &discovered_items,
+                    &discovered_inventory,
+                    &discovered_actions,
+                    true,
+                )
+            };
             let mut collected = String::new();
             let mut spoken_len: usize = 0;
             trace_generate_stage(trace_id.as_deref(), "gen_llm_request_dispatch");
@@ -432,6 +457,35 @@ pub async fn generate_stream_core(
             if !plan.structured {
                 break;
             }
+            // A LOCKED travel round returns a FLAT {action, destination, time}
+            // object (required fields, so the model can't emit nothing), NOT the
+            // {speech, actions} shape agent_partition_round expects. Parse it into a
+            // travel world step and finish the turn - he already spoke his "I'll be
+            // there" on the find_action round (persisted as an interstitial).
+            if lock_travel {
+                // Capture the model's RAW locked-round output so we can see whether
+                // the runtime actually enforced the flat {action,destination,time}
+                // schema (vs falling back to its habitual {speech,actions:[]}).
+                let head: String =
+                    collected.trim().chars().take(200).collect::<String>().replace(['\n', '\r'], " ");
+                trace_generate_stage(trace_id.as_deref(), &format!("gen_travel_lock_raw {head}"));
+                if let Ok(obj) = serde_json::from_str::<Value>(collected.trim()) {
+                    let action = obj.get("action").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                    if !action.is_empty() {
+                        let destination = obj.get("destination").and_then(Value::as_str).unwrap_or("").trim();
+                        let time = obj.get("time").and_then(Value::as_str).unwrap_or("").trim();
+                        world_steps.push(json!({
+                            "action": action,
+                            "target": destination,
+                            "items": "",
+                            "time": time,
+                        }));
+                        tracing::info!("travel lock: committed '{action}' -> '{destination}' at '{time}'");
+                    }
+                }
+                round_speeches.push(String::new());
+                break;
+            }
             let Some((round_speech, mut queries, world)) = agent_partition_round(&state, &agent, &collected) else {
                 break;
             };
@@ -461,6 +515,7 @@ pub async fn generate_stream_core(
                         }
                         if discovered_items.is_empty() {
                             queries.push(("world.search_area".to_string(), String::new()));
+                            pending_pick = Some("take"); // next round: locked item pick
                             continue;
                         }
                     }
@@ -488,6 +543,7 @@ pub async fn generate_stream_core(
                         }
                         if discovered_inventory.is_empty() {
                             queries.push(("chasm.give_scan".to_string(), String::new()));
+                            pending_pick = Some("give"); // next round: locked item pick
                             continue;
                         }
                     }
@@ -553,6 +609,16 @@ pub async fn generate_stream_core(
                     if !bucket.contains(name) {
                         bucket.push(name.clone());
                     }
+                }
+                // A find_action that surfaced the travel action = a go-somewhere
+                // intent; lock the next round to a travel commit so he actually sets
+                // off / schedules instead of just agreeing ("I'll be there"). Match
+                // travel ANYWHERE in the results, not just first: the displayed top
+                // line can differ from actions[0] (describe_found_actions skips
+                // alias-less entries), so travel may be present but not at index 0 -
+                // which is why the lock never fired even when travel was found.
+                if outcome.actions.iter().any(|s| s == "movement.travel_to_location") {
+                    pending_travel = true;
                 }
                 // find_action results unlock those actions in the grammar for the
                 // rest of the loop; accumulate (a loop can pursue several goals).
@@ -2454,6 +2520,33 @@ fn persist_world_record(state: &Arc<AppState>, ctx: &TurnContext, text: &str) {
     }
 }
 
+/// The native `npc_key` of the turn's selected speaker, matched by name against
+/// the request's nearby-NPC list. The speaker is chosen by orchestration, so the
+/// request's own `npc_key` is empty on a player-typed turn; the movement engine
+/// needs the real key to resolve the traveller offscreen (its companion-slot match
+/// keys on it). `None` when no nearby entry matches by name.
+fn resolve_speaker_native_key(ctx: &TurnContext, speaker_name: &str) -> Option<String> {
+    let name = speaker_name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    ctx.player_metadata
+        .pointer("/targeting/nearby_npcs")
+        .and_then(Value::as_array)?
+        .iter()
+        .find_map(|item| {
+            let cand = item.get("npc_name").and_then(Value::as_str).unwrap_or("").trim();
+            if !cand.eq_ignore_ascii_case(name) {
+                return None;
+            }
+            item.get("npc_key")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .map(str::to_string)
+        })
+}
+
 /// Execute the CHASM-side world steps of a finalized turn (native steps go
 /// through the bridge; these are ours): an immediate `travel_to_location`
 /// starts a movement journey directly - no scheduler task, the walk begins
@@ -2522,12 +2615,23 @@ fn dispatch_chasm_world_steps(
                     .filter(|v| !v.is_empty())
             })
             .unwrap_or("player");
-        let npc_key = ctx
-            .player_metadata
-            .get("npc_key")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        // The traveller's native key. The request's own npc_key is EMPTY on a
+        // player-typed turn (the speaker was chosen by orchestration, not named in
+        // the request), and an empty key leaves the journey's per-step actor lookup
+        // unresolvable the moment he walks offscreen - the companion-slot match keys
+        // on it, and the name fallback needs the actor still loaded (a traveller
+        // heading to you usually isn't). Resolve it from the SELECTED speaker via
+        // the turn's nearby-NPC list; fall back to the request key.
+        let npc_key = resolve_speaker_native_key(ctx, &plan.speaker_name)
+            .or_else(|| {
+                ctx.player_metadata
+                    .get("npc_key")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|k| !k.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
         let traveller = crate::movement::Traveller {
             npc_key,
             npc_name: plan.speaker_name.clone(),
@@ -3044,7 +3148,20 @@ fn agent_partition_round(
         };
         match agent_resolve_step(state, agent, &fields.verb) {
             Some(id) if agent.query_ids.contains(&id) => {
-                queries.push((id, fields.target.clone()));
+                // find_action carries its search text in its own `query` field (a
+                // search is a lookup, not an action aimed at a `target`); fall back
+                // to `target` for older/text shapes. Other query steps have no
+                // model-authored topic.
+                let topic = if id == chasm_prompt::FIND_ACTION_ID {
+                    fields
+                        .query
+                        .clone()
+                        .filter(|q| !q.trim().is_empty())
+                        .unwrap_or_else(|| fields.target.clone())
+                } else {
+                    fields.target.clone()
+                };
+                queries.push((id, topic));
             }
             _ => world.push(step),
         }
@@ -3362,10 +3479,63 @@ fn npc_response_format(
         give_verbs: verbs_of("world.give_item"),
         inventory_names: discovered_inventory.to_vec(),
     });
+    // find_action's alias, passed to the grammar ONLY when the search is actually
+    // offered in the enum, so it gets its own `query`-only branch instead of the
+    // generic action form (whose "who/where" target box the model misfilled with
+    // the current location on an intentless search).
+    let find_alias = enum_values.as_ref().and_then(|vals| {
+        chasm_prompt::action_alias_pairs(&entries)
+            .into_iter()
+            .find(|(id, alias)| {
+                id == chasm_prompt::FIND_ACTION_ID && vals.iter().any(|v| v.eq_ignore_ascii_case(alias))
+            })
+            .map(|(_, alias)| alias)
+    });
     Some(crate::llm::npc_structured_response_format(
         enum_values.as_deref(),
         loot_grammar.as_ref(),
+        find_alias.as_deref(),
     ))
+}
+
+/// The LOCKED pick grammar for a post-scan round (streaming loop `pending_pick`).
+/// `kind` is "give" (pin to his carried inventory, no "everything") or "take" (pin
+/// to the scanned loose items, allow "everything"). Verbs come from the SAME book
+/// entries as the normal give/take branch, so the pinned action resolves
+/// identically; the item list is the scan's discovered names.
+fn npc_locked_pick_format(
+    state: &Arc<AppState>,
+    kind: &str,
+    discovered_items: &[String],
+    discovered_inventory: &[String],
+) -> Value {
+    let entries = action_book_entries(state);
+    let verbs_of = |action_id: &str| -> Vec<String> {
+        entries
+            .iter()
+            .filter(|e| !e.disable && e.action_id == action_id)
+            .flat_map(|e| e.alias.clone().into_iter().chain(e.verbs.iter().cloned()))
+            .collect()
+    };
+    if kind == "give" {
+        crate::llm::npc_locked_pick_response_format(&verbs_of("world.give_item"), discovered_inventory, false)
+    } else {
+        crate::llm::npc_locked_pick_response_format(&verbs_of("world.take_items"), discovered_items, true)
+    }
+}
+
+/// The LOCKED travel grammar (streaming loop `pending_travel`): after find_action
+/// surfaced the travel action, force one travel step (place + optional arrival
+/// time) so the NPC commits instead of just agreeing in words. Verbs come from the
+/// book so the pinned action resolves like any travel emit.
+fn npc_locked_travel_format(state: &Arc<AppState>) -> Value {
+    let entries = action_book_entries(state);
+    let verbs: Vec<String> = entries
+        .iter()
+        .filter(|e| !e.disable && e.action_id == "movement.travel_to_location")
+        .flat_map(|e| e.alias.clone().into_iter().chain(e.verbs.iter().cloned()))
+        .collect();
+    crate::llm::npc_locked_travel_response_format(&verbs)
 }
 
 /// Loads the profile's action books flattened to their entries (empty on error).
@@ -3642,6 +3812,9 @@ struct StepFields {
     to: Option<String>,
     /// Item names for a taking step ("hat", "bottle, caps", "everything").
     items: Option<String>,
+    /// find_action's search text — its own field now (a search is a lookup, not an
+    /// action aimed at a `target`). Falls back to `target` for older/text shapes.
+    query: Option<String>,
     obj: Option<serde_json::Map<String, Value>>,
 }
 
@@ -3672,6 +3845,7 @@ fn extract_step_fields(raw: &Value) -> Option<StepFields> {
                 after: pick(map, &["after", "delay", "wait"]),
                 to: pick(map, &["to", "dest", "destination", "place", "location"]),
                 items: pick(map, &["items", "item", "take", "loot"]),
+                query: pick(map, &["query"]),
                 obj: Some(map.clone()),
             })
         }
@@ -3685,6 +3859,7 @@ fn extract_step_fields(raw: &Value) -> Option<StepFields> {
                     after: None,
                     to: call.to,
                     items: None,
+                    query: None,
                     obj: None,
                 });
             }
@@ -3702,6 +3877,7 @@ fn extract_step_fields(raw: &Value) -> Option<StepFields> {
                 after: None,
                 to: None,
                 items: None,
+                query: None,
                 obj: None,
             })
         }

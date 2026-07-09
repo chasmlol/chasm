@@ -85,11 +85,13 @@ Each step: {"action": "...", "target": "...", "items": "...", "time": "", "condi
 - "action": one of your available actions.
 - "target": who or where it is aimed at - "player", a person's name, a place, a container. "" when none.
 - "items": what to take, when taking things. "" otherwise.
-- "time"/"condition"/"delay": ONLY when the player asked for a later clock time, an event to wait for, or a delay - that puts the step on your schedule instead of doing it now. Otherwise leave them "".
+- "time"/"condition"/"delay": fill these in when the player wants the step done LATER - at a clock time ("meet me at 9", "come by at noon"), on an event ("when I leave"), or after a delay. You STILL emit the action now with the time/event/delay set, and that puts it on your schedule to happen then. Leave them "" for a do-it-now step.
+
+A request to do something LATER - meet the player somewhere at a set time, come by at noon, head out when they leave - is STILL a request to ACT, not just to chat: find the action (e.g. travel) and emit it with its "time"/"condition"/"delay" filled in. Do NOT merely agree in words - saying "sure, I'll be there at 9" schedules NOTHING and you will never show up. Only the emitted action, carrying the time, makes it happen.
 
 You act in a loop: do something, the world tells you what happened, then you decide your next step from what it said. Act only on what you have seen.
 
-Lines that begin with "World:" are the game itself narrating what has ALREADY happened - a search result, a pickup, an item you handed over, someone arriving. They are finished facts, NOT orders from the player. React however you see fit: say something, take another action, or do nothing. In particular, "World: [You handed the X to the player.]" means the hand-off is DONE - never read it as an instruction to hand X over again."#;
+Lines that begin with "World:" are the game itself narrating what has ALREADY happened - a search result, a pickup, a hand-off, someone arriving. They are finished facts, NOT orders from the player. React however you see fit: say something, take another action, or do nothing. These are the GAME's words, never your own: never echo a World line back, never begin your speech with "World:", and never state an outcome as though you were narrating it. Saying you did something does NOT make it happen - to actually give, take, or do anything at all you must emit the ACTION, and the game will report the result back to you as a new World line. When a World line says something is already done, simply carry on; never redo it."#;
 
 /// Verbatim from `src/headless/quest-books.js` `QUEST_BOOK_STRUCTURED_OUTPUT_INSTRUCTION`.
 pub const QUEST_BOOK_STRUCTURED_OUTPUT_INSTRUCTION: &str = concat!(
@@ -337,7 +339,7 @@ pub fn npc_actions_instruction(entries: &[ActionEntry], requested_scopes: &[Stri
     };
     format!(
         "
-ACTIONS - you cannot act directly. To DO anything at all - move, loot, fight, sit, gesture, search the room, check what you carry - first FIND the action: emit \"{alias}\" with an empty speech string and set its target to a plain description of what you are trying to do (e.g. \"loot a container\", \"play a song\", \"sit down\", \"look around the room for loot\"). You get back the real actions that match; read them, then emit ONE of them using the exact verb shown. Some of those actions only LOOK or CHECK and answer instantly (searching the room, checking your inventory): emit those with an empty speech string too, read the result, then act on it. What you find stays available for the rest of what you are doing, so search once for a new goal, not for every step. Never invent an action you have not found, and never answer a question in the same round you check something.
+ACTIONS - you cannot act directly. To DO anything at all - move, loot, fight, sit, gesture, search the room, check what you carry - first FIND the action: emit \"{alias}\" with an empty speech string and set its \"query\" to a plain description of what you are trying to do (e.g. \"loot a container\", \"play a song\", \"sit down\", \"look around the room for loot\") - the query is your intent, never a person or a place. You get back the real actions that match; read them, then emit ONE of them using the exact verb shown. Some of those actions only LOOK or CHECK and answer instantly (searching the room, checking your inventory): emit those with an empty speech string too, read the result, then act on it. What you find stays available for the rest of what you are doing, so search once for a new goal, not for every step. Never invent an action you have not found, and never answer a question in the same round you check something.
 "
     )
 }

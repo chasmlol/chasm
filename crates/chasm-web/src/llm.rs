@@ -240,6 +240,14 @@ pub struct LootGrammar {
 pub fn npc_structured_response_format(
     action_enum: Option<&[String]>,
     loot: Option<&LootGrammar>,
+    // The alias of the `find_action` LOOKUP tool, when it is offered. A search is
+    // NOT an action aimed at a target - it is how the NPC discovers an action - so
+    // it gets its OWN step shape (a single `query` field) and is pulled OUT of the
+    // generic action enum. Sharing the generic form gave a search a "who or where"
+    // `target` box the model misfilled with the current location (e.g.
+    // "Goodsprings") on an intentless search. `None` = no dedicated branch
+    // (find_action not offered, or the verb enum is off).
+    find_alias: Option<&str>,
 ) -> Value {
     let step_schema =
         |action_values: Option<&[String]>, target_values: Option<&[String]>, items_values: Option<&[String]>| -> Value {
@@ -269,11 +277,37 @@ pub fn npc_structured_response_format(
             })
         };
 
+    // find_action is a LOOKUP, not an action you aim somewhere: its own shape, with
+    // ONE field - `query`, a plain description of the intent - so a search can never
+    // carry a who/where target. It is stripped from the generic action enum below,
+    // so it appears ONLY in this clean form.
+    let find_alias = find_alias.map(str::trim).filter(|a| !a.is_empty());
+    let find_branch = find_alias.map(|alias| {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "action": { "type": "string", "enum": [alias] },
+                "query": { "type": "string", "description": "Plainly what you want to DO, so the matching action can be found (e.g. \"sit down\", \"loot a container\", \"play a song\"). Describe the intent - never a person or a place." }
+            },
+            "required": ["action", "query"]
+        })
+    });
+    // The offered verbs with find_action removed (it lives in `find_branch`).
+    let strip_find = |values: &[String]| -> Vec<String> {
+        values
+            .iter()
+            .filter(|v| find_alias.map_or(true, |a| !v.eq_ignore_ascii_case(a)))
+            .cloned()
+            .collect()
+    };
+
     // The step grammar. Without the verb enum everything stays a free string (the
     // resolver corrects after generation) and no pinning can bind. With the enum
-    // on, up to three branches:
-    //   * generic  - every verb EXCEPT loot verbs (need a container first) and,
-    //                once items are known, take verbs (they move to the take branch).
+    // on, up to several branches:
+    //   * find     - the find_action LOOKUP (a `query` field only), when offered.
+    //   * generic  - every other verb EXCEPT loot verbs (need a container first)
+    //                and, once items are known, take verbs (they move to take).
     //   * loot     - once a container is discovered: loot verbs, target pinned to it.
     //   * take     - once items are known (scan / open container): take verbs, the
     //                `items` field pinned to the real names + "everything" + "[none]".
@@ -291,14 +325,22 @@ pub fn npc_structured_response_format(
             // (a bare give triggers the inventory scan); once the inventory is known
             // it moves to a pinned branch (items = his carried items + "[none]").
             let pin_give = !grammar.inventory_names.is_empty() && !grammar.give_verbs.is_empty();
-            let other: Vec<String> = values
-                .iter()
+            let other: Vec<String> = strip_find(values)
+                .into_iter()
                 .filter(|v| !is(&grammar.verbs, v))
                 .filter(|v| !(pin_take && is(&grammar.take_verbs, v)))
                 .filter(|v| !(pin_give && is(&grammar.give_verbs, v)))
-                .cloned()
                 .collect();
-            let mut branches = vec![step_schema(Some(&other), None, None)];
+            let mut branches: Vec<Value> = Vec::new();
+            if let Some(fb) = &find_branch {
+                branches.push(fb.clone());
+            }
+            // Generic branch: with find_action pulled out `other` can be empty (only
+            // the search was offered) - then it is dropped. With no find branch,
+            // keep it even when empty to preserve the prior free-action fallback.
+            if !other.is_empty() || find_branch.is_none() {
+                branches.push(step_schema(Some(&other), None, None));
+            }
             if !grammar.container_names.is_empty() {
                 branches.push(step_schema(Some(&grammar.verbs), Some(&grammar.container_names), None));
             }
@@ -335,7 +377,19 @@ pub fn npc_structured_response_format(
                 json!({ "anyOf": branches })
             }
         }
-        _ => step_schema(action_enum, None, None),
+        // No loot grammar (enum off, or the buffered path). Still split find_action
+        // into its own branch when it is offered.
+        _ => match (&find_branch, action_enum) {
+            (Some(fb), Some(values)) => {
+                let other = strip_find(values);
+                if other.is_empty() {
+                    fb.clone()
+                } else {
+                    json!({ "anyOf": [fb.clone(), step_schema(Some(&other), None, None)] })
+                }
+            }
+            _ => step_schema(action_enum, None, None),
+        },
     };
 
     json!({
@@ -356,6 +410,98 @@ pub fn npc_structured_response_format(
                     }
                 },
                 "required": ["speech", "actions"]
+            }
+        }
+    })
+}
+
+/// A LOCKED pick round. After a bare give/take triggered the inventory/area scan,
+/// the NEXT round is constrained to EXACTLY one give/take step: `speech` forced to
+/// "" (no talking), `actions` forced to one item (`minItems`/`maxItems` = 1), that
+/// step's verb pinned to `verbs`, its `target` forced empty, and its `items` pinned
+/// to the real scanned names + "[none]" (+ "everything" for a take). So the model
+/// MUST pick a real item or explicitly decline - it can neither narrate a fake
+/// outcome (the "World: [You handed X]" parrot) nor escape to speech-only. `verbs`
+/// are the give/take verbs; `item_names` the scanned list.
+pub fn npc_locked_pick_response_format(
+    verbs: &[String],
+    item_names: &[String],
+    allow_everything: bool,
+) -> Value {
+    let mut opts: Vec<String> = item_names.to_vec();
+    if allow_everything {
+        opts.push("everything".to_string());
+    }
+    opts.push("[none]".to_string());
+    let enum_field = |desc: &str, values: &[String]| -> Value {
+        json!({ "type": "string", "description": desc, "enum": values })
+    };
+    let step = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "action": enum_field("The pick action (use exactly as shown).", verbs),
+            "target": enum_field("Leave empty.", &[String::new()]),
+            "items": enum_field(
+                "EXACTLY one: the item name to hand over / take, or \"[none]\" to decline.",
+                &opts,
+            )
+        },
+        "required": ["action", "target", "items"]
+    });
+    json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "chasm_npc_pick",
+            "description": "A single locked item pick: choose one item or decline.",
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "speech": { "type": "string", "enum": [""], "description": "No talking on a pick - leave empty." },
+                    "actions": {
+                        "type": "array",
+                        "description": "Exactly one pick.",
+                        "minItems": 1,
+                        "maxItems": 1,
+                        "items": step
+                    }
+                },
+                "required": ["speech", "actions"]
+            }
+        }
+    })
+}
+
+/// A LOCKED travel round: after `find_action` surfaces the travel action for a
+/// go-somewhere intent, force the NPC to COMMIT the travel instead of escaping to
+/// speech ("I'll be there" with no action - which schedules nothing).
+///
+/// This is a FLAT object `{action, destination, time}` with all three REQUIRED,
+/// NOT a `{speech, actions[]}` shape with a `minItems:1` array - the local runtime
+/// enforces `required` object properties (the model always emitted both `speech`
+/// and `actions`) but does NOT enforce `minItems`, so an array lock let the model
+/// emit `actions: []` right through it. With required fields it cannot emit
+/// nothing; the streaming loop parses this object into a travel step. The verb is
+/// pinned; he fills the destination and, for a later meeting, the arrival time (a
+/// time routes the step onto his schedule).
+pub fn npc_locked_travel_response_format(verbs: &[String]) -> Value {
+    json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "chasm_npc_travel",
+            "description": "Commit to a travel: the action, the place, and the arrival time if it's for later.",
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "action": { "type": "string", "enum": verbs, "description": "The travel action (use exactly as shown)." },
+                    "destination": { "type": "string", "description": "Where to go: a place's name (e.g. \"Prospector Saloon\"), or \"player\" to come to where the player is." },
+                    "time": { "type": "string", "description": "The clock time to ARRIVE if the player asked to meet at a LATER time (e.g. \"9:00PM\") - that schedules it. Leave \"\" to set off right now." }
+                },
+                "required": ["action", "destination", "time"]
             }
         }
     })
@@ -935,7 +1081,7 @@ mod tests {
         // insertion order in this build (a dependency enables preserve_order;
         // if that ever drops, properties serialize alphabetically = actions
         // first, and this test catches it).
-        let format = super::npc_structured_response_format(None, None);
+        let format = super::npc_structured_response_format(None, None, None);
         let serialized = serde_json::to_string(&format).unwrap();
         let speech_pos = serialized.find("\"speech\"").unwrap();
         let actions_pos = serialized.find("\"actions\"").unwrap();
@@ -947,14 +1093,14 @@ mod tests {
         assert!(step["properties"]["action"].get("enum").is_none());
         // Enum variant: the verb list rides the grammar.
         let vals = vec!["attack".to_string(), "kill".to_string()];
-        let format = super::npc_structured_response_format(Some(&vals), None);
+        let format = super::npc_structured_response_format(Some(&vals), None, None);
         let step = &format["json_schema"]["schema"]["properties"]["actions"]["items"];
         assert_eq!(
             step["properties"]["action"]["enum"],
             serde_json::json!(["attack", "kill"])
         );
         // Empty enum degrades to a free string, not an unsatisfiable grammar.
-        let format = super::npc_structured_response_format(Some(&[]), None);
+        let format = super::npc_structured_response_format(Some(&[]), None, None);
         let step = &format["json_schema"]["schema"]["properties"]["actions"]["items"];
         assert!(step["properties"]["action"].get("enum").is_none());
     }
@@ -969,7 +1115,7 @@ mod tests {
             verbs: vec!["loot".into()],
             ..Default::default()
         };
-        let format = super::npc_structured_response_format(Some(&vals), Some(&loot));
+        let format = super::npc_structured_response_format(Some(&vals), Some(&loot), None);
         let step = format.pointer("/json_schema/schema/properties/actions/items").unwrap();
         let action_enum = step.pointer("/properties/action/enum").unwrap();
         assert!(!action_enum.to_string().contains("loot"), "pre-search enum still contains loot: {action_enum}");
@@ -980,7 +1126,7 @@ mod tests {
             container_names: vec!["Oven".into(), "Footlocker".into()],
             ..Default::default()
         };
-        let format = super::npc_structured_response_format(Some(&vals), Some(&loot));
+        let format = super::npc_structured_response_format(Some(&vals), Some(&loot), None);
         let step = format.pointer("/json_schema/schema/properties/actions/items").unwrap();
         let branches = step.get("anyOf").and_then(serde_json::Value::as_array).expect("anyOf branches");
         // A loot branch (target pinned) + the generic branch (no loot verb).
@@ -1004,7 +1150,7 @@ mod tests {
             take_verbs: vec!["take".into()],
             ..Default::default()
         };
-        let f = super::npc_structured_response_format(Some(&vals), Some(&g));
+        let f = super::npc_structured_response_format(Some(&vals), Some(&g), None);
         let step = f.pointer("/json_schema/schema/properties/actions/items").unwrap();
         // No items known and no containers -> single generic branch containing "take".
         assert!(step.pointer("/properties/action/enum").unwrap().to_string().contains("take"));
@@ -1016,7 +1162,7 @@ mod tests {
             item_names: vec!["Hammer".into(), "9mm Pistol".into()],
             ..Default::default()
         };
-        let f = super::npc_structured_response_format(Some(&vals), Some(&g));
+        let f = super::npc_structured_response_format(Some(&vals), Some(&g), None);
         let branches = f
             .pointer("/json_schema/schema/properties/actions/items/anyOf")
             .and_then(serde_json::Value::as_array)
@@ -1038,6 +1184,100 @@ mod tests {
         assert!(!generic.pointer("/properties/action/enum").unwrap().to_string().contains("take"));
     }
 
+    /// find_action is a LOOKUP: its step is a `query`-only shape with NO who/where
+    /// `target`, and it never appears in the generic (target-bearing) action form.
+    /// This is what structurally prevents the location leaking into the search.
+    #[test]
+    fn find_action_gets_its_own_query_only_branch() {
+        let g = super::LootGrammar {
+            verbs: vec!["loot".into()],
+            take_verbs: vec!["take".into()],
+            give_verbs: vec!["give".into()],
+            ..Default::default()
+        };
+        // Only the search offered (nothing discovered yet): the single step IS the
+        // find branch - a query field, no target box.
+        let vals = vec!["find_action".to_string()];
+        let f = super::npc_structured_response_format(Some(&vals), Some(&g), Some("find_action"));
+        let step = f.pointer("/json_schema/schema/properties/actions/items").unwrap();
+        assert_eq!(step.pointer("/properties/action/enum").unwrap(), &json!(["find_action"]));
+        assert!(step.pointer("/properties/query").is_some(), "search has a query field");
+        assert!(step.pointer("/properties/target").is_none(), "search has NO who/where target");
+        assert_eq!(step["required"], json!(["action", "query"]));
+
+        // A real action ALSO discovered: the search stays its own query-only anyOf
+        // branch, separate from the generic (target-bearing) action form.
+        let vals = vec!["find_action".to_string(), "sit".to_string()];
+        let f = super::npc_structured_response_format(Some(&vals), Some(&g), Some("find_action"));
+        let branches = f
+            .pointer("/json_schema/schema/properties/actions/items/anyOf")
+            .and_then(serde_json::Value::as_array)
+            .expect("anyOf branches");
+        let find_branch = branches
+            .iter()
+            .find(|b| b.pointer("/properties/query").is_some())
+            .expect("find branch");
+        assert!(find_branch.pointer("/properties/target").is_none(), "find branch has no target");
+        // find_action must NOT appear in the generic (target-bearing) branch.
+        let generic = branches
+            .iter()
+            .find(|b| b.pointer("/properties/query").is_none())
+            .expect("generic branch");
+        let generic_enum = generic.pointer("/properties/action/enum").unwrap().to_string();
+        assert!(!generic_enum.contains("find_action"), "search must not ride the generic form");
+        assert!(generic_enum.contains("sit"));
+    }
+
+    /// The locked pick round: exactly one give/take step, no speech, item pinned to
+    /// the scanned list + "[none]" - the model can only pick or decline.
+    #[test]
+    fn locked_pick_forces_one_item_or_none_no_speech() {
+        let verbs = vec!["give".to_string(), "give_item".to_string()];
+        let inv = vec!["9mm Pistol".to_string(), "Hammer".to_string()];
+        let f = super::npc_locked_pick_response_format(&verbs, &inv, false);
+        let schema = f.pointer("/json_schema/schema").unwrap();
+        // No talking: speech is pinned to "".
+        assert_eq!(schema.pointer("/properties/speech/enum").unwrap(), &json!([""]));
+        // Exactly one action.
+        let actions = schema.pointer("/properties/actions").unwrap();
+        assert_eq!(actions["minItems"], json!(1));
+        assert_eq!(actions["maxItems"], json!(1));
+        let step = actions.pointer("/items").unwrap();
+        // Verb pinned, target forced empty.
+        assert_eq!(step.pointer("/properties/action/enum").unwrap(), &json!(["give", "give_item"]));
+        assert_eq!(step.pointer("/properties/target/enum").unwrap(), &json!([""]));
+        // Items pinned to the real inventory + [none]; NO "everything" on a give.
+        let items = step.pointer("/properties/items/enum").unwrap().to_string();
+        assert!(items.contains("9mm Pistol") && items.contains("Hammer") && items.contains("[none]"));
+        assert!(!items.contains("everything"), "give has no everything");
+        assert_eq!(step["required"], json!(["action", "target", "items"]));
+
+        // Take variant additionally offers "everything".
+        let f = super::npc_locked_pick_response_format(&["take".to_string()], &["Stimpak".to_string()], true);
+        let items = f
+            .pointer("/json_schema/schema/properties/actions/items/properties/items/enum")
+            .unwrap()
+            .to_string();
+        assert!(items.contains("Stimpak") && items.contains("everything") && items.contains("[none]"));
+    }
+
+    /// The locked travel round is a FLAT object with all three fields REQUIRED (the
+    /// runtime enforces `required`, not array `minItems`), so the model cannot emit
+    /// nothing. Verb pinned; place and time free for the NPC to fill.
+    #[test]
+    fn locked_travel_is_a_required_flat_object() {
+        let verbs = vec!["travel_to".to_string(), "travel".to_string()];
+        let f = super::npc_locked_travel_response_format(&verbs);
+        let schema = f.pointer("/json_schema/schema").unwrap();
+        assert_eq!(schema.pointer("/properties/action/enum").unwrap(), &json!(["travel_to", "travel"]));
+        assert!(schema.pointer("/properties/destination").is_some(), "has a place field");
+        assert!(schema.pointer("/properties/time").is_some(), "has a time field");
+        assert_eq!(schema["required"], json!(["action", "destination", "time"]));
+        // No {speech, actions[]} escape hatch - it is the flat object itself.
+        assert!(schema.pointer("/properties/speech").is_none());
+        assert!(schema.pointer("/properties/actions").is_none());
+    }
+
     /// give mirrors take, over the NPC's own inventory: pre-check the give verb is
     /// generic (a bare give triggers the inventory scan); once the inventory is
     /// known, a branch pins `items` to his carried items + "[none]" (NO
@@ -1050,7 +1290,7 @@ mod tests {
             give_verbs: vec!["give".into()],
             ..Default::default()
         };
-        let f = super::npc_structured_response_format(Some(&vals), Some(&g));
+        let f = super::npc_structured_response_format(Some(&vals), Some(&g), None);
         let step = f.pointer("/json_schema/schema/properties/actions/items").unwrap();
         assert!(step.pointer("/properties/action/enum").unwrap().to_string().contains("give"));
 
@@ -1060,7 +1300,7 @@ mod tests {
             inventory_names: vec!["Stimpak".into(), "Purified Water".into()],
             ..Default::default()
         };
-        let f = super::npc_structured_response_format(Some(&vals), Some(&g));
+        let f = super::npc_structured_response_format(Some(&vals), Some(&g), None);
         let branches = f
             .pointer("/json_schema/schema/properties/actions/items/anyOf")
             .and_then(serde_json::Value::as_array)

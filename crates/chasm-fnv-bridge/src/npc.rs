@@ -615,6 +615,46 @@ pub fn extract_lines(
         .collect()
 }
 
+/// Like [`extract_lines`] but KEEPS items whose visible text is empty. A silent
+/// action turn (empty speech + steps — the NPC grabs something "without a word")
+/// carries no text, so `extract_lines` drops it; the native-action dispatch still
+/// needs that item's ORCHESTRATOR-SELECTED speaker to aim its command at the
+/// right actor. Resolving here (not from `request.npc_key`/`npc_name`, which are
+/// empty when the player typed a command without naming an NPC) is what lets a
+/// silent, player-requested action reach the game instead of silently no-oping.
+pub fn extract_action_lines(
+    config: &BridgeConfig,
+    participants: &[NpcParticipant],
+    request: &NativeRequest,
+    turn: &Value,
+) -> Vec<GeneratedLine> {
+    let owned;
+    let items: &[Value] = match turn.get("turns").and_then(Value::as_array) {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => {
+            owned = vec![turn.clone()];
+            &owned
+        }
+    };
+    items
+        .iter()
+        .map(|item| {
+            let speaker = selected_speaker_info(config, participants, request, item);
+            let content = item.pointer("/message/content").and_then(Value::as_str).unwrap_or("");
+            let text = strip_speaker_prefix(content, &speaker.character_name);
+            GeneratedLine {
+                participant_id: speaker.participant_id,
+                native_npc_key: speaker.native_npc_key,
+                native_npc_name: speaker.native_npc_name,
+                character_name: speaker.character_name,
+                character_id: speaker.character_id,
+                text,
+                turn: (*item).clone(),
+            }
+        })
+        .collect()
+}
+
 /// A speaker resolved from a streaming `speaker.start` event, reused to label each
 /// `speech.delta` segment's audio chunks before the final turn arrives.
 #[derive(Debug, Clone)]

@@ -503,13 +503,35 @@ fn write_song_delivery(job: &SongJob, song: &StoredSong, lyrics: &SongLyrics) ->
 /// `start_song_job`. Never blocks the caller; any failure is logged.
 pub(crate) fn spawn_song_job(state: Arc<AppState>, job: SongJob) {
     tokio::spawn(async move {
-        if let Err(error) = run_song_job(&state, &job).await {
-            tracing::warn!(
-                "music: song job for '{}' (req {}) failed: {error}",
-                job.character_name, job.request_id
-            );
-        }
+        let outcome = run_song_job(&state, &job).await;
+        let line = match &outcome {
+            Ok(()) => format!("OK   song delivered for '{}' (req {})", job.character_name, job.request_id),
+            Err(error) => {
+                tracing::warn!(
+                    "music: song job for '{}' (req {}) failed: {error}",
+                    job.character_name, job.request_id
+                );
+                format!("FAIL '{}' (req {}): {error}", job.character_name, job.request_id)
+            }
+        };
+        // The song job runs off the turn thread and logs only to chasm's stdout,
+        // which the launcher does not capture - persist the per-stage outcome next
+        // to native_plugin.log so a failure is diagnosable from the logs alone.
+        write_music_log(&state, &line);
     });
+}
+
+/// Appends one line to `<bridge>/music.log` (best effort; never fails the job).
+fn write_music_log(state: &Arc<AppState>, line: &str) {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let path = crate::scheduler::bridge_root(state).join("music.log");
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "[{millis}] {line}");
+    }
 }
 
 /// The full song job: lyrics -> ACE-Step -> store -> deliver. Each stage logs on

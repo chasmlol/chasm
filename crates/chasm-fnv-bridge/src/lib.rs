@@ -305,6 +305,138 @@ pub async fn run_turn_with_sink(
     run_turn(config, client, sink, &root, &path, request).await
 }
 
+/// Start the async song job if this line chose the play-a-song / rap action.
+/// Shared by the SPEAKING path and the SILENT-turn branch: a song is usually
+/// played with empty speech (the NPC just performs), which routes through the
+/// silent branch, so the trigger must live in both - otherwise a silent
+/// performance fires the guitar but never generates the song. Returns whether a
+/// job was started.
+fn maybe_start_song_job(
+    client: &dyn ChasmClient,
+    config: &BridgeConfig,
+    request: &NativeRequest,
+    message: &str,
+    line: &npc::GeneratedLine,
+    gms: &[actions::GameMaster],
+) -> bool {
+    let Some(gm) = gms.iter().find(|gm| {
+        gm.should_trigger
+            && (gm.action_id == chasm_core::PLAY_SONG_ACTION_ID
+                || gm.action_id == chasm_core::PLAY_RAP_ACTION_ID)
+    }) else {
+        return false;
+    };
+    let is_rap = gm.action_id == chasm_core::PLAY_RAP_ACTION_ID;
+    let job = crate::chasm::SongJob {
+        request_id: request.request_id.clone(),
+        live_chat_id: config.live_chat_id.clone(),
+        character_id: line.character_id.clone(),
+        character_name: line.character_name.clone(),
+        npc_key: first_non_empty([line.native_npc_key.clone(), request.npc_key.clone()]),
+        npc_name: first_non_empty([
+            line.native_npc_name.clone(),
+            line.character_name.clone(),
+            request.npc_name.clone(),
+        ]),
+        user_message: message.to_string(),
+        style_hint: if is_rap { "rap".to_string() } else { String::new() },
+        bridge_roots: config.native_bridge_roots.clone(),
+    };
+    info!(
+        "{}: {} action -> starting song job for {}",
+        request.request_id,
+        if is_rap { "rap" } else { "play-a-song" },
+        line.character_name
+    );
+    client.start_song_job(job);
+    true
+}
+
+/// Create any SCHEDULED tasks a line's turn carries (natural-language "at <time>"
+/// / "then", peeled into `structured.scheduled` by normalize). Each native step's
+/// command body is built NOW (only here is the turn context available) so the tick
+/// can replay it verbatim at the scheduled time. Shared by the SPEAKING path and
+/// the SILENT-turn branch: a scheduled action can be emitted with empty speech
+/// (the NPC just sets it up without a word), which routes through the silent
+/// branch, so without this a silently-scheduled task is dropped and never fires.
+fn schedule_line_tasks(
+    client: &dyn ChasmClient,
+    config: &BridgeConfig,
+    request: &NativeRequest,
+    line: &npc::GeneratedLine,
+) {
+    let Some(specs) = line.turn.pointer("/structured/scheduled").and_then(Value::as_array) else {
+        return;
+    };
+    for spec in specs {
+        let owner_key = first_non_empty([line.native_npc_key.clone(), request.npc_key.clone()]);
+        let owner_name = first_non_empty([
+            line.native_npc_name.clone(),
+            line.character_name.clone(),
+            request.npc_name.clone(),
+        ]);
+        let actor = actions::ActionActor {
+            native_npc_key: owner_key.clone(),
+            native_npc_name: owner_name.clone(),
+            character_name: line.character_name.clone(),
+            character_id: line.character_id.clone(),
+        };
+        let mut out_steps: Vec<Value> = Vec::new();
+        for (step_index, step) in spec.get("steps").and_then(Value::as_array).into_iter().flatten().enumerate() {
+            let mut step = step.clone();
+            let action_id = step.get("action_id").and_then(Value::as_str).unwrap_or("").to_string();
+            if !action_id.is_empty() {
+                // Classify just this action against the real turn (which carries the
+                // activated executions) and build its native command body. Aim it at
+                // the step's own target (a scheduled "attack Easy Pete" must hit Easy
+                // Pete), defaulting to the player.
+                let target = step
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or("player");
+                let mut synth = line.turn.clone();
+                let items = step
+                    .get("items")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or("");
+                let single = serde_json::json!([{ "id": action_id, "target": target, "items": items }]);
+                match synth.get_mut("structured") {
+                    Some(s) => s["actions"] = single,
+                    None => synth["structured"] = serde_json::json!({ "actions": single }),
+                }
+                let gm = actions::get_native_game_master_action(config, &synth);
+                // A UNIQUE request id per chain step: completion signals (LootDone)
+                // correlate on it - two loot steps in one chain sharing the turn's id
+                // would fire each other's gates.
+                let mut step_request = request.clone();
+                step_request.request_id = format!("{}-k{}", request.request_id, step_index + 1);
+                if let Some(body) = actions::build_native_command_body(&step_request, &actor, &gm, "scheduler") {
+                    if let Some(obj) = step.as_object_mut() {
+                        obj.insert("command_body".to_string(), Value::String(body));
+                    }
+                }
+            }
+            out_steps.push(step);
+        }
+        let (day, hour) = request_clock(request);
+        let payload = serde_json::json!({
+            "owner_npc_key": owner_key,
+            "owner_name": owner_name,
+            "character_name": line.character_name.clone(),
+            "live_chat_id": config.live_chat_id.clone(),
+            "raw": spec.get("raw").cloned().unwrap_or(Value::Null),
+            "steps": out_steps,
+            "day": day,
+            "hour": hour,
+        });
+        info!("{}: scheduled phrase by {}", request.request_id, line.character_name);
+        client.schedule_task(payload);
+    }
+}
+
 /// The regular-NPC turn: resolve, presence, generate, TTS, respond. Emits its
 /// own success/early-return outputs through `sink`; the caller emits a generic
 /// error + always archives. `root`/`path` are retained for the file-only paths
@@ -543,26 +675,63 @@ async fn run_turn(
         // empty-text lines, so classify the TURN itself and dispatch any
         // triggered steps before replying with silence; without this a silent
         // action turn silently no-ops.
-        let silent_gms = actions::get_native_game_master_actions_per_step(config, &turn);
-        if !silent_gms.is_empty() {
+        //
+        // Resolve each item's speaker via extract_action_lines (which KEEPS the
+        // text-less items) and aim the command at THAT actor. The old code built
+        // the actor from request.npc_key/npc_name, which are empty when the player
+        // typed a command without naming an NPC (the speaker is chosen by
+        // orchestration) — so actor resolution failed and the command was never
+        // queued, leaving the NPC frozen on a valid-but-undispatched action.
+        for (line_index, line) in npc::extract_action_lines(config, &participants, request, &turn)
+            .iter()
+            .enumerate()
+        {
+            let silent_gms = actions::get_native_game_master_actions_per_step(config, &line.turn);
+            if silent_gms.is_empty() {
+                continue;
+            }
             let actor = actions::ActionActor {
-                native_npc_key: request.npc_key.clone(),
-                native_npc_name: request.npc_name.clone(),
-                character_name: String::new(),
-                character_id: String::new(),
+                native_npc_key: line.native_npc_key.clone(),
+                native_npc_name: line.native_npc_name.clone(),
+                character_name: line.character_name.clone(),
+                character_id: line.character_id.clone(),
             };
+            // Loot steps fold into ONE errand command, exactly like the speaking
+            // path (a multi-item sweep is one trip, not N competing orders).
+            let loot_aggregate = actions::aggregate_loot_steps(&silent_gms);
+            let mut loot_dispatched = false;
             for (step_index, gm) in silent_gms.iter().enumerate() {
                 if !gm.should_trigger {
                     continue;
                 }
-                let mut step_request = request.clone();
-                if silent_gms.len() > 1 {
-                    step_request.request_id = format!("{}-s{}", request.request_id, step_index + 1);
+                let is_loot = gm.action == "LOOT";
+                if is_loot && loot_dispatched {
+                    continue;
                 }
-                if sink.action(config, &step_request, &actor, gm, "fallout-new-vegas-native-action") {
-                    info!("{}: silent turn dispatched {} ({})", request.request_id, gm.action, gm.action_id);
+                let dispatch_gm = if is_loot {
+                    loot_dispatched = true;
+                    loot_aggregate.as_ref().unwrap_or(gm)
+                } else {
+                    gm
+                };
+                let mut step_request = request.clone();
+                let suffix = first_non_empty([line.native_npc_key.clone(), (line_index + 1).to_string()]);
+                step_request.request_id = format!("{}-{}-s{}", request.request_id, suffix, step_index + 1);
+                if sink.action(config, &step_request, &actor, dispatch_gm, "fallout-new-vegas-native-action") {
+                    info!(
+                        "{}: silent turn dispatched {} ({}) for {}",
+                        request.request_id, dispatch_gm.action, dispatch_gm.action_id, actor.native_npc_name
+                    );
                 }
             }
+            // A song is usually played SILENTLY (empty speech), so it arrives HERE,
+            // not in the speaking path - start the job or the guitar fires and no
+            // song is ever generated (the regression once acting went silent).
+            maybe_start_song_job(client, config, request, &message, line, &silent_gms);
+            // Same silent-branch trap for scheduling: a deferred action (travel "at
+            // 9pm") emitted with no speech must still create its task, or it never
+            // fires and the NPC never shows up.
+            schedule_line_tasks(client, config, request, line);
         }
         // Status 1, no audio.
         let resp = OutgoingResponse {
@@ -585,76 +754,7 @@ async fn run_turn(
     // available to resolve the script + args) so the tick can replay it verbatim
     // at the scheduled time. Fire-and-forget; never blocks or fails the turn.
     for line in &lines {
-        let Some(specs) = line.turn.pointer("/structured/scheduled").and_then(Value::as_array) else {
-            continue;
-        };
-        for spec in specs {
-            let owner_key = first_non_empty([line.native_npc_key.clone(), request.npc_key.clone()]);
-            let owner_name = first_non_empty([
-                line.native_npc_name.clone(),
-                line.character_name.clone(),
-                request.npc_name.clone(),
-            ]);
-            let actor = actions::ActionActor {
-                native_npc_key: owner_key.clone(),
-                native_npc_name: owner_name.clone(),
-                character_name: line.character_name.clone(),
-                character_id: line.character_id.clone(),
-            };
-            let mut out_steps: Vec<Value> = Vec::new();
-            for (step_index, step) in spec.get("steps").and_then(Value::as_array).into_iter().flatten().enumerate() {
-                let mut step = step.clone();
-                let action_id = step.get("action_id").and_then(Value::as_str).unwrap_or("").to_string();
-                if !action_id.is_empty() {
-                    // Classify just this action against the real turn (which carries
-                    // the activated executions) and build its native command body.
-                    // Aim it at the step's own target (e.g. a scheduled "attack Easy
-                    // Pete" must hit Easy Pete), defaulting to the player.
-                    let target = step
-                        .get("target")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|t| !t.is_empty())
-                        .unwrap_or("player");
-                    let mut synth = line.turn.clone();
-                    let items = step
-                        .get("items")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .unwrap_or("");
-                    let single = serde_json::json!([{ "id": action_id, "target": target, "items": items }]);
-                    match synth.get_mut("structured") {
-                        Some(s) => s["actions"] = single,
-                        None => synth["structured"] = serde_json::json!({ "actions": single }),
-                    }
-                    let gm = actions::get_native_game_master_action(config, &synth);
-                    // A UNIQUE request id per chain step: completion signals
-                    // (LootDone) correlate on it - two loot steps in one chain
-                    // sharing the turn's id would fire each other's gates.
-                    let mut step_request = request.clone();
-                    step_request.request_id = format!("{}-k{}", request.request_id, step_index + 1);
-                    if let Some(body) = actions::build_native_command_body(&step_request, &actor, &gm, "scheduler") {
-                        if let Some(obj) = step.as_object_mut() {
-                            obj.insert("command_body".to_string(), Value::String(body));
-                        }
-                    }
-                }
-                out_steps.push(step);
-            }
-            let (day, hour) = request_clock(request);
-            let payload = serde_json::json!({
-                "owner_npc_key": owner_key,
-                "owner_name": owner_name,
-                "character_name": line.character_name.clone(),
-                "live_chat_id": config.live_chat_id.clone(),
-                "raw": spec.get("raw").cloned().unwrap_or(Value::Null),
-                "steps": out_steps,
-                "day": day,
-                "hour": hour,
-            });
-            info!("{}: scheduled phrase by {}", request.request_id, line.character_name);
-            client.schedule_task(payload);
-        }
+        schedule_line_tasks(client, config, request, line);
     }
 
     // Native actions: classify each line, write a durable command file per triggered
@@ -748,38 +848,10 @@ async fn run_turn(
     // and bails if music is disabled, so the live setting is the real authority;
     // in the standalone build `start_song_job` is a no-op anyway.
     {
-        if let Some((line, gm)) = lines.iter().zip(line_gms.iter()).find_map(|(line, gms)| {
-            gms.iter()
-                .find(|gm| {
-                    gm.should_trigger
-                        && (gm.action_id == chasm_core::PLAY_SONG_ACTION_ID
-                            || gm.action_id == chasm_core::PLAY_RAP_ACTION_ID)
-                })
-                .map(|gm| (line, gm))
-        }) {
-            let is_rap = gm.action_id == chasm_core::PLAY_RAP_ACTION_ID;
-            let job = crate::chasm::SongJob {
-                request_id: request.request_id.clone(),
-                live_chat_id: config.live_chat_id.clone(),
-                character_id: line.character_id.clone(),
-                character_name: line.character_name.clone(),
-                npc_key: first_non_empty([line.native_npc_key.clone(), request.npc_key.clone()]),
-                npc_name: first_non_empty([
-                    line.native_npc_name.clone(),
-                    line.character_name.clone(),
-                    request.npc_name.clone(),
-                ]),
-                user_message: message.clone(),
-                style_hint: if is_rap { "rap".to_string() } else { String::new() },
-                bridge_roots: config.native_bridge_roots.clone(),
-            };
-            info!(
-                "{}: {} action -> starting song job for {}",
-                request.request_id,
-                if is_rap { "rap" } else { "play-a-song" },
-                line.character_name
-            );
-            client.start_song_job(job);
+        for (line, gms) in lines.iter().zip(line_gms.iter()) {
+            if maybe_start_song_job(client, config, request, &message, line, gms) {
+                break;
+            }
         }
     }
 
