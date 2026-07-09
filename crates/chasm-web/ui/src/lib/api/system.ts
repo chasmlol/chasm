@@ -180,6 +180,10 @@ export interface HotkeysConfig {
   enter_text: string;
   todd_push_to_talk: string;
   todd_enter_text: string;
+  /** Runs the reflection passes on demand. "" = unbound. */
+  reflect: string;
+  /** Whether a game save also runs the reflection passes. */
+  reflect_on_save: boolean;
 }
 
 /** Mirrors `UiHotkeysView`. `defaults` drives the per-row reset buttons. */

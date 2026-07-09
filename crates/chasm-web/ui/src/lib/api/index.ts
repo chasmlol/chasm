@@ -28,6 +28,8 @@ export * from "./events";
 export * from "./scheduler";
 export * from "./travel";
 export * from "./triggers";
+export * from "./journals";
+export * from "./skills";
 
 import { systemApi } from "./system";
 import { booksApi } from "./books";
@@ -45,6 +47,8 @@ import { eventsApi } from "./events";
 import { schedulerApi } from "./scheduler";
 import { travelApi } from "./travel";
 import { triggersApi } from "./triggers";
+import { journalsApi } from "./journals";
+import { skillsApi } from "./skills";
 
 export {
   systemApi,
@@ -63,6 +67,8 @@ export {
   schedulerApi,
   travelApi,
   triggersApi,
+  journalsApi,
+  skillsApi,
 };
 
 /**
@@ -87,4 +93,6 @@ export const api = {
   scheduler: schedulerApi,
   travel: travelApi,
   triggers: triggersApi,
+  journals: journalsApi,
+  skills: skillsApi,
 };

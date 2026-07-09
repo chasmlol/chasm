@@ -15,6 +15,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import { FormRow } from "@/components/ui/page";
 import { SettingsPage } from "@/components/ui/settings-page";
 
@@ -80,6 +81,7 @@ function canonicalKeyName(code: string): string | null {
 
 /** Slightly friendlier display text for a canonical name. */
 function displayKeyName(name: string): string {
+  if (!name) return "Not set";
   const pretty: Record<string, string> = {
     Backquote: "` (Backquote)",
     Semicolon: "; (Semicolon)",
@@ -96,8 +98,11 @@ function displayKeyName(name: string): string {
   return pretty[name] ?? name;
 }
 
+/** The string-valued (key-bound) fields — everything except the boolean toggle. */
+type HotkeyBinding = Exclude<keyof HotkeysConfig, "reflect_on_save">;
+
 const BINDING_ROWS: {
-  key: keyof HotkeysConfig;
+  key: HotkeyBinding;
   label: string;
   help: string;
 }[] = [
@@ -220,7 +225,7 @@ function HotkeysForm({
 }) {
   const initial = useMemo(() => data.config, [data.config]);
   const [form, setForm] = useState<HotkeysConfig>(initial);
-  const [capturing, setCapturing] = useState<keyof HotkeysConfig | null>(null);
+  const [capturing, setCapturing] = useState<HotkeyBinding | null>(null);
   const [justSaved, setJustSaved] = useState(false);
 
   useEffect(() => setForm(initial), [initial]);
@@ -239,7 +244,7 @@ function HotkeysForm({
     },
   });
 
-  const set = (key: keyof HotkeysConfig, value: string) =>
+  const set = (key: HotkeyBinding, value: string) =>
     setForm((f) => ({ ...f, [key]: value }));
 
   // Non-blocking duplicate detection: which key names appear on 2+ bindings.
@@ -321,6 +326,59 @@ function HotkeysForm({
               }
             />
           ))}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Reflection</CardTitle>
+          <CardDescription>
+            What makes NPCs reflect — writing relationships, journals, and
+            picking up habits. Keep it on every save, bind a key to do it on
+            demand, or both.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-5">
+          <FormRow
+            label="Run on game save"
+            help="After each save, update relationships + journals and re-check for new habits (the original behaviour)."
+            control={
+              <Switch
+                checked={form.reflect_on_save}
+                onCheckedChange={(v) =>
+                  setForm((f) => ({ ...f, reflect_on_save: v }))
+                }
+              />
+            }
+          />
+          <FormRow
+            label="Reflect key"
+            help="Press this in-game to run the reflection now, without saving. Leave unset to disable."
+            control={
+              <div className="flex items-center gap-2">
+                <KeyCaptureButton
+                  value={form.reflect}
+                  capturing={capturing === "reflect"}
+                  onStartCapture={() => setCapturing("reflect")}
+                  onCapture={(name) => {
+                    set("reflect", name);
+                    setCapturing(null);
+                  }}
+                  onCancel={() => setCapturing(null)}
+                  duplicate={false}
+                />
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  title="Clear (unbind)"
+                  onClick={() => set("reflect", "")}
+                  disabled={!form.reflect}
+                >
+                  <RotateCcw />
+                </Button>
+              </div>
+            }
+          />
         </CardContent>
       </Card>
     </SettingsPage>

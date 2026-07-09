@@ -257,6 +257,13 @@ pub(crate) fn append_events_detailed(
     Ok(appended)
 }
 
+/// The current event log for `content_root`, oldest first (missing file =
+/// empty). Shared read used by the journal pass (ambient "what happened around
+/// you" context) — kept here so the on-disk layout stays owned by this module.
+pub(crate) fn read_current_events(content_root: &Path) -> Vec<Value> {
+    read_events_file(&current_file(content_root))
+}
+
 /// The distinct event `type`s present in the current log, for the Triggers
 /// page's dynamic catalog union (future plugin types appear automatically).
 pub(crate) fn observed_event_types(data_root: &Path) -> Vec<String> {
@@ -368,6 +375,14 @@ pub async fn ingest_events(
     })
     .await
     .map_err(|e| web_err(e.to_string()))??;
+    // Self-improving NPCs: fire any event-triggered skills the freshly-ingested
+    // events match (crate::skill_executor). Fire-and-forget on its own task so
+    // it never delays this response; owner-witnessed gating reads each event's
+    // `witnessedBy`/`witnesses` (present on the raw appended events). Runs
+    // independently of the witness fan-out below.
+    if !appended.is_empty() {
+        crate::skill_executor::spawn_match(state.clone(), appended.clone());
+    }
     // Witness fan-out (crate::witness): each newly-appended event that carries a
     // `witnesses` list is bundled into those NPCs' pending narration. Post-dedup
     // by construction (only appended events reach here), so redelivered batches

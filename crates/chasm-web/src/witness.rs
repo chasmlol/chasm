@@ -380,7 +380,13 @@ fn bundle_incoming(
             .trim()
             .to_lowercase();
         // The dialogue already IS the history — never narrate it back.
-        if event_type == "conversation" {
+        // `weapon_fire` is the self-improvement system's dedicated immediate
+        // skill-trigger signal (one per burst): the `shooting` aggregate
+        // already narrates the same burst into memory, so fanning weapon_fire
+        // out too would double every gunshot in NPC history. Its witnesses are
+        // still stamped as `witnessedBy` at ingest (annotate_witnessed_by), so
+        // the skill executor can gate on who saw the shot.
+        if event_type == "conversation" || event_type == "weapon_fire" {
             continue;
         }
         let summary = obj
@@ -729,10 +735,111 @@ fn write_narration_message(
         }),
         original_avatar: None,
     };
+    // Write to the shared SEGMENT (group-mode chats + the fallback read path)…
     state
         .repository
         .append_segment_message(segment, &message)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // …AND to the participant's PROJECTION session, which is what the live game
+    // path actually reads (messages_for_participant returns the projection when
+    // present and only falls back to segments when there is none). Without this
+    // the witnessed line lands only in a file the live UI never reads. Best
+    // effort: a chat with no projection for this participant (group mode) simply
+    // returns false and relies on the segment write above.
+    state
+        .repository
+        .append_participant_projection_message(live_chat, participant_id, &message)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    Ok(())
+}
+
+/// Injects one FIRST-PERSON "thought" line into an NPC's chat history — a silent
+/// inner aside (`is_system`, audible only to them, `chasm.witnessed` so it rides
+/// their history + is read by the journal like a witnessed beat, plus
+/// `chasm.skillThought` for the UI) that the self-improvement executor drops in
+/// each time one of that NPC's skills fires, so their NEXT words know WHY they
+/// just acted. Passive: it does not make them speak. Resolves the NPC in the
+/// active live chat by character id (the skill owner) or display name, matched
+/// on a normalized key. Returns whether a line was written (false = the NPC is
+/// not a participant of the active chat, or there is none).
+pub(crate) fn inject_skill_thought(
+    state: &AppState,
+    owner_character_id: &str,
+    owner_name: &str,
+    thought: &str,
+) -> bool {
+    let thought = thought.trim();
+    if thought.is_empty() {
+        return false;
+    }
+    let Ok(Some(live_chat)) = crate::generate::active_live_chat(state) else {
+        return false;
+    };
+    let norm = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect::<String>()
+    };
+    let want_id = norm(owner_character_id);
+    let want_name = norm(owner_name);
+    if want_id.is_empty() && want_name.is_empty() {
+        return false;
+    }
+    let Some(participant) = live_chat
+        .presence
+        .values()
+        .chain(live_chat.participants.values())
+        .find(|p| {
+            let cid = p.character_id.as_deref().map(&norm).unwrap_or_default();
+            (!want_id.is_empty() && cid == want_id)
+                || (!want_name.is_empty() && norm(&p.name) == want_name)
+        })
+    else {
+        return false;
+    };
+    let participant_id = participant.participant_id.clone();
+    let display = if participant.name.trim().is_empty() {
+        owner_name.to_string()
+    } else {
+        participant.name.clone()
+    };
+    let Some(segment) = current_segment(&live_chat) else {
+        return false;
+    };
+    let message = STJsonlChatMessage {
+        name: display,
+        is_user: false,
+        is_system: true,
+        send_date: Some(now_iso()),
+        mes: thought.to_string(),
+        extra: json!({
+            "headless": {
+                "characterId": Value::Null,
+                "metadata": {
+                    "live": {
+                        "liveChatId": live_chat.id,
+                        "segmentId": segment.id,
+                        "speakerParticipantId": Value::Null,
+                        "present": [participant_id],
+                        "audibleTo": [participant_id],
+                        "location": segment.location,
+                        "strictVisibility": true,
+                    }
+                }
+            },
+            "chasm": { "witnessed": true, "skillThought": true }
+        }),
+        original_avatar: None,
+    };
+    let wrote = state
+        .repository
+        .append_segment_message(&segment, &message)
+        .is_ok();
+    let _ = state
+        .repository
+        .append_participant_projection_message(&live_chat, &participant_id, &message);
+    wrote
 }
 
 /// Resolves `npc_key` in the active live chat and appends one narration line
@@ -972,6 +1079,41 @@ fn enqueue_reaction(
     flushed: &FlushedBundle,
     now: i64,
 ) -> anyhow::Result<bool> {
+    write_reaction_file(
+        state,
+        npc_key,
+        &flushed.participant_name,
+        &flushed.narration,
+        &flushed.event_types.join(","),
+        now,
+    )
+}
+
+/// Enqueue a SKILL-impulse reaction: nudge `npc_key` to take a turn and act on a
+/// planted intention (self-improvement). The narration IS the intention, tagged
+/// with the skill sentinel so the generate path uses the act-permissive skill
+/// directive instead of the speak-only witness one. Idle-gated + newest-wins
+/// like any reaction (it rides the same `control/reactions` queue).
+pub(crate) fn enqueue_skill_reaction(
+    state: &AppState,
+    npc_key: &str,
+    npc_name: &str,
+    intention: &str,
+) -> anyhow::Result<bool> {
+    let narration = format!("{}{}", crate::generate::SKILL_IMPULSE_SENTINEL, intention);
+    write_reaction_file(state, npc_key, npc_name, &narration, "skill", epoch_millis() as i64)
+}
+
+/// Writes one reaction queue file (`NVBRIDGE_REACTION_V1`), superseding any
+/// un-consumed one (newest wins). Shared by witness reactions and skill impulses.
+fn write_reaction_file(
+    state: &AppState,
+    npc_key: &str,
+    npc_name: &str,
+    narration: &str,
+    event_types_csv: &str,
+    now: i64,
+) -> anyhow::Result<bool> {
     let dir = crate::scheduler::bridge_root(state)
         .join("control")
         .join("reactions");
@@ -998,9 +1140,9 @@ fn enqueue_reaction(
     let content = format!(
         "NVBRIDGE_REACTION_V1\n{id}\n{key}\n{name}\n{narration}\n{types}\n",
         key = sanitize(npc_key),
-        name = sanitize(&flushed.participant_name),
-        narration = sanitize(&flushed.narration),
-        types = flushed.event_types.join(","),
+        name = sanitize(npc_name),
+        narration = sanitize(narration),
+        types = event_types_csv,
     );
     // Temp + rename so the plugin never reads a half-written file.
     let tmp = dir.join(format!("{id}.txt.tmp"));

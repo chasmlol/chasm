@@ -314,6 +314,33 @@ impl ProfilePaths {
             .join("movement.json")
     }
 
+    /// Journal store file (the self-improvement system's append-only per-NPC
+    /// private journals): `profiles/<id>/headless/journals.json` when the
+    /// profile folder exists, else `{data_root}/headless/journals.json`.
+    ///
+    /// Same write-safe / save-aware rule as [`Self::scheduler_store`]: a runtime
+    /// store the backend WRITES, anchored on [`Self::content_root`] so it lives
+    /// alongside the save-sync snapshots that roll it back with the save.
+    pub fn journal_store(&self) -> PathBuf {
+        self.content_root()
+            .join("headless")
+            .join("journals.json")
+    }
+
+    /// Skill store file (the self-improvement system's event-triggered NPC
+    /// "skills", authored by the skill-creator pass):
+    /// `profiles/<id>/headless/skills.json` when the profile folder exists,
+    /// else `{data_root}/headless/skills.json`.
+    ///
+    /// Same write-safe / save-aware rule as [`Self::scheduler_store`]: a runtime
+    /// store the backend WRITES, anchored on [`Self::content_root`] so it lives
+    /// alongside the save-sync snapshots that roll it back with the save.
+    pub fn skills_store(&self) -> PathBuf {
+        self.content_root()
+            .join("headless")
+            .join("skills.json")
+    }
+
     /// The "content root" used by code paths that derive several sibling paths
     /// from one base (the live-chat repository, save-sync). When a profile is
     /// active *and* its folder exists, this is `profiles/<id>`; otherwise it is

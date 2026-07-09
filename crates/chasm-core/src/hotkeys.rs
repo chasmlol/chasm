@@ -134,11 +134,15 @@ pub fn bridge_hotkeys_file_contents(hotkeys: &HotkeysSettings) -> String {
          chat_vk={}\r\n\
          voice_vk={}\r\n\
          admin_chat_vk={}\r\n\
-         admin_voice_vk={}\r\n",
+         admin_voice_vk={}\r\n\
+         reflect_vk={}\r\n",
         code_or_default(&hotkeys.enter_text, &defaults.enter_text),
         code_or_default(&hotkeys.push_to_talk, &defaults.push_to_talk),
         code_or_default(&hotkeys.todd_enter_text, &defaults.todd_enter_text),
         code_or_default(&hotkeys.todd_push_to_talk, &defaults.todd_push_to_talk),
+        // The reflect key has NO built-in default: unbound (empty / unknown) is a
+        // legitimate state, delivered as 0 so the plugin ignores it.
+        virtual_key_code(&hotkeys.reflect).unwrap_or(0),
     )
 }
 
@@ -228,12 +232,26 @@ mod tests {
             enter_text: "T".to_string(),
             todd_push_to_talk: "F6".to_string(),
             todd_enter_text: "Numpad5".to_string(),
+            ..HotkeysSettings::default()
         };
         let contents = bridge_hotkeys_file_contents(&hotkeys);
         assert!(contents.contains("voice_vk=70\r\n"));
         assert!(contents.contains("chat_vk=84\r\n"));
         assert!(contents.contains("admin_voice_vk=117\r\n"));
         assert!(contents.contains("admin_chat_vk=101\r\n"));
+    }
+
+    #[test]
+    fn reflect_key_is_unbound_by_default_and_binds_when_set() {
+        // Unbound by default → delivered as 0 (the plugin ignores it).
+        let contents = bridge_hotkeys_file_contents(&HotkeysSettings::default());
+        assert!(contents.contains("reflect_vk=0\r\n"));
+        // A bound reflect key serializes its VK code (F10 = 0x79 = 121).
+        let bound = HotkeysSettings {
+            reflect: "F10".to_string(),
+            ..HotkeysSettings::default()
+        };
+        assert!(bridge_hotkeys_file_contents(&bound).contains("reflect_vk=121\r\n"));
     }
 
     #[test]

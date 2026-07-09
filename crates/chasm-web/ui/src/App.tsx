@@ -18,6 +18,8 @@ import { Schedule } from "@/screens/Schedule";
 import { Travel } from "@/screens/Travel";
 import { Relationships } from "@/screens/Relationships";
 import { Events } from "@/screens/Events";
+import { Journals } from "@/screens/Journals";
+import { Skills } from "@/screens/Skills";
 import { Triggers } from "@/screens/Triggers";
 import { Persona } from "@/screens/Persona";
 import { Globals } from "@/screens/Globals";
@@ -60,6 +62,8 @@ export function App() {
           <Route path="action" element={<ActionBook />} />
           <Route path="relationships" element={<Relationships />} />
           <Route path="events" element={<Events />} />
+          <Route path="journals" element={<Journals />} />
+          <Route path="skills" element={<Skills />} />
           <Route path="triggers" element={<Triggers />} />
           <Route path="gamestate" element={<Gamestate />} />
           <Route path="schedule" element={<Schedule />} />

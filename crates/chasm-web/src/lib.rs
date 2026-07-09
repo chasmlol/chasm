@@ -46,6 +46,7 @@ mod fnv_bridge;
 mod game_bridge;
 mod gamemaster;
 mod generate;
+mod journal;
 mod launcher;
 mod llm;
 mod llm_api;
@@ -55,6 +56,8 @@ mod orchestrator;
 mod persona;
 mod save_sync;
 mod scheduler;
+mod skill_creator;
+mod skill_executor;
 mod stack_lifecycle;
 mod stt_api;
 mod stt_vocab;
@@ -586,6 +589,9 @@ pub fn router(config: AppConfig) -> Router {
             post(persona::receive_capture)
                 .layer(axum::extract::DefaultBodyLimit::max(persona::MAX_BODY_BYTES)),
         )
+        // Run the reflection passes (relationships + journal + skill-creator) on
+        // demand — the in-game "reflect" hotkey POSTs this. See [`gamemaster`].
+        .route("/api/game/v1/reflect", post(gamemaster::reflect))
         // Settings → Updates: reports the running version + the latest GitHub
         // release so the UI can offer a "Download update" link. Always succeeds.
         .route("/api/app/version", get(app_version))

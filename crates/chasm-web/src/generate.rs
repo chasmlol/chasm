@@ -819,6 +819,11 @@ struct TurnContext {
     /// in history (flushed before the reaction was enqueued); this carries it
     /// again for the depth-1 directive. `None` on ordinary turns.
     reaction: Option<String>,
+    /// The reaction is a self-improvement SKILL IMPULSE (its narration carried
+    /// [`SKILL_IMPULSE_SENTINEL`]) rather than a witnessed-event reaction: the
+    /// depth-1 directive tells the NPC to ACT on their own planted intention
+    /// (freeform), not merely speak about what they saw.
+    reaction_skill: bool,
 }
 
 /// Whether a turn's requested action-book scopes mark it as the admin/gamemaster
@@ -1012,7 +1017,7 @@ fn resolve_turn_context(state: &Arc<AppState>, id: &str, body: &Value) -> WebRes
 
     // Witness-trigger reaction marker: `{ "reaction": { "narration": "…" } }`
     // (or a bare string). Regular turns don't carry it.
-    let reaction = body.get("reaction").and_then(|reaction| {
+    let reaction_raw = body.get("reaction").and_then(|reaction| {
         reaction
             .get("narration")
             .and_then(Value::as_str)
@@ -1020,6 +1025,17 @@ fn resolve_turn_context(state: &Arc<AppState>, id: &str, body: &Value) -> WebRes
             .map(str::trim)
             .filter(|text| !text.is_empty())
             .map(str::to_string)
+    });
+    // A self-improvement SKILL IMPULSE tags its narration with the sentinel:
+    // strip it and remember, so the directive is act-permissive (the NPC acts on
+    // their own planted intention) rather than the speak-only witness reaction.
+    let mut reaction_skill = false;
+    let reaction = reaction_raw.map(|text| match text.strip_prefix(SKILL_IMPULSE_SENTINEL) {
+        Some(rest) => {
+            reaction_skill = true;
+            rest.trim().to_string()
+        }
+        None => text,
     });
 
     Ok(TurnContext {
@@ -1038,6 +1054,7 @@ fn resolve_turn_context(state: &Arc<AppState>, id: &str, body: &Value) -> WebRes
         requested_scopes: parse_action_book_scopes(body),
         orchestrator,
         reaction,
+        reaction_skill,
     })
 }
 
@@ -1235,6 +1252,31 @@ fn format_combat_directive(names: &[String], player_name: &str) -> String {
          snapping out threats or orders. Keep it SHORT, loud, and frantic. Never be calm, polite, \
          measured, or chatty. You are ALREADY fighting — do NOT choose an attack action; express the \
          fight in your words."
+    )
+}
+
+/// Marks a reaction narration as a self-improvement SKILL IMPULSE (vs a
+/// witnessed-event reaction). The skill executor prefixes the intention with it
+/// when enqueuing the reaction (see `witness::enqueue_skill_reaction`); the turn
+/// context strips it and flips to the act-permissive directive. Printable ASCII
+/// so it survives the plugin's line-based reaction file + JSON metadata intact,
+/// and it is stripped before the directive is built, so it is never shown.
+pub(crate) const SKILL_IMPULSE_SENTINEL: &str = "@@skill-impulse@@ ";
+
+/// The skill-impulse directive — depth-1 on a self-improvement trigger turn.
+/// Unlike the witness reaction (which is speak-only), this tells the NPC to ACT
+/// on their OWN planted intention, freely and adapting to the moment: it opens
+/// the normal action loop (find_action, gestures, sequences) rather than asking
+/// for a spoken line.
+fn format_skill_impulse_directive(intention: &str, player_name: &str) -> String {
+    let player = if player_name.trim().is_empty() {
+        "the player".to_string()
+    } else {
+        player_name.trim().to_string()
+    };
+    format!(
+        "Something in this moment stirs a familiar impulse in you — this is YOUR OWN thought, right now:\n{intention}\n\
+         Nobody ordered you to; it is your own habit, not {player}'s command. Act on it as you honestly would, adapting to what is actually happening around you: DO it — take the action and play it out however fits (a whole little sequence is fine) — and add a short line only if it suits you. If the moment genuinely doesn't allow it, or it isn't like you to follow through, don't. Stay in character; don't narrate the scene."
     )
 }
 
@@ -1611,7 +1653,14 @@ fn prepare_speaker_turn_traced(
     // injection mechanics as the combat directive above.
     if let Some(narration) = &ctx.reaction {
         let player_name = ctx.scenario_macros.get("player_name").map_or("", String::as_str);
-        let directive = format_witness_reaction_directive(narration, player_name);
+        // Skill impulses act on their own planted intention; witness reactions
+        // speak about a witnessed event. Both ride the same depth-1 slot (key
+        // stays "witness_reaction" so the injection logic below is unchanged).
+        let directive = if ctx.reaction_skill {
+            format_skill_impulse_directive(narration, player_name)
+        } else {
+            format_witness_reaction_directive(narration, player_name)
+        };
         let char_count = directive.chars().count();
         assembled.components.push(chasm_core::PromptComponentView {
             order: assembled.components.len(),

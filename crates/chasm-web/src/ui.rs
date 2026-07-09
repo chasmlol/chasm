@@ -42,6 +42,7 @@ pub(crate) mod config;
 pub(crate) mod gamestate;
 pub(crate) mod globals;
 pub(crate) mod hotkeys;
+pub(crate) mod journals;
 pub(crate) mod models;
 pub(crate) mod persona;
 pub(crate) mod profiles;
@@ -49,6 +50,7 @@ pub(crate) mod providers;
 pub(crate) mod relationships;
 pub(crate) mod scheduler;
 pub(crate) mod settings;
+pub(crate) mod skills;
 pub(crate) mod system;
 pub(crate) mod travel;
 
@@ -166,6 +168,13 @@ pub(crate) fn api_router() -> Router<Arc<AppState>> {
         // crate::event_log next to save_sync, so the handler is registered from
         // there like the trace viewer below) -----------------------------------
         .route("/events", get(crate::event_log::events_view))
+        // --- self-improving NPCs: read-only journals + the skill list/config -
+        .route("/journals", get(journals::list_journals))
+        .route("/journals/delete-entry", post(journals::delete_entry))
+        .route("/skills", get(skills::list_skills))
+        .route("/skills/settings", post(skills::save_settings))
+        .route("/skills/:id/toggle", post(skills::toggle_skill))
+        .route("/skills/:id/delete", post(skills::delete_skill))
         // --- triggers (witness-memory + reaction triggers; the fan-out lives in
         // crate::witness next to event_log — this is its settings round-trip) ---
         .route("/triggers", get(crate::witness::triggers_view))

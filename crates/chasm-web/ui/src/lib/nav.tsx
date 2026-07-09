@@ -5,6 +5,8 @@ import {
   HeartHandshake,
   UsersRound,
   History,
+  NotebookPen,
+  Sparkles,
   BookText,
   ScrollText,
   Swords,
@@ -83,6 +85,18 @@ export const NAV_GROUPS: NavGroup[] = [
         label: "Events",
         path: "events",
         icon: History,
+      },
+      {
+        key: "journals",
+        label: "Journals",
+        path: "journals",
+        icon: NotebookPen,
+      },
+      {
+        key: "skills",
+        label: "Skills",
+        path: "skills",
+        icon: Sparkles,
       },
       {
         key: "triggers",

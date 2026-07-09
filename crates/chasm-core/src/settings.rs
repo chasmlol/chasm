@@ -59,6 +59,11 @@ pub struct AppSettings {
     /// "walk an NPC to a place, arriving on time" engine). Serde default so
     /// older settings files load fine.
     pub movement: MovementSettings,
+    /// Self-improving NPCs: the save-driven journal + skill-creator passes and
+    /// the event-driven skill executor (the Skills / Journals pages). Serde
+    /// default so older settings files load fine.
+    #[serde(default)]
+    pub self_improvement: SelfImprovementSettings,
 }
 
 impl Default for AppSettings {
@@ -78,6 +83,57 @@ impl Default for AppSettings {
             api_keys: BTreeMap::new(),
             hotkeys: HotkeysSettings::default(),
             movement: MovementSettings::default(),
+            self_improvement: SelfImprovementSettings::default(),
+        }
+    }
+}
+
+/// The self-improving-NPC system. Two save-driven LLM passes author the data:
+/// a per-NPC **journal** pass (each NPC reflects, in character, on what happened
+/// since the last save) and a persona-less **skill-creator** pass (reads the
+/// journals and CRUDs event-triggered "skills"). A third, LLM-free **executor**
+/// fires a skill's actions the instant its trigger event arrives in-game.
+///
+/// `#[serde(default)]` so older settings files (no `self_improvement` key) load.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SelfImprovementSettings {
+    /// Master switch for the per-NPC journal pass. When off, no journals are
+    /// written on save (existing journals are still readable on the page).
+    pub journaling_enabled: bool,
+    /// Master switch for the skill-creator pass. When off, no skills are
+    /// created/edited/deleted automatically (existing skills still fire).
+    pub skill_creation_enabled: bool,
+    /// Master switch for the skill executor. When off, matching events fire no
+    /// skill actions in-game (the authoring passes may still run).
+    pub skill_execution_enabled: bool,
+    /// Per-skill cooldown in seconds: the minimum wall-clock gap between two
+    /// firings of the SAME skill, so a burst of one event type (e.g. rapid
+    /// weapon fire) can't flood the game with actions. 0 = use the default.
+    pub skill_cooldown_secs: u32,
+}
+
+impl Default for SelfImprovementSettings {
+    fn default() -> Self {
+        Self {
+            journaling_enabled: true,
+            skill_creation_enabled: true,
+            skill_execution_enabled: true,
+            skill_cooldown_secs: SKILL_COOLDOWN_SECS_DEFAULT,
+        }
+    }
+}
+
+/// Default per-skill cooldown (seconds) when the stored value is 0.
+pub const SKILL_COOLDOWN_SECS_DEFAULT: u32 = 6;
+
+impl SelfImprovementSettings {
+    /// The effective per-skill cooldown (the default when stored value is 0).
+    pub fn effective_cooldown_secs(&self) -> u64 {
+        if self.skill_cooldown_secs == 0 {
+            SKILL_COOLDOWN_SECS_DEFAULT as u64
+        } else {
+            self.skill_cooldown_secs as u64
         }
     }
 }
@@ -139,6 +195,21 @@ pub struct HotkeysSettings {
     pub todd_push_to_talk: String,
     /// Opens the typed-message input to Todd. Plugin default: O.
     pub todd_enter_text: String,
+    /// Runs the reflection passes on demand (relationships + journal +
+    /// skill-creator) — the same chain a save triggers. EMPTY = unbound (no
+    /// key); otherwise a canonical key name. Delivered to the plugin as
+    /// `reflect_vk` (0 when unbound).
+    #[serde(default)]
+    pub reflect: String,
+    /// Whether a game SAVE also runs the reflection passes (the original
+    /// behaviour). When off, only the `reflect` key (or nothing) triggers them.
+    /// Chasm-side only — never written to the plugin's hotkeys file.
+    #[serde(default = "default_true")]
+    pub reflect_on_save: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for HotkeysSettings {
@@ -148,6 +219,8 @@ impl Default for HotkeysSettings {
             enter_text: "Enter".to_string(),
             todd_push_to_talk: "H".to_string(),
             todd_enter_text: "O".to_string(),
+            reflect: String::new(),
+            reflect_on_save: true,
         }
     }
 }

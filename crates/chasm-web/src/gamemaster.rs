@@ -23,11 +23,23 @@ use std::{
     sync::Arc,
 };
 
+use axum::{extract::State, Json};
 use serde_json::{json, Value};
 use chasm_core::AppSettings;
 use chasm_st_compat::{LiveChat, STJsonlChatMessage, PLAYER_TARGET_ID};
 
 use crate::AppState;
+
+/// `POST /api/game/v1/reflect` — run the reflection passes on demand (the
+/// reflect hotkey, or any client). Kicks off the SAME chain a save triggers:
+/// relationships → journal → skill-creator. Fire-and-forget behind the pass's
+/// own busy flag; returns immediately without waiting for the LLM work.
+pub(crate) async fn reflect(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let started = spawn_pass(state);
+    Json(json!({
+        "status": if started { "started" } else { "already_running" }
+    }))
+}
 
 /// One GM pass at a time, process-wide. A save arriving mid-pass is skipped —
 /// its content stays beyond the watermark and the NEXT save picks it up.
@@ -70,6 +82,11 @@ pub(crate) fn spawn_pass(state: Arc<AppState>) -> bool {
             ),
         }
         RUNNING.store(false, Ordering::SeqCst);
+        // Relationships are now committed. Chain the self-improvement journal
+        // pass (which in turn chains the skill-creator) so it always sees the
+        // latest ledger. Fire-and-forget behind its own busy flag; a GM failure
+        // above does not skip it (journaling reads transcript, not the ledger).
+        crate::journal::spawn_pass(state.clone());
     });
     true
 }

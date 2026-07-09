@@ -780,7 +780,11 @@ pub async fn receive_capture(
     // this response nor the persona generation, and a pass skipped while one
     // is already running loses nothing (its content stays past the watermark
     // for the next save).
-    if is_save_trigger(&capture) {
+    if is_save_trigger(&capture)
+        && AppSettings::load(&state.config.settings_path)
+            .hotkeys
+            .reflect_on_save
+    {
         crate::gamemaster::spawn_pass(state.clone());
     }
 

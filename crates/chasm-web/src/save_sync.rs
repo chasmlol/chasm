@@ -1749,6 +1749,10 @@ fn handle_save_sync_event(
             // by that load vanishes).
             crate::scheduler::checkpoint_scheduler_store(data_root, &checkpoint_id);
             crate::movement::checkpoint_movement_store(data_root, &checkpoint_id);
+            // Self-improvement stores (per-NPC journals + event-triggered
+            // skills) roll back with the save exactly like the scheduler store.
+            crate::journal::checkpoint_journal_store(data_root, &checkpoint_id);
+            crate::skill_executor::checkpoint_skills_store(data_root, &checkpoint_id);
         }
         return Ok(result);
     }
@@ -1806,6 +1810,10 @@ fn handle_save_sync_event(
         }
         crate::scheduler::restore_scheduler_store(data_root, &checkpoint_id);
         crate::movement::restore_movement_store(data_root, &checkpoint_id);
+        // Self-improvement stores roll back with the save (a journal or skill
+        // authored in a now-discarded branch vanishes on load).
+        crate::journal::restore_journal_store(data_root, &checkpoint_id);
+        crate::skill_executor::restore_skills_store(data_root, &checkpoint_id);
         // (No action-loop toolsets to drop on reload: discovery is turn-local now,
         // so nothing is carried between turns in the first place.)
         // Pending (not yet flushed) witnessed-event bundles belong to the
@@ -1815,7 +1823,29 @@ fn handle_save_sync_event(
         return Ok(result);
     }
 
-    Err(web_err("event must be one of: save, load."))
+    // A brand-new playthrough (the plugin dispatches `new_game` from
+    // kMessage_NewGame): start every save-scoped store fresh, exactly like chat
+    // history begins with no prior turns — so the Events page (and the
+    // scheduler / movement / self-improvement stores) reflect only the current
+    // save's timeline. Reuse the restore path with a checkpoint id that has no
+    // snapshot: the event log archives the old log to `discarded/` then empties,
+    // and the sidecar stores clear to their defaults.
+    if matches!(event.as_str(), "new_game" | "newgame" | "new-game") {
+        const RESET_ID: &str = "new-game";
+        if let Err(e) = crate::event_log::restore_event_log(data_root, RESET_ID) {
+            tracing::warn!("event-log new-game reset: {e}");
+        }
+        crate::scheduler::restore_scheduler_store(data_root, RESET_ID);
+        crate::movement::restore_movement_store(data_root, RESET_ID);
+        crate::journal::restore_journal_store(data_root, RESET_ID);
+        crate::skill_executor::restore_skills_store(data_root, RESET_ID);
+        crate::witness::clear_pending();
+        append_store_event(&mut store, json_object(json!({ "type": "new_game.reset" })));
+        write_save_sync_store(data_root, &store)?;
+        return Ok(json!({ "status": "ok", "event": event, "reset": true }));
+    }
+
+    Err(web_err("event must be one of: save, load, new_game."))
 }
 
 // ---------------------------------------------------------------------------

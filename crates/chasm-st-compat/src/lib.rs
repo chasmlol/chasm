@@ -15,12 +15,16 @@ use chasm_core::{
 use thiserror::Error;
 
 mod action_books;
+mod journal;
 mod lorebooks;
 mod relationships;
+mod skills;
 mod sources;
 pub use action_books::*;
+pub use journal::*;
 pub use lorebooks::*;
 pub use relationships::*;
+pub use skills::*;
 pub use sources::*;
 
 #[derive(Debug, Error)]
@@ -420,7 +424,44 @@ impl LiveChatRepository {
         segment: &LiveChatSegment,
         message: &STJsonlChatMessage,
     ) -> Result<()> {
-        let path = self.session_file_path(&segment.session_id)?;
+        self.append_session_message(&segment.session_id, message)
+    }
+
+    /// Appends `message` to a participant's PROJECTION session — the per-NPC
+    /// `single`-mode file the live game path reads via
+    /// [`Self::messages_for_participant`] (it reads the projection when present
+    /// and only falls back to the shared segments when there is none). A
+    /// SEGMENT-only write (e.g. witness narration) is therefore invisible in the
+    /// live case unless it is ALSO written here. Returns `Ok(true)` when the
+    /// participant has a projection session and the line was written, `Ok(false)`
+    /// when there is none (nothing written).
+    pub fn append_participant_projection_message(
+        &self,
+        live_chat: &LiveChat,
+        participant_id: &str,
+        message: &STJsonlChatMessage,
+    ) -> Result<bool> {
+        match participant_session_id(live_chat, participant_id) {
+            Some(session_id) => {
+                self.append_session_message(&session_id, message)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Appends one chat message line to the JSONL file backing `session_id`
+    /// (a shared segment OR a per-participant projection session), creating the
+    /// file/dirs if missing. Mirrors the Node `appendMessage` write path: each
+    /// message is one JSON object per line. The shared core of
+    /// [`Self::append_segment_message`] /
+    /// [`Self::append_participant_projection_message`].
+    pub fn append_session_message(
+        &self,
+        session_id: &str,
+        message: &STJsonlChatMessage,
+    ) -> Result<()> {
+        let path = self.session_file_path(session_id)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| CompatError::Io {
                 path: parent.to_path_buf(),
