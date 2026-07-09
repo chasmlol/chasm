@@ -130,9 +130,13 @@ fn llm_settings(state: &AppState) -> UiModelSettings {
     let models = panel
         .models
         .into_iter()
-        // Curated recommended list: drop the small E2B / E4B Gemma variants — the
-        // LLM page now recommends the larger, higher-quality models (12B and up).
-        .filter(|m: &LlmModelView| m.id != "gemma-4-e2b" && m.id != "gemma-4-e4b")
+        // Curated recommended list: hide the small E2B / E4B Gemma variants the
+        // page no longer recommends — UNLESS one is actually on disk (manually
+        // placed), in which case it must stay listed so the Active-model picker
+        // can show and select it. Never hide an installed model.
+        .filter(|m: &LlmModelView| {
+            m.downloaded || (m.id != "gemma-4-e2b" && m.id != "gemma-4-e4b")
+        })
         .map(|m: LlmModelView| {
             let status = download_status_pill(&m.status, m.status_label, m.selected);
             UiModel {
