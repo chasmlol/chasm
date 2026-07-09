@@ -1034,9 +1034,13 @@ impl AppSettings {
     /// produces
     /// new-shape defaults, so it needs no migration.
     pub fn load(path: &Path) -> Self {
+        // Strip a UTF-8 BOM before parsing: serde_json rejects BOM'd input, and
+        // Windows tools (notably WinPS 5.1's `Set-Content -Encoding UTF8`) write
+        // one - without this, a BOM'd settings file silently falls back to FULL
+        // defaults (no TTS/STT selected, wrong profile) with no error anywhere.
         match fs::read_to_string(path)
             .ok()
-            .and_then(|text| serde_json::from_str::<Self>(&text).ok())
+            .and_then(|text| serde_json::from_str::<Self>(text.trim_start_matches('\u{feff}')).ok())
         {
             Some(mut settings) => {
                 settings.migrate();
@@ -2987,6 +2991,23 @@ mod tests {
             .unwrap();
         let stem = llm_model_match_stem(a4b);
         assert!("gemma-4-26b-a4b-it-ud-q4_k_s.gguf".contains(&stem));
+    }
+
+    /// A UTF-8 BOM'd settings file (what WinPS 5.1's `Set-Content -Encoding UTF8`
+    /// writes) must parse, not silently fall back to defaults. Regression: the
+    /// Minecraft launcher's BOM'd settings copy lost the TTS/STT selection and the
+    /// forced profile, so the connect lifecycle booted only the LLM.
+    #[test]
+    fn load_tolerates_a_utf8_bom() {
+        let dir = std::env::temp_dir().join(format!("chasm-settings-bom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chasm.settings.json");
+        let json = r#"{ "profile": "minecraft", "tts": { "local_engine": "faster-qwen3-tts" } }"#;
+        std::fs::write(&path, format!("\u{feff}{json}")).unwrap();
+        let settings = AppSettings::load(&path);
+        assert_eq!(settings.profile, "minecraft", "BOM'd file must parse, not default");
+        assert_eq!(settings.tts.local_engine, "faster-qwen3-tts");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
