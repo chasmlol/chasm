@@ -1,5 +1,9 @@
 # Retired Node FNV bridge — where it went + how to roll back
 
+> **⚠️ Legacy / historical.** Records the retirement of the old standalone Node bridge,
+> now fully replaced by the in-process `chasm-fnv-bridge` crate. Kept as a rollback
+> reference only.
+
 The Fallout: New Vegas bridge used to be a Node helper (`nvbridge-helper.mjs`, ~4,283
 lines) that ran as its own process and talked to chasm over `127.0.0.1:7341`. It has
 been **fully ported to native Rust and folded in-process into chasm** (the
@@ -8,7 +12,7 @@ No Node process, no localhost hop.
 
 ## Where the Node stuff is now (archived, not deleted)
 
-Moved out of the SillyTavern fork (`Chasm\tools\fnv\`) to:
+Moved out of the legacy upstream fork (`Chasm\tools\fnv\`) to:
 
 ```
 C:\Users\user\Documents\nvbridge-node-archive\
@@ -18,8 +22,8 @@ C:\Users\user\Documents\nvbridge-node-archive\
   └─ README.md                      # short pointer back to this file
 ```
 
-The `Chasm\tools\fnv\` folder is now empty. (That folder lives in the ST fork
-repo `chasmlol/chasm`, so that repo's working tree shows these three files as
+The `Chasm\tools\fnv\` folder is now empty. (That folder lives in the legacy upstream
+fork repo `chasmlol/chasm`, so that repo's working tree shows these three files as
 deleted — uncommitted. Commit that separately there if/when you want it cleaned up.)
 
 The config the bridge reads is **NOT** archived — it's still live and used by the

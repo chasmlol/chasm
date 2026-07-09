@@ -1,7 +1,12 @@
 # FNV Bridge → Rust Port + Latency Wins — Phased Plan
 
+> **⚠️ Legacy / historical.** This is the completed porting plan that folded the old
+> standalone Node bridge into chasm as the in-process `chasm-fnv-bridge` crate. The
+> port is done; this document is retained only as a record of how it was carried out.
+> See [retired-node-bridge.md](retired-node-bridge.md) for the end state.
+
 > Fold the Node bridge (`nvbridge-helper.mjs`, ~4,283 lines) into chasm as native
-> Rust, retire the separate Node process, move the bridge out of the SillyTavern
+> Rust, retire the separate Node process, move the bridge out of the legacy upstream
 > fork — **and** pick up the free latency wins along the way. Built section by
 > section so the game stays playable and **you test each slice in-game before the
 > next one starts.**
@@ -34,7 +39,7 @@ handle Windows file-write races, request supersede/cancel, locks.
 
 **End state:** a Rust crate `chasm-fnv-bridge` doing all of that, ultimately
 **in-process inside chasm** (no Node, no localhost HTTP hop, one process, one build,
-compiler-checked). The bridge code leaves the ST fork.
+compiler-checked). The bridge code leaves the legacy upstream fork.
 
 ### Why Rust here is low-risk
 - No exotic Rust (no `unsafe`, FFI, complex lifetimes) — just `tokio` async + `serde`
@@ -322,7 +327,7 @@ across the full captured corpus.
 ## SECTION 7 — The fold: in-process + kill the HTTP hop + retire Node
 
 **Goal:** one process. No Node. No localhost HTTP between bridge and chasm. Bridge
-code out of the ST fork.
+code out of the legacy upstream fork.
 
 **Changes:**
 - Extract chasm-web's `/generate`, `/speech/*`, `/save-sync/events` handler bodies
@@ -332,7 +337,7 @@ code out of the ST fork.
 - Launch `run()` as a `tokio` task from `chasm-web::serve` behind a flag
   (`CHASM_FNV_BRIDGE`, default ON once proven), sharing chasm's runtime.
 - Stop launching the Node helper in the stack launcher.
-- Move the bridge out of `Chasm` (ST fork); delete `nvbridge-helper.mjs` once
+- Move the bridge out of `Chasm` (the legacy upstream fork); delete `nvbridge-helper.mjs` once
   signed off. Update [[node-bridge-architecture]] + [[tts-volume-control]] memory.
 
 **In-game test:** full playthrough on the single-process backend — conversation,
@@ -364,7 +369,7 @@ chasm.
 - Kill `chasm.exe` (and the bridge bin) before `cargo build` (file lock).
 - Books/profiles are **not** in git — back up before editing; never commit `profiles/`
   or `scripts/__pycache__/*.pyc`.
-- The Node helper edit (Section 0) commits to the **ST fork** (`chasmlol/chasm`),
+- The Node helper edit (Section 0) commits to the **legacy upstream fork** (`chasmlol/chasm`),
   not chasm.
 
 ## Free wins summary (what speeds things up, and when)

@@ -1,23 +1,28 @@
-# Generation parity reference (SillyTavern ground truth)
+# Generation parity reference (legacy ground truth)
 
-> Captured live from the running SillyTavern stack on 2026-06-25 via a logging
+> **⚠️ Legacy / historical.** The captured ground-truth request used during the initial
+> port to bring chasm's Rust generation path to byte-parity. It was captured from the
+> legacy upstream chat stack chasm was ported away from; some quoted prompt text below
+> is a verbatim capture from that era. Retained for historical reference only.
+
+> Captured live from the running legacy reference stack on 2026-06-25 via a logging
 > proxy (`scripts/llm_capture_proxy.py`) inserted on the LLM hop with
 > `providerOptions.custom_url`. Non-persisting (`saveUserMessage/saveAssistantMessage=false`),
-> so the real `fnv-goodsprings` chat was untouched. This is the exact request ST
-> sends to llama.cpp; the Rust `/live-chats/:id/generate/stream` must reproduce it.
+> so the real `fnv-goodsprings` chat was untouched. This is the exact request the legacy stack
+> sent to llama.cpp; the Rust `/live-chats/:id/generate/stream` reproduces it.
 
 ## How to re-capture
 ```
 # 1. start the proxy (forwards 8099 -> llama.cpp 8080, logs to scripts/captures/)
 python scripts/llm_capture_proxy.py 8099 http://127.0.0.1:8080
-# 2. POST to ST with providerOptions.custom_url=http://127.0.0.1:8099/v1 and
+# 2. POST to the legacy stack with providerOptions.custom_url=http://127.0.0.1:8099/v1 and
 #    saveUserMessage=false, saveAssistantMessage=false (see scenarios below)
 # 3. python scripts/build_parity_doc.py   # regenerates this file
 ```
 
 ## 1. Request envelope to llama.cpp (`POST /v1/chat/completions`)
 
-Exact top-level body fields ST sends (scenario 1):
+Exact top-level body fields the legacy stack sends (scenario 1):
 
 | field | value |
 |---|---|
@@ -33,7 +38,7 @@ Field key order as serialized: `seed`, `model`, `messages`, `temperature`, `max_
 
 ## 2. System prompt — section order
 
-ST joins these `systemParts` with `\n\n` (from `src/headless/generation.js`),
+the legacy stack joins these `systemParts` with `\n\n` (from `src/headless/generation.js`),
 in this exact order; each present only when it has content:
 
 1. `Character: <name>`
@@ -131,7 +136,7 @@ When action aliases are listed, choose only those exact short strings in "action
 Actions are suggestions for the external client. Do not claim external actions were executed.
 
 Audio Tags:
-These instructions apply only to the next spoken assistant reply and should be visible in the SillyTavern chat text.
+These instructions apply only to the next spoken assistant reply and should be visible in the legacy reference stack chat text.
 Use no more than 2 short audio tags in a reply unless the scene absolutely requires more.
 The allowed provider tags/control forms are listed below. Do not invent bracket tags outside these provider rules.
 Never explain the tags, never put tags on their own line, and never let tags replace the actual dialogue.
@@ -143,7 +148,7 @@ Use one steering tag at the start of the spoken line when delivery needs directi
 
 ## 3. Message array shape
 
-`messages` = 1 system + 40 chat messages (ST's last-N history window,
+`messages` = 1 system + 40 chat messages (the legacy stack's last-N history window,
 then the trailing player line). Role sequence (scenario 1):
 
 ```
@@ -208,10 +213,10 @@ Model produced structured action `movement.follow_target` (alias "follow").
 ## 6. Parity checklist for the Rust port
 
 - [ ] System prompt byte-identical: section set, order, labels, `\n\n` joins.
-- [ ] `temperature`, `max_tokens`, `seed`, `model`, `stream` match ST's connection.
+- [ ] `temperature`, `max_tokens`, `seed`, `model`, `stream` match the legacy stack's connection.
 - [ ] `response_format` JSON schema identical (structured mode).
 - [ ] History window = same last-N selection + role mapping.
-- [ ] Action/quest/lore activation selects the same entries (note: ST also uses
+- [ ] Action/quest/lore activation selects the same entries (note: the legacy stack also uses
       vector retrieval — Rust covers keyword/constant only for now).
 - [ ] Audio-tags instruction present/absent matches the TTS setting.
 
