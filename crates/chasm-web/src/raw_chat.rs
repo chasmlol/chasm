@@ -8,14 +8,21 @@
 //!
 //!   * the prompt is the request's `messages[]` VERBATIM — no system prompt,
 //!     no persona/scenario/lorebook/structured-output instructions, nothing.
-//!     We render the messages into the model's REAL Gemma chat format
-//!     (`<start_of_turn>user\n…<end_of_turn>\n … <start_of_turn>model\n`) and
-//!     call llama-server's raw `/completion`, deliberately BYPASSING the GGUF's
-//!     embedded chat template: a wrongly-baked template (`<|turn>`/`<|think|>`
-//!     instead of Gemma's turn tokens) is the #1 "great in training, garbage at
-//!     serve" cause, and this LoRA shipped with exactly that. Building the
-//!     prompt ourselves guarantees train/serve parity + the spec's "no system
-//!     turn, ever" rule.
+//!     We render the messages into Gemma 4's turn format
+//!     (`<|turn>user\n…<turn|>\n … <|turn>model\n`) and call llama-server's raw
+//!     `/completion`, deliberately BYPASSING the GGUF's embedded jinja: served
+//!     via `--jinja` + /v1/chat/completions, the 17KB Gemma 4 template can
+//!     inject a system turn and/or a `<|think|>` preamble, and the LoRA's data
+//!     had ZERO system turns (a hard spec rule) — that off-distribution prefix
+//!     was the real "garbage at serve" bug. Building the prompt ourselves gives
+//!     train/serve parity + the spec's "no system turn, ever".
+//!
+//!     Gemma 4 uses `<|turn>` / `<turn|>` (NOT Gemma 2/3's `<start_of_turn>` /
+//!     `<end_of_turn>`), confirmed by the training run: `train.log` reports
+//!     `Detected turn markers: '<|turn>user\n' / '<|turn>model\n'`, the
+//!     label-mask audit shows every trained span ending in `<turn|>`, and the
+//!     GGUF's EOS is `<turn|>` (export.log `EOS check ok: '<turn|>'`). So the
+//!     stop token is `<turn|>` and the model turn is prompted with `<|turn>model`.
 //!   * an optional raw GBNF `grammar` is forwarded to llama.cpp per request
 //!     (the caller swaps grammars by state, e.g. goal active vs not).
 //!   * the response is the model's text VERBATIM (the caller parses it).
@@ -113,16 +120,16 @@ pub async fn raw_chat(
         .and_then(Value::as_str)
         .filter(|g| !g.trim().is_empty());
 
-    // --- generate: raw /completion on the Gemma-formatted prompt ---------------
-    let prompt = gemma_prompt(&messages);
+    // --- generate: raw /completion on the Gemma-4-formatted prompt -------------
+    let prompt = gemma4_prompt(&messages);
     let mut req = json!({
         "prompt": prompt,
         "temperature": temperature,
         "top_p": top_p,
         "n_predict": n_predict,
         "cache_prompt": true,
-        // Stop cleanly at the end of the model turn (grammar has no end token).
-        "stop": ["<end_of_turn>", "<start_of_turn>"],
+        // Stop at the Gemma 4 end-of-turn token (also the model's EOS).
+        "stop": ["<turn|>"],
     });
     if top_k > 0 {
         req["top_k"] = json!(top_k);
@@ -170,23 +177,24 @@ pub async fn raw_chat(
     })))
 }
 
-/// Render chat messages into the model's REAL Gemma chat format. No system turn
-/// (the spec forbids one; a `system` role, if ever present, is folded into the
-/// content stream as a user turn rather than silently dropped). `<start_of_turn>`
-/// / `<end_of_turn>` are the Gemma turn tokens the LoRA was trained on.
-fn gemma_prompt(messages: &[Value]) -> String {
+/// Render chat messages into Gemma 4's turn format — the exact format the LoRA
+/// was trained on. No system turn (the spec forbids one; a `system` role, if
+/// ever present, is folded into the stream as a user turn rather than silently
+/// dropped). `<|turn>` / `<turn|>` are Gemma 4's turn tokens (NOT Gemma 2/3's
+/// `<start_of_turn>` / `<end_of_turn>`).
+fn gemma4_prompt(messages: &[Value]) -> String {
     let mut prompt = String::from("<bos>");
     for msg in messages {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
         let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
         let turn = if role == "assistant" { "model" } else { "user" };
-        prompt.push_str("<start_of_turn>");
+        prompt.push_str("<|turn>");
         prompt.push_str(turn);
         prompt.push('\n');
         prompt.push_str(content);
-        prompt.push_str("<end_of_turn>\n");
+        prompt.push_str("<turn|>\n");
     }
-    prompt.push_str("<start_of_turn>model\n");
+    prompt.push_str("<|turn>model\n");
     prompt
 }
 
