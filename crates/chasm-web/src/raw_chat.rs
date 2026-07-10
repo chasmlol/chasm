@@ -8,8 +8,14 @@
 //!
 //!   * the prompt is the request's `messages[]` VERBATIM — no system prompt,
 //!     no persona/scenario/lorebook/structured-output instructions, nothing.
-//!     llama-server's `--jinja` applies the GGUF's own chat template, giving
-//!     train/serve parity (the LoRA was trained with no system turn).
+//!     We render the messages into the model's REAL Gemma chat format
+//!     (`<start_of_turn>user\n…<end_of_turn>\n … <start_of_turn>model\n`) and
+//!     call llama-server's raw `/completion`, deliberately BYPASSING the GGUF's
+//!     embedded chat template: a wrongly-baked template (`<|turn>`/`<|think|>`
+//!     instead of Gemma's turn tokens) is the #1 "great in training, garbage at
+//!     serve" cause, and this LoRA shipped with exactly that. Building the
+//!     prompt ourselves guarantees train/serve parity + the spec's "no system
+//!     turn, ever" rule.
 //!   * an optional raw GBNF `grammar` is forwarded to llama.cpp per request
 //!     (the caller swaps grammars by state, e.g. goal active vs not).
 //!   * the response is the model's text VERBATIM (the caller parses it).
@@ -86,37 +92,102 @@ pub async fn raw_chat(
 
     // --- sampling + grammar ----------------------------------------------------
     let opts = body.get("generationOptions").cloned().unwrap_or(Value::Null);
-    let mut sampling = crate::llm::Sampling::from_settings(&settings.llm.sampling);
-    if let Some(t) = opts.get("temperature").and_then(Value::as_f64) {
-        sampling.temperature = t;
-    }
-    if let Some(p) = opts.get("topP").and_then(Value::as_f64) {
-        sampling.top_p = p;
-    }
-    if let Some(k) = opts.get("topK").and_then(Value::as_u64) {
-        sampling.top_k = Some(k as u32);
-    }
-    if let Some(m) = opts.get("maxTokens").and_then(Value::as_i64) {
-        sampling.max_tokens = Some(m);
-    }
-    sampling.grammar = body
+    let base = crate::llm::Sampling::from_settings(&settings.llm.sampling);
+    let temperature = opts
+        .get("temperature")
+        .and_then(Value::as_f64)
+        .unwrap_or(base.temperature);
+    let top_p = opts.get("topP").and_then(Value::as_f64).unwrap_or(base.top_p);
+    let top_k = opts
+        .get("topK")
+        .and_then(Value::as_u64)
+        .or(base.top_k.map(u64::from))
+        .unwrap_or(0);
+    let n_predict = opts
+        .get("maxTokens")
+        .and_then(Value::as_i64)
+        .or(base.max_tokens)
+        .unwrap_or(512);
+    let grammar = body
         .get("grammar")
         .and_then(Value::as_str)
-        .filter(|g| !g.trim().is_empty())
-        .map(str::to_string);
+        .filter(|g| !g.trim().is_empty());
 
-    // --- generate: messages verbatim, no response_format, raw text back --------
-    let target = crate::llm::LlmTarget::resolve(&settings, &state.config);
-    let (raw, _metrics) =
-        crate::llm::chat_completion_capturing_sampled(&target, &messages, None, sampling)
-            .await
-            .map_err(|e| WebError::from(anyhow::anyhow!("generation failed: {e}")))?;
+    // --- generate: raw /completion on the Gemma-formatted prompt ---------------
+    let prompt = gemma_prompt(&messages);
+    let mut req = json!({
+        "prompt": prompt,
+        "temperature": temperature,
+        "top_p": top_p,
+        "n_predict": n_predict,
+        "cache_prompt": true,
+        // Stop cleanly at the end of the model turn (grammar has no end token).
+        "stop": ["<end_of_turn>", "<start_of_turn>"],
+    });
+    if top_k > 0 {
+        req["top_k"] = json!(top_k);
+    }
+    if let Some(g) = grammar {
+        req["grammar"] = json!(g);
+    }
+    if let Some(seed) = base.seed {
+        req["seed"] = json!(seed);
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()
+        .map_err(|e| WebError::from(anyhow::anyhow!("http client: {e}")))?;
+    let resp = client
+        .post(format!("{LLAMA_BASE}/completion"))
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| WebError::from(anyhow::anyhow!("generation request failed: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(WebError::from(anyhow::anyhow!(
+            "llama-server /completion {status}: {}",
+            detail.chars().take(300).collect::<String>()
+        )));
+    }
+    let out: Value = resp
+        .json()
+        .await
+        .map_err(|e| WebError::from(anyhow::anyhow!("bad /completion response: {e}")))?;
+    let raw = out
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
 
     Ok(Json(json!({
         "characterId": character_id,
         "model": model_file,
         "text": raw,
     })))
+}
+
+/// Render chat messages into the model's REAL Gemma chat format. No system turn
+/// (the spec forbids one; a `system` role, if ever present, is folded into the
+/// content stream as a user turn rather than silently dropped). `<start_of_turn>`
+/// / `<end_of_turn>` are the Gemma turn tokens the LoRA was trained on.
+fn gemma_prompt(messages: &[Value]) -> String {
+    let mut prompt = String::from("<bos>");
+    for msg in messages {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
+        let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
+        let turn = if role == "assistant" { "model" } else { "user" };
+        prompt.push_str("<start_of_turn>");
+        prompt.push_str(turn);
+        prompt.push('\n');
+        prompt.push_str(content);
+        prompt.push_str("<end_of_turn>\n");
+    }
+    prompt.push_str("<start_of_turn>model\n");
+    prompt
 }
 
 /// Ensures llama-server is serving `gguf`; relaunches it on that model when it
