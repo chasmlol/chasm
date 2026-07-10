@@ -40,7 +40,9 @@ use std::time::Duration;
 use axum::{extract::State, Json};
 use serde_json::{json, Value};
 use chasm_core::AppSettings;
+use chasm_st_compat::STJsonlChatMessage;
 
+use crate::save_sync::now_iso;
 use crate::{AppState, WebError, WebResult};
 
 /// llama-server base (the managed runtime) — mirrors DEFAULT_STACK_LLM_ADDR.
@@ -170,11 +172,158 @@ pub async fn raw_chat(
         .trim()
         .to_string();
 
+    // Persist the turn to a live-chat so chasm's Chat UI shows it (and "clear
+    // chat" clears it) — the same on-disk shape the FNV path writes. Best-effort:
+    // a persistence failure never fails the generation. `historyCount` lets the
+    // bridge detect a UI clear (count dropped) and reset its own context.
+    let history_count = persist_turn(&state, &body, &messages, &raw);
+
     Ok(Json(json!({
         "characterId": character_id,
         "model": model_file,
         "text": raw,
+        "historyCount": history_count,
     })))
+}
+
+/// Appends the new player/world message + Digby's full reply to the live-chat's
+/// current segment, so the Chat screen renders the companion thread and
+/// clear-history wipes it. Returns the segment's message count after the append
+/// (None when not in session mode or the live-chat doesn't exist yet).
+fn persist_turn(state: &Arc<AppState>, body: &Value, messages: &[Value], raw: &str) -> Option<usize> {
+    let live_chat_id = body
+        .get("liveChatId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let participant_id = body
+        .get("participantId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("npc:Digby");
+    let player_name = body
+        .get("playerName")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Player");
+
+    // The live-chat is created by the bridge on spawn (POST /live-chats); if it's
+    // not there yet, skip persistence rather than inventing one here.
+    let live_chat = state.repository.get_live_chat(live_chat_id).ok()?;
+    let segment = live_chat
+        .segments
+        .iter()
+        .find(|s| s.id == live_chat.current_segment_id)
+        .or_else(|| live_chat.segments.first())?
+        .clone();
+
+    // The new incoming message is the last user turn the bridge sent.
+    let new_message = messages
+        .last()
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let now = now_iso();
+
+    // Incoming line (player chat / world event / lesson) — is_user so the UI's
+    // fallback visibility renders it; label it by its tag.
+    let user_msg = STJsonlChatMessage {
+        name: incoming_label(&new_message, player_name),
+        is_user: true,
+        is_system: false,
+        send_date: Some(now.clone()),
+        mes: new_message,
+        extra: Value::Null,
+        original_avatar: None,
+    };
+    if state.repository.append_segment_message(&segment, &user_msg).is_err() {
+        return None;
+    }
+
+    // Digby's turn — persist the FULL raw output (say + do + goal + learn) so the
+    // whole context is visible for debugging, plus a turn_actions chip for the
+    // do:. Live metadata marks him as the speaker so it shows in his thread.
+    let digby_name = live_chat
+        .participants
+        .get(participant_id)
+        .map(|p| p.name.clone())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "Digby".to_string());
+    let turn_actions = parse_do_chip(raw).map(|chip| vec![chip]).unwrap_or_default();
+    let assistant_msg = STJsonlChatMessage {
+        name: digby_name,
+        is_user: false,
+        is_system: false,
+        send_date: Some(now),
+        mes: raw.to_string(),
+        // HeadlessLiveMetadata is camelCase — snake_case keys silently fail to
+        // deserialize, which drops the message's visibility (it then falls to the
+        // non-user fallback and never shows in the thread).
+        extra: json!({
+            "headless": { "metadata": { "live": {
+                "speakerParticipantId": participant_id,
+                "audibleTo": ["player"],
+                "present": ["player", participant_id],
+            } } },
+            "chasm": { "turn_actions": turn_actions },
+        }),
+        original_avatar: None,
+    };
+    if state.repository.append_segment_message(&segment, &assistant_msg).is_err() {
+        return None;
+    }
+
+    // Bump updated_at so chat_view (newest-first) shows THIS conversation, not a
+    // stale FNV one that happens to sit elsewhere in the store.
+    let lcid = live_chat_id.to_string();
+    let now2 = now_iso();
+    let _ = state.repository.update_store(|store| {
+        if let Some(lc) = store.items.get_mut(&lcid) {
+            lc.updated_at = Some(now2);
+        }
+    });
+
+    state.repository.read_segment_messages(&segment).ok().map(|m| m.len())
+}
+
+/// A display name for an incoming line based on its tag: `[Name] …` → Name,
+/// `[world] …` / `[lesson …]` → "World", else the player name.
+fn incoming_label(content: &str, player_name: &str) -> String {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("[world]") || trimmed.starts_with("[lesson") {
+        return "World".to_string();
+    }
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            let tag = &rest[..end];
+            if !tag.is_empty() && !tag.eq_ignore_ascii_case("goal") {
+                return tag.to_string();
+            }
+        }
+    }
+    player_name.to_string()
+}
+
+/// Parses the first `do: action{args}` line of the raw output into a
+/// turn_actions chip (`{ id, parameters }`) for the Chat UI's green action pill.
+fn parse_do_chip(raw: &str) -> Option<Value> {
+    for line in raw.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("do:") {
+            let call = rest.trim();
+            let (action, args) = match call.find('{') {
+                Some(idx) => (&call[..idx], &call[idx..]),
+                None => (call, ""),
+            };
+            let action = action.trim();
+            if action.is_empty() {
+                return None;
+            }
+            return Some(json!({ "id": action, "parameters": args }));
+        }
+    }
+    None
 }
 
 /// Render chat messages into Gemma 4's turn format — the exact format the LoRA

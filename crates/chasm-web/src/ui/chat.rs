@@ -350,7 +350,15 @@ fn preview_text(text: &str) -> String {
 /// context. Returns an empty projection (no live chat / no NPC threads) rather
 /// than erroring so the UI can render its empty state.
 pub(crate) async fn chat_view(State(state): State<Arc<AppState>>) -> WebResult<Json<UiChatView>> {
-    let Some(live_chat) = state.repository.list_live_chats()?.into_iter().next() else {
+    // Show the MOST RECENTLY ACTIVE live-chat, not an arbitrary hashmap entry:
+    // several can coexist (e.g. a leftover FNV `fnv-goodsprings` alongside the
+    // Minecraft `minecraft-digby`), and `into_iter().next()` picked one at
+    // random — so the Chat screen could show a stale conversation. The active
+    // game bumps its live-chat's `updated_at` every turn, so newest-first is
+    // "the conversation happening now".
+    let mut live_chats = state.repository.list_live_chats()?;
+    live_chats.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let Some(live_chat) = live_chats.into_iter().next() else {
         return Ok(Json(UiChatView {
             live_chat_id: None,
             title: None,
