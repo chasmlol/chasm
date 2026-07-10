@@ -392,7 +392,7 @@ pub async fn generate_stream_core(
             let mut spoken_len: usize = 0;
             trace_generate_stage(trace_id.as_deref(), "gen_llm_request_dispatch");
             let mut first_token_seen = false;
-            match crate::llm::chat_completion_stream(&target, &agent_messages, response_format.as_ref(), trace_id.as_deref(), sampling)
+            match crate::llm::chat_completion_stream(&target, &agent_messages, response_format.as_ref(), trace_id.as_deref(), sampling.clone())
                 .await
             {
                 Ok(mut rx) => {
@@ -744,7 +744,7 @@ pub async fn generate(
             &target,
             &plan.chat_messages,
             response_format.as_ref(),
-            sampling,
+            sampling.clone(),
         )
         .await
         .map_err(web_err)?;

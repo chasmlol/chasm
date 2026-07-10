@@ -195,7 +195,7 @@ async fn run_pass(state: &AppState) -> Result<usize, String> {
             &target,
             &messages,
             Some(&response_format),
-            sampling,
+            sampling.clone(),
         )
         .await
         {

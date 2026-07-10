@@ -520,7 +520,9 @@ pub struct GenerationOptions {
 /// OpenAI-compatible request body. Built via [`Sampling::from_settings`] so the
 /// "send only when meaningful" rules live in one place (e.g. `top_k`/`min_p`/
 /// `n_ctx` are omitted at their off values to preserve prior default behaviour).
-#[derive(Debug, Clone, Copy, Default)]
+// NOTE: not `Copy` since the pure-LoRA `grammar` field (String) landed; sites
+// that reused a sampling value now clone explicitly.
+#[derive(Debug, Clone, Default)]
 pub struct Sampling {
     pub temperature: f64,
     pub top_p: f64,
@@ -530,6 +532,11 @@ pub struct Sampling {
     pub max_tokens: Option<i64>,
     pub n_ctx: Option<u32>,
     pub seed: Option<i64>,
+    /// Raw GBNF grammar forwarded verbatim to llama.cpp (`body["grammar"]`).
+    /// `None` everywhere except the pure-LoRA raw-chat path, so existing
+    /// requests are byte-identical to before this field existed. Hosted API
+    /// providers ignore it (llama.cpp-only capability).
+    pub grammar: Option<String>,
 }
 
 /// Rounds an `f32` sampling value to 3 decimals as `f64`, so the `f32`→`f64`
@@ -554,6 +561,7 @@ impl Sampling {
             max_tokens: (s.max_tokens > 0).then_some(s.max_tokens as i64),
             n_ctx: (s.n_ctx > 0).then_some(s.n_ctx),
             seed: (s.seed >= 0).then_some(s.seed),
+            grammar: None,
         }
     }
 
@@ -608,6 +616,9 @@ impl Sampling {
         }
         if let Some(seed) = self.seed {
             body["seed"] = json!(seed);
+        }
+        if let Some(grammar) = &self.grammar {
+            body["grammar"] = json!(grammar);
         }
     }
 }

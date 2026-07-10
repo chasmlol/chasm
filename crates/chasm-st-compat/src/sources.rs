@@ -35,6 +35,13 @@ pub struct CharacterCard {
     pub example_dialogue: String,
     /// Linked world/lorebook name from `data.extensions.world`, when present.
     pub world: Option<String>,
+    /// Pure-LoRA marker from `data.extensions.chasm.pure_lora.model`: the GGUF
+    /// filename (in the LLM models dir) whose WEIGHTS carry this character's
+    /// entire persona + protocol. When set, the raw-chat path serves this
+    /// character with ZERO prompt injection (conversation turns only) on that
+    /// model. `None` for every normal prompt-bearing card — the existing
+    /// pipeline is untouched.
+    pub pure_lora_model: Option<String>,
 }
 
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
@@ -105,6 +112,15 @@ fn card_from_json(id: &str, json: &str) -> Option<CharacterCard> {
         .and_then(Value::as_str)
         .filter(|world| !world.is_empty())
         .map(str::to_string);
+    let pure_lora_model = data
+        .get("extensions")
+        .and_then(|extensions| extensions.get("chasm"))
+        .and_then(|chasm| chasm.get("pure_lora"))
+        .and_then(|pure| pure.get("model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string);
     let name = {
         let raw = field("name");
         if raw.is_empty() {
@@ -122,6 +138,7 @@ fn card_from_json(id: &str, json: &str) -> Option<CharacterCard> {
         scenario: field("scenario"),
         example_dialogue: field("mes_example"),
         world,
+        pure_lora_model,
     })
 }
 
@@ -1056,6 +1073,41 @@ fn combine_persona(description: Option<&str>, custom_note: Option<&str>) -> Opti
         (Some(description), None) => Some(description.to_string()),
         (None, Some(note)) => Some(note.to_string()),
         (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod card_tests {
+    use super::card_from_json;
+
+    /// The pure-LoRA marker parses from `data.extensions.chasm.pure_lora.model`,
+    /// and every normal card (no extension) reads `None` — the flag can never
+    /// misfire on prompt-bearing cards.
+    #[test]
+    fn pure_lora_extension_parses_and_defaults_off() {
+        let lora = r#"{
+            "spec": "chara_card_v3",
+            "data": {
+                "name": "Digby",
+                "extensions": { "chasm": { "pure_lora": { "model": "gemma4-e2b-digby-v1-Q4_K_M.gguf" } } }
+            }
+        }"#;
+        let card = card_from_json("Digby", lora).expect("card parses");
+        assert_eq!(
+            card.pure_lora_model.as_deref(),
+            Some("gemma4-e2b-digby-v1-Q4_K_M.gguf")
+        );
+
+        let normal = r#"{ "data": { "name": "Easy Pete", "description": "A prospector.",
+            "extensions": { "world": "Fallout New Vegas" } } }"#;
+        let card = card_from_json("Easy Pete", normal).expect("card parses");
+        assert_eq!(card.pure_lora_model, None);
+        assert_eq!(card.world.as_deref(), Some("Fallout New Vegas"));
+
+        // Empty model string reads as not-pure-LoRA (never route to a blank file).
+        let blank = r#"{ "data": { "name": "X",
+            "extensions": { "chasm": { "pure_lora": { "model": "  " } } } } }"#;
+        assert_eq!(card_from_json("X", blank).unwrap().pure_lora_model, None);
     }
 }
 

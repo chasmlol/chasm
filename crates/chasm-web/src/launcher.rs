@@ -1210,6 +1210,74 @@ pub(crate) fn apply_selected_llm_model(state: &Arc<AppState>) {
     }
 }
 
+/// Respawns the managed llama-server on an EXPLICIT gguf path — the pure-LoRA
+/// per-character model routing (raw-chat). Additive next to
+/// [`apply_selected_llm_model`]: the settings-selected model is untouched (a
+/// normal card's next turn swaps back through the same mechanism the other way
+/// — callers check what's currently served before invoking). Mirrors the
+/// managed spec's spawn args exactly (same port/slots/--jinja), differing only
+/// in `-m`. Returns false when llama.cpp isn't installed or the spawn failed.
+pub(crate) fn respawn_llm_with_gguf(state: &Arc<AppState>, gguf: &Path) -> bool {
+    let exe = llamacpp_exe_path(&state.config);
+    if !exe.exists() || !gguf.exists() {
+        return false;
+    }
+    let settings = AppSettings::load(&state.config.settings_path);
+    // Build the standard managed spec (for args parity), then point -m at ours.
+    // When no model is selected in settings, build the arg list directly.
+    let spec = {
+        let cwd = exe
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.display().to_string());
+        let mut base = managed_llm_runtime_spec(&settings, &state.config, None)
+            .map(|s| s.args)
+            .unwrap_or_default();
+        if base.is_empty() {
+            base = vec![
+                "-m".into(), String::new(),
+                "--host".into(), "127.0.0.1".into(),
+                "--port".into(), "5001".into(),
+                "-ngl".into(), "999".into(),
+                "-c".into(), "16384".into(),
+                "-np".into(), "2".into(),
+                "--cache-reuse".into(), "256".into(),
+                "--reasoning-budget".into(), "0".into(),
+                "--jinja".into(),
+                "-fa".into(),
+            ];
+        }
+        // Swap the -m argument to the explicit gguf.
+        if let Some(idx) = base.iter().position(|a| a == "-m" || a == "--model") {
+            if idx + 1 < base.len() {
+                base[idx + 1] = gguf.display().to_string();
+            }
+        }
+        RuntimeSpec {
+            program: exe.display().to_string(),
+            args: base,
+            cwd,
+            env: Vec::new(),
+        }
+    };
+
+    kill_llm_servers();
+    if tcp_reachable(DEFAULT_STACK_LLM_ADDR) {
+        crate::kill_process_on_port(DEFAULT_LLAMA_PORT);
+    }
+    std::thread::sleep(Duration::from_millis(800));
+    match spawn_runtime(&spec) {
+        Ok(()) => {
+            tracing::info!("pure-LoRA model routing: llama-server relaunched on {}", gguf.display());
+            true
+        }
+        Err(error) => {
+            tracing::warn!("pure-LoRA model routing failed to spawn llama-server: {error}");
+            false
+        }
+    }
+}
+
 /// The download status of each LLM model keyed by id, read from the on-disk GGUFs
 /// in `models_dir` (mirrors the web layer's `llm_model_statuses`, duplicated here
 /// so the launcher's model-swap path doesn't depend on it). Only the `downloaded`

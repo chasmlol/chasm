@@ -44,6 +44,7 @@ mod connection;
 mod event_log;
 mod fnv_bridge;
 mod game_bridge;
+mod raw_chat;
 mod gamemaster;
 mod generate;
 mod journal;
@@ -566,6 +567,10 @@ pub fn router(config: AppConfig) -> Router {
                 // Admin / "Todd" single-character generation (non-live).
                 .route("/generate", post(generate::generate_headless))
                 .route("/generate/stream", post(generate::generate_headless_stream))
+                // Pure-LoRA raw chat: zero-assembly generation for characters
+                // whose persona/protocol live in their own GGUF's weights
+                // (extensions.chasm.pure_lora). Additive; see [`raw_chat`].
+                .route("/raw-chat", post(raw_chat::raw_chat))
                 // Game save/load checkpoint + restore.
                 .route("/save-sync/events", post(save_sync::save_sync_event))
                 // Gameplay event-log ingest (the bridge relays the plugin's
